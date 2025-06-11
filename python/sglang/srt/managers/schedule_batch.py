@@ -818,6 +818,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Request, memory pool, and cache
     reqs: List[Req]
+
+    # Batch Id
+    bid: int = -1
+
+
+    # Batch Id
+    bid: int = -1
+
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -923,26 +931,104 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        bid: int,
         chunked_req: Optional[Req] = None,
     ):
+        # Add requests to memory pools
+        for r in reqs:
+            r.req_pool_idx = req_to_token_pool.alloc(1)[0]
+
+        req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
+        )
+        # Add requests to memory pools
+        for r in reqs:
+            r.req_pool_idx = req_to_token_pool.alloc(1)[0]
+
+        req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
+        )
         return_logprob = any(req.return_logprob for req in reqs)
 
-        return cls(
+        if chunked_req is not None:
+            # Handle chunked prefill
+            # NOTE: The current request is a chunk of a large request.
+            # The memory for the whole large request has been allocated,
+            # so we do not need to allocate memory for the chunk.
+            input_ids = chunked_req.input_ids
+            if not hasattr(chunked_req, 'prefix_indices'):
+                chunked_req.prefix_indices = []
+            prefix_indices = chunked_req.prefix_indices
+            position_ids_offset = chunked_req.prefix_len
+        else:
+            # Allocate memory for new requests
+            position_ids_offset = 0
+            prefix_indices = np.empty([len(reqs), 0], dtype=np.int32)
+            for i, r in enumerate(reqs):
+                r.token_id_to_kv_pool_indices = token_to_kv_pool_allocator.alloc(r.total_len)
+                if not hasattr(r, 'prefix_indices'):
+                    r.prefix_indices = []
+                if r.prefix_indices is not None:
+                    prefix_indices[i] = r.prefix_indices
+            input_ids = torch.cat([r.input_ids for r in reqs])
+
+        # Create the batch
+        batch = cls(
+            if chunked_req is not None:
+                # Handle chunked prefill
+                # NOTE: The current request is a chunk of a large request.
+                # The memory for the whole large request has been allocated,
+                # so we do not need to allocate memory for the chunk.
+                input_ids = chunked_req.input_ids
+                if not hasattr(chunked_req, 'prefix_indices'):
+                    chunked_req.prefix_indices = []
+                prefix_indices = chunked_req.prefix_indices
+                position_ids_offset = chunked_req.prefix_len
+            else:
+                # Allocate memory for new requests
+                position_ids_offset = 0
+                prefix_indices = np.empty([len(reqs), 0], dtype=np.int32)
+                for i, r in enumerate(reqs):
+                    r.token_id_to_kv_pool_indices = token_to_kv_pool_allocator.alloc(r.total_len)
+                    if not hasattr(r, 'prefix_indices'):
+                        r.prefix_indices = []
+                    if r.prefix_indices is not None:
+                        prefix_indices[i] = r.prefix_indices
+                input_ids = torch.cat([r.input_ids for r in reqs])
+
+        # Create the batch
+        batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
-            return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.grammar for req in reqs),
-            device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
-            return_hidden_states=any(req.return_hidden_states for req in reqs),
-            chunked_req=chunked_req,
+            forward_mode=ForwardMode.PREFILL,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            position_ids_offset=position_ids_offset,
+            prefix_indices=prefix_indices,
+            return_logprob=return_logprob,
+            bid=bid,
+            forward_mode=ForwardMode.PREFILL,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            position_ids_offset=position_ids_offset,
+            prefix_indices=prefix_indices,
+            return_logprob=return_logprob,
+            bid=bid,
         )
+        return batch
+
+    def __len__(self):
+        return len(self.reqs)
+        return batch
+
+    def __len__(self):
+        return len(self.reqs)
 
     def batch_size(self):
         return len(self.reqs)
@@ -1669,10 +1755,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 self.sampling_info.grammars = None
 
-        global bid
-        bid += 1
+        lora_paths = [r.lora_path for r in self.reqs]
+
+        lora_paths = [r.lora_path for r in self.reqs]
+
         return ModelWorkerBatch(
-            bid=bid,
+            bid=self.bid,
+            reqs=self.reqs,
+            bid=self.bid,
+            reqs=self.reqs,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1689,15 +1780,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
             extend_num_tokens=self.extend_num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_logprob_start_lens=extend_logprob_start_lens,
+            extend_seq_lens=self.extend_lens,
+            extend_prefix_lens=self.prefix_lens,
+            extend_logprob_start_lens=self.extend_logprob_start_lens,
+            extend_input_logprob_token_ids=extend_input_logprob_token_ids,
+            extend_seq_lens=self.extend_lens,
+            extend_prefix_lens=self.prefix_lens,
+            extend_logprob_start_lens=self.extend_logprob_start_lens,
+            extend_input_logprob_token_ids=extend_input_logprob_token_ids,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_paths=[req.lora_path for req in self.reqs],
+            lora_paths=lora_paths,
+            lora_paths=lora_paths,
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
@@ -1713,7 +1810,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     else CaptureHiddenMode.NULL
                 )
             ),
-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
             is_multimodal=self.is_multimodal,
             speculative_num_draft_tokens=None,
@@ -1736,6 +1832,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class ModelWorkerBatch:
     # The batch id
     bid: int
+    # The list of requests
+    reqs: List[Req]
+    # The list of requests
+    reqs: List[Req]
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
@@ -1744,55 +1844,82 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    seq_lens_cpu: Optional[torch.Tensor]
-    # The indices of output tokens in the token_to_kv_pool_allocator
-    out_cache_loc: torch.Tensor
-
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    # The indices of output tokens in the token_to_kv_pool_allocator
+    out_cache_loc: Optional[torch.Tensor] = None
+
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    # The indices of output tokens in the token_to_kv_pool_allocator
+    out_cache_loc: Optional[torch.Tensor] = None
+
     # For logprob
-    return_logprob: bool
-    top_logprobs_nums: Optional[List[int]]
-    token_ids_logprobs: Optional[List[List[int]]]
+    return_logprob: bool = False
+    top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
+    return_logprob: bool = False
+    top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For DP attention
-    global_num_tokens: Optional[List[int]]
-    global_num_tokens_for_logprob: Optional[List[int]]
-    can_run_dp_cuda_graph: bool
-    tbo_split_seq_index: Optional[int]
-    global_forward_mode: Optional[ForwardMode]
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+    can_run_dp_cuda_graph: bool = False
+    tbo_split_seq_index: Optional[int] = None
+    global_forward_mode: Optional[ForwardMode] = None
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+    can_run_dp_cuda_graph: bool = False
+    tbo_split_seq_index: Optional[int] = None
+    global_forward_mode: Optional[ForwardMode] = None
 
     # For extend
-    extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[List[int]]
-    extend_prefix_lens: Optional[List[int]]
-    extend_logprob_start_lens: Optional[List[int]]
-    extend_input_logprob_token_ids: Optional[torch.Tensor]
+    extend_num_tokens: Optional[int] = None
+    extend_seq_lens: Optional[List[int]] = None
+    extend_prefix_lens: Optional[List[int]] = None
+    extend_logprob_start_lens: Optional[List[int]] = None
+    extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+    extend_num_tokens: Optional[int] = None
+    extend_seq_lens: Optional[List[int]] = None
+    extend_prefix_lens: Optional[List[int]] = None
+    extend_logprob_start_lens: Optional[List[int]] = None
+    extend_input_logprob_token_ids: Optional[torch.Tensor] = None
 
     # For multimodal
-    multimodal_inputs: Optional[List[MultimodalInputs]]
+    multimodal_inputs: Optional[List[MultimodalInputs]] = None
+    multimodal_inputs: Optional[List[MultimodalInputs]] = None
 
     # For encoder-decoder
-    encoder_cached: Optional[List[bool]]
-    encoder_lens: Optional[torch.Tensor]
-    encoder_lens_cpu: Optional[List[int]]
-    encoder_out_cache_loc: Optional[torch.Tensor]
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # For LoRA
-    lora_paths: Optional[List[str]]
+    lora_paths: Optional[List[str]] = None
+    lora_paths: Optional[List[str]] = None
 
     # Sampling info
-    sampling_info: SamplingBatchInfo
+    sampling_info: Optional[SamplingBatchInfo] = None
+    sampling_info: Optional[SamplingBatchInfo] = None
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
 
     # Speculative decoding
-    spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
+    spec_info: Optional[Union["EagleDraftInput", "EagleVerifyInput"]] = None
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
+    spec_info: Optional[Union["EagleDraftInput", "EagleVerifyInput"]] = None
     # If set, the output of the batch contains the hidden states of the run.
-    capture_hidden_mode: CaptureHiddenMode = None
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
@@ -1803,6 +1930,10 @@ class ModelWorkerBatch:
     speculative_eagle_adapter_ids: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        if self.forward_mode.is_decode():
+            assert self.seq_lens is not None
+        if self.forward_mode.is_decode():
+            assert self.seq_lens is not None
         self.is_multimodal: Optional[bool] = None
 
 

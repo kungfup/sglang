@@ -354,6 +354,7 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.next_bid = 0
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1400,7 +1401,7 @@ class Scheduler(
             # Merge the new batch into the running batch
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = self.last_batch.copy()
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
@@ -1559,9 +1560,11 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            chunked_req=self.chunked_req,
+            bid=self.next_bid,
         )
-        new_batch.prepare_for_extend()
+        self.log_prefill_stats(adder, can_run_list, running_bs)
+
+        self.next_bid += 1
 
         # Mixed-style chunked prefill
         if (
@@ -1855,83 +1858,81 @@ class Scheduler(
         return local_batch, any(is_extend_in_batch)
 
     def get_idle_batch(self):
-        idle_batch = ScheduleBatch.init_new(
+        return ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
+            self.token_to_kv_pool,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
+            self.enable_custom_logit_processor,
+            bid=-1,
         )
-        idle_batch.prepare_for_idle()
-        return idle_batch
 
     def move_ready_grammar_requests(self):
-        """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
-
-        num_ready_reqs = 0
-        num_timeout_reqs = 0
-        for req in self.grammar_queue:
-            try:
-                if req.finished():  # It is aborted by AbortReq
+        if not self.server_args.enable_flashinfer:
+            num_ready_reqs = 0
+            num_timeout_reqs = 0
+            for req in self.grammar_queue:
+                try:
+                    if req.finished():  # It is aborted by AbortReq
+                        num_ready_reqs += 1
+                        continue
+                    req.grammar = req.grammar.result(timeout=0.03)
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    if req.grammar is INVALID_GRAMMAR_OBJ:
+                        req.set_finish_with_abort(
+                            f"Invalid grammar request: {req.grammar_key=}"
+                        )
                     num_ready_reqs += 1
-                    continue
-                req.grammar = req.grammar.result(timeout=0.03)
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    req.set_finish_with_abort(
-                        f"Invalid grammar request: {req.grammar_key=}"
-                    )
-                num_ready_reqs += 1
-            except futures._base.TimeoutError:
-                req.grammar_wait_ct += 1
-                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
-                # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
-                    num_timeout_reqs = 1
-                break
+                except futures._base.TimeoutError:
+                    req.grammar_wait_ct += 1
+                    # NOTE(lianmin): this timeout is the waiting time of the above line. It is
+                    # not the waiting time from it enters the grammar queue.
+                    if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                        num_timeout_reqs = 1
+                    break
 
-        if self.server_args.enable_dp_attention:
-            tp_size = self.attn_tp_size
-            tp_group = self.attn_tp_cpu_group
-        else:
-            tp_size = self.tp_size
-            tp_group = self.tp_cpu_group
+            if self.server_args.enable_dp_attention:
+                tp_size = self.attn_tp_size
+                tp_group = self.attn_tp_cpu_group
+            else:
+                tp_size = self.tp_size
+                tp_group = self.tp_cpu_group
 
-        if tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
-            )
-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
+            if tp_size > 1:
+                # Sync across TP ranks to make sure they have the same number of ready requests
+                tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                )
+                num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
-            for i in range(num_ready_reqs, num_ready_reqs_max):
+                for i in range(num_ready_reqs, num_ready_reqs_max):
+                    req = self.grammar_queue[i]
+                    if req.finished():  # It is aborted by AbortReq
+                        continue
+                    req.grammar = req.grammar.result()
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    if req.grammar is INVALID_GRAMMAR_OBJ:
+                        req.set_finish_with_abort(
+                            f"Invalid grammar request: {req.grammar_key=}"
+                        )
+            else:
+                num_ready_reqs_max = num_ready_reqs
+                num_timeout_reqs_max = num_timeout_reqs
+
+            for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
                 req = self.grammar_queue[i]
-                if req.finished():  # It is aborted by AbortReq
-                    continue
-                req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    req.set_finish_with_abort(
-                        f"Invalid grammar request: {req.grammar_key=}"
-                    )
-        else:
-            num_ready_reqs_max = num_ready_reqs
-            num_timeout_reqs_max = num_timeout_reqs
+                req.grammar.cancel()
+                error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+                req.set_finish_with_abort(error_msg)
+                self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+            num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
-            req = self.grammar_queue[i]
-            req.grammar.cancel()
-            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
-        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
-
-        self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
-        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+            self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
+            self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
@@ -2412,7 +2413,7 @@ class Scheduler(
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
-            self.rpd_profiler_path = None
+            self.rpd_profile_path = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(

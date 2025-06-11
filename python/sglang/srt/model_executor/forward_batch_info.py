@@ -71,6 +71,9 @@ class ForwardMode(IntEnum):
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
 
+    # Compute embeddings.
+    EMBEDDING = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -116,6 +119,9 @@ class ForwardMode(IntEnum):
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
+    def is_embedding(self):
+        return self == ForwardMode.EMBEDDING
 
 
 class CaptureHiddenMode(IntEnum):
@@ -267,8 +273,15 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        flashinfer_decode_workspace_buffer: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
+        if batch.input_ids is not None:
+            batch_size = len(batch.input_ids)
+        else:
+            # This is for pipeline parallelism, where input_ids is not available on non-rank0 gpus.
+            batch_size = len(batch.seq_lens)
 
         device = model_runner.device
         extend_input_logprob_token_ids_gpu = None
@@ -276,61 +289,79 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
+        
         ret = cls(
+            bid=batch.bid,
+            reqs_info=[ReqInfo(req.rid, req.sampling_params) for req in batch.reqs],
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
+            batch_size=batch_size,
             input_ids=batch.input_ids,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            out_cache_loc=batch.out_cache_loc,
-            mm_data=batch.multimodal_inputs,
-            encoder_cached=batch.encoder_cached,
-            encoder_lens=batch.encoder_lens,
-            encoder_lens_cpu=batch.encoder_lens_cpu,
-            encoder_out_cache_loc=batch.encoder_out_cache_loc,
+            req_pool_indices=torch.tensor(
+                batch.req_pool_indices, dtype=torch.int64, device=device
+            ),
+            seq_lens=torch.tensor(batch.seq_lens, dtype=torch.int32, device=device),
+            prefix_lens=torch.tensor(
+                [r.prefix_len for r in batch.reqs], dtype=torch.int32, device=device
+            ),
+            position_ids_offsets=torch.tensor(
+                [r.position_ids_offset for r in batch.reqs],
+                dtype=torch.int32,
+                device=device,
+            ),
+            out_cache_loc=torch.tensor(
+                batch.out_cache_loc, dtype=torch.int64, device=device
+            ),
             seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
-            lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            model_config=model_runner.model_config,
+            global_server_args_dict=global_server_args_dict,
+            tp_size=model_runner.tp_size,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
+            enable_custom_logit_processor=batch.enable_custom_logit_processor,
+            return_hidden_states=batch.return_hidden_states,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
-            num_token_non_padded=torch.tensor(
-                len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True),
+            num_token_non_padded=torch.tensor(batch_size, dtype=torch.int32).to(
+                device, non_blocking=True
+            ),
             tbo_split_seq_index=batch.tbo_split_seq_index,
             speculative_num_draft_tokens=batch.speculative_num_draft_tokens,
             speculative_eagle_adapter_ids=batch.speculative_eagle_adapter_ids,
             is_multimodal=batch.is_multimodal,
+            multimodal_inputs=batch.multimodal_inputs,
+            lora_infos=LoraBatchInfo.from_lora_paths(batch.lora_paths, model_runner),
+            pad_token_id=model_runner.model_config.pad_token_id,
         )
 
-        # For DP attention
-        if batch.global_num_tokens is not None:
-            ret.global_num_tokens_cpu = batch.global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                batch.global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
-
-            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                batch.global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
-
-            sum_len = sum(batch.global_num_tokens)
-            ret.gathered_buffer = torch.zeros(
-                (sum_len, model_runner.model_config.hidden_size),
-                dtype=model_runner.dtype,
-                device=device,
+        if batch.extend_num_tokens is not None:
+            ret.extend_num_tokens = batch.extend_num_tokens
+            ret.extend_seq_lens = torch.tensor(
+                batch.extend_seq_lens, dtype=torch.int32
             )
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, dtype=torch.int32
+            )
+            ret.extend_out_cache_loc = torch.tensor(
+                batch.extend_out_cache_loc, dtype=torch.int64
+            )
+            ret.extend_attention_mask = model_runner.attn_backend.make_attention_mask(
+                ret.extend_seq_lens, ret.extend_prefix_lens
+            )
+        
+        ret.init_flashinfer_args(
+            flashinfer_decode_workspace_buffer, model_runner.flashinfer_workspace_buffer
+        )
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             TboForwardBatchPreparer.prepare(ret)
