@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from functools import partial
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -181,29 +182,27 @@ class Qwen2Attention(nn.Module):
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
-        layer_id: int = 0,
+        config: "Qwen2Config",
+        idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-    ) -> None:
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
+            max_position_embeddings=config.max_position_embeddings,
+            rope_theta=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+            layer_id=idx,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
-            hidden_size=self.hidden_size,
+            hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
@@ -242,54 +241,40 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
+        config: "Qwen2Config",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
-    ) -> None:
+    ):
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Use the provided decoder layer type or default to Qwen2DecoderLayer
-        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: decoder_layer_type(
-                layer_id=idx,
-                config=config,
-                quant_config=quant_config,
-                prefix=prefix,
-            ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
-            prefix=add_prefix("layers", prefix),
+        layer_fn = partial(
+            Qwen2DecoderLayer, config=config, quant_config=quant_config
         )
+
+        # TODO: The return_tuple=True is a temporary solution.
+        layers_ret = make_layers(
+            config.num_hidden_layers,
+            layer_fn,
+            prefix=add_prefix("layers", prefix),
+            return_tuple=True,
+        )
+        self.start_layer, self.end_layer, self.layers = layers_ret
+
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
-            self.norm = PPMissingLayer(return_tuple=True)
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.embed_tokens
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -310,14 +295,15 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
+        # The model is piperlined, so we only have a subset of layers.
+        for layer in self.layers:
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -327,7 +313,7 @@ class Qwen2Model(nn.Module):
             )
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+            return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should

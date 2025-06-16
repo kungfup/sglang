@@ -450,41 +450,55 @@ class LayerFn(Protocol):
 
 def make_layers(
     num_hidden_layers: int,
-    layer_fn: LayerFn,
+    layer_fn: "LayerFn",
     pp_rank: Optional[int] = None,
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
-) -> Tuple[int, int, torch.nn.ModuleList]:
-    """Make a list of layers with the given layer function"""
-    # circula imports
-    from sglang.srt.distributed import get_pp_indices
-    from sglang.srt.layers.utils import PPMissingLayer
+):
+    """
+    Creates a list of layers for a model, handling pipeline parallelism if specified.
+    If pipeline parallelism is used, it splits the layers across different pipeline stages.
+    Otherwise, it creates all layers on a single device.
+    """
+    if pp_size is None or pp_rank is None:
+        from sglang.srt.distributed import get_pp_group
 
-    assert not pp_size or num_hidden_layers >= pp_size
-    start_layer, end_layer = (
-        get_pp_indices(
-            num_hidden_layers,
-            pp_rank,
-            pp_size,
+        pp_group = get_pp_group()
+        pp_rank = pp_group.rank
+        pp_size = pp_group.world_size
+
+    if pp_size > 1:
+        from sglang.srt.distributed.parallel_state import (
+            get_pipeline_model_parallel_layer_split,
         )
-        if pp_rank is not None and pp_size is not None
-        else (0, num_hidden_layers)
-    )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(start_layer, end_layer)
-        ]
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
-    if pp_rank is None or pp_size is None:
-        return modules
-    return modules, start_layer, end_layer
+
+        layer_split = get_pipeline_model_parallel_layer_split()
+        if layer_split is not None:
+            # A custom layer split is provided.
+            assert len(layer_split) == pp_size
+            import numpy as np
+
+            cumsum = [0] + list(np.cumsum(layer_split))
+            start_layer, end_layer = cumsum[pp_rank], cumsum[pp_rank + 1]
+        else:
+            # Evenly split the layers.
+            layers_per_rank = (num_hidden_layers + pp_size - 1) // pp_size
+            start_layer = pp_rank * layers_per_rank
+            end_layer = min(num_hidden_layers, (pp_rank + 1) * layers_per_rank)
+    else:
+        start_layer, end_layer = 0, num_hidden_layers
+
+    layers = torch.nn.ModuleList()
+    for idx in range(start_layer, end_layer):
+        layers.append(
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(str(idx), prefix)))
+        )
+
+    if return_tuple:
+        return start_layer, end_layer, layers
+
+    return layers, start_layer, end_layer
 
 
 def set_random_seed(seed: int) -> None:

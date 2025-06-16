@@ -1143,9 +1143,20 @@ def init_distributed_environment(
         ), "world group already initialized with a different world size"
 
 
+_PIPELINE_GLOBAL_CONFIG = {
+    "layer_split": None,
+}
+
+
+def get_pipeline_model_parallel_layer_split():
+    """Get the pipeline model parallel layer split."""
+    return _PIPELINE_GLOBAL_CONFIG["layer_split"]
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    pipeline_model_parallel_layer_split: Optional[List[int]] = None,
     backend: Optional[str] = None,
 ) -> None:
     """
@@ -1181,6 +1192,29 @@ def initialize_model_parallel(
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
+
+    if _PIPELINE_GLOBAL_CONFIG["layer_split"] is not None:
+        if pipeline_model_parallel_layer_split is not None:
+            # Maybe we should override it?
+            pass
+        pipeline_model_parallel_layer_split = _PIPELINE_GLOBAL_CONFIG["layer_split"]
+    if pipeline_model_parallel_layer_split is not None:
+        _PIPELINE_GLOBAL_CONFIG[
+            "layer_split"
+        ] = pipeline_model_parallel_layer_split
+        if sum(pipeline_model_parallel_layer_split) == 0:
+            # `embed_tokens` and `lm_head` are not counted in the layer split.
+            # So, we should allow the sum of the layer split to be 0.
+            # But, the pipeline size must be correct.
+            assert pipeline_model_parallel_size == len(
+                pipeline_model_parallel_layer_split
+            ), (
+                "The number of layers specified in the layer split "
+                "must be equal to the pipeline model parallel size."
+            )
+        else:
+            # If the layer split is specified, we can infer the pipeline size from it.
+            pipeline_model_parallel_size = len(pipeline_model_parallel_layer_split)
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
@@ -1225,16 +1259,16 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    pipeline_model_parallel_layer_split: Optional[List[int]] = None,
     backend: Optional[str] = None,
 ) -> None:
-    """Helper to initialize model parallel groups if they are not initialized,
-    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
-    values if the model parallel groups are initialized.
-    """
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    """Helper to initialize model parallel if it's not initialized."""
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size, pipeline_model_parallel_size, backend
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            pipeline_model_parallel_layer_split,
+            backend,
         )
         return
 
@@ -1252,7 +1286,7 @@ def ensure_model_parallel_initialized(
 
 
 def model_parallel_is_initialized():
-    """Check if tensor and pipeline parallel groups are initialized."""
+    """Check if model parallel groups are initialized."""
     return _TP is not None and _PP is not None
 
 
