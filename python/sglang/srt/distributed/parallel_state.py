@@ -199,6 +199,8 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    start_layer: Optional[int] = None
+    end_layer: Optional[int] = None
 
     def __init__(
         self,
@@ -1163,97 +1165,71 @@ def initialize_model_parallel(
     Initialize model parallel groups.
 
     Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model
-            parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model
-            parallelism.
+        tensor_model_parallel_size: number of GPUs used for tensor model parallelism.
+        pipeline_model_parallel_size: number of GPUs used for pipeline model parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
-    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
-    the model pipeline. The present function will
-    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
-        4 tensor model-parallel groups:
-            [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-        2 pipeline model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
-    Note that for efficiency, the caller should make sure adjacent ranks
-    are on the same DGX box. For example if we are using 2 DGX-1 boxes
-    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
-    ranks 8 to 15 belong to the second box.
+    use 2-way tensor model-parallelism and 4-way pipeline model-parallelism.
+    The ranks in dp_group are [0, ..., 7].
+    The ranks in tp_group are [[0, 1], [2, 3], [4, 5], [6, 7]].
+    The ranks in pp_group are [[0, 2, 4, 6], [1, 3, 5, 7]].
     """
-    # Get world size and rank. Ensure some consistencies.
-    assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    if torch.distributed.is_initialized() and get_world_group().world_size > 1:
+        rank = torch.distributed.get_rank()
+        world_size = get_world_group().world_size
+        local_rank = get_world_group().local_rank
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
 
-    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
-        raise RuntimeError(
-            f"world_size ({world_size}) is not equal to "
-            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+    if (
+        tensor_model_parallel_size < 1
+        or pipeline_model_parallel_size < 1
+        or tensor_model_parallel_size * pipeline_model_parallel_size > world_size
+    ):
+        raise ValueError(
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) * "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size}) "
+            f"must be <= world_size ({world_size})"
         )
 
-    if _PIPELINE_GLOBAL_CONFIG["layer_split"] is not None:
-        if pipeline_model_parallel_layer_split is not None:
-            # Maybe we should override it?
-            pass
-        pipeline_model_parallel_layer_split = _PIPELINE_GLOBAL_CONFIG["layer_split"]
-    if pipeline_model_parallel_layer_split is not None:
-        _PIPELINE_GLOBAL_CONFIG[
-            "layer_split"
-        ] = pipeline_model_parallel_layer_split
-        if sum(pipeline_model_parallel_layer_split) == 0:
-            # `embed_tokens` and `lm_head` are not counted in the layer split.
-            # So, we should allow the sum of the layer split to be 0.
-            # But, the pipeline size must be correct.
-            assert pipeline_model_parallel_size == len(
-                pipeline_model_parallel_layer_split
-            ), (
-                "The number of layers specified in the layer split "
-                "must be equal to the pipeline model parallel size."
-            )
-        else:
-            # If the layer split is specified, we can infer the pipeline size from it.
-            pipeline_model_parallel_size = len(pipeline_model_parallel_layer_split)
+    if backend is None:
+        backend = torch.distributed.get_backend()
 
     # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+    all_tp_groups = []
+    for i in range(pipeline_model_parallel_size):
+        ranks = range(
+            i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size
         )
-        group_ranks.append(ranks)
-
-    # message queue broadcaster is only used in tensor model parallel group
+        all_tp_groups.append(list(ranks))
     _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
+        all_tp_groups,
+        local_rank,
         backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
-        group_name="tp",
+        group_name="tp_group_frontend",
     )
 
-    # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+    # Build pipeline groups so that ranks with the same tensor-parallel
+    # index are placed in the same pipeline group. This is the standard
+    # Megatron-style construction: iterate over `tensor_model_parallel_size`
+    # (i.e. tp index) and stride by it across the whole world.
     global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
+    all_pp_groups = []
+    for i in range(tensor_model_parallel_size):
+        ranks = range(i, world_size, tensor_model_parallel_size)
+        all_pp_groups.append(list(ranks))
     _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
+        all_pp_groups,
+        local_rank,
         backend,
-        use_custom_allreduce=False,
-        group_name="pp",
+        group_name="pp_group_frontend",
     )
+
+    # Store layer split for later lookup
+    _PIPELINE_GLOBAL_CONFIG["layer_split"] = pipeline_model_parallel_layer_split
 
 
 def ensure_model_parallel_initialized(
@@ -1319,17 +1295,35 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 
 
 def get_tensor_model_parallel_world_size():
-    """Return world size for the tensor model parallel group."""
-    return get_tp_group().world_size
+    """Return tensor model parallel world size."""
+    if _TP is None:
+        return 1
+    return _TP.world_size
 
 
 def get_tensor_model_parallel_rank():
-    """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
+    """Return tensor model parallel rank."""
+    if _TP is None:
+        return 0
+    return _TP.rank_in_group
+
+
+def get_pipeline_model_parallel_world_size():
+    """Return pipeline model parallel world size."""
+    if _PP is None:
+        return 1
+    return _PP.world_size
+
+
+def get_pipeline_model_parallel_rank():
+    """Return pipeline model parallel rank."""
+    if _PP is None:
+        return 0
+    return _PP.rank_in_group
 
 
 def destroy_model_parallel():
-    """Set the groups to none and destroy them."""
+    """Destroy all model parallel groups."""
     global _TP
     if _TP:
         _TP.destroy()
@@ -1339,6 +1333,8 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    monkey_patch_vllm_parallel_state(reverse=True)
 
 
 def destroy_distributed_environment():
@@ -1463,3 +1459,34 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+def get_pp_indices(
+    num_layers: int,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Get the start and end layer indices for a given pipeline rank."""
+    if pp_rank is None:
+        pp_rank = get_pipeline_model_parallel_rank()
+    if pp_size is None:
+        pp_size = get_pipeline_model_parallel_world_size()
+
+    layer_split = get_pipeline_model_parallel_layer_split()
+    if layer_split:
+        if len(layer_split) != pp_size - 1:
+            raise ValueError(
+                "The number of layer splits must be equal to pp_size - 1."
+            )
+        start_layer = 0 if pp_rank == 0 else layer_split[pp_rank - 1]
+        end_layer = (
+            layer_split[pp_rank] if pp_rank < pp_size - 1 else num_layers
+        )
+        return start_layer, end_layer
+
+    layers_per_stage = num_layers // pp_size
+    start_layer = pp_rank * layers_per_stage
+    end_layer = (
+        (pp_rank + 1) * layers_per_stage if pp_rank != pp_size - 1 else num_layers
+    )
+    return start_layer, end_layer

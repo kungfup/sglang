@@ -27,6 +27,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
+    get_pp_indices,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -248,28 +253,31 @@ class Qwen2Model(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_pp_group()
+        self.start_layer, self.end_layer = get_pp_indices(config.num_hidden_layers)
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
 
-        layer_fn = partial(
-            Qwen2DecoderLayer, config=config, quant_config=quant_config
-        )
-
-        # TODO: The return_tuple=True is a temporary solution.
-        layers_ret = make_layers(
-            config.num_hidden_layers,
-            layer_fn,
-            prefix=add_prefix("layers", prefix),
-            return_tuple=True,
-        )
-        self.start_layer, self.end_layer, self.layers = layers_ret
+        self.layers = nn.ModuleList()
+        for i in range(config.num_hidden_layers):
+            if self.start_layer <= i < self.end_layer:
+                self.layers.append(
+                    Qwen2DecoderLayer(
+                        config,
+                        i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{i}", prefix),
+                    )
+                )
+            else:
+                self.layers.append(PPMissingLayer(return_tuple=True))
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -286,34 +294,34 @@ class Qwen2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states = self.get_input_embedding(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
         else:
-            assert pp_proxy_tensors is not None
+            # Retrieve tensors from the previous pipeline stage.
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # The model is piperlined, so we only have a subset of layers.
-        for layer in self.layers:
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
+                positions, hidden_states, forward_batch, residual
             )
 
-        if not self.pp_group.is_last_rank:
+        if self.pp_group.is_last_rank:
+            hidden_states = self.norm(hidden_states, residual)
+            # RMSNorm returns a tuple (output, residual) when residual is provided.
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            return hidden_states
+        else:
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
                 }
             )
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -337,6 +345,15 @@ class Qwen2Model(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
+
+    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.config, "scale_emb"):
+            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
+        else:
+            return self.get_input_embeddings()(input_ids)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
 
 class Qwen2ForCausalLM(nn.Module):
