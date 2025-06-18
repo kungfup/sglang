@@ -2343,3 +2343,21 @@ class LazyValue:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility shim for deprecated import path
+# ---------------------------------------------------------------------------
+# 某些历史代码会执行 `from sglang.srt.utils.profiler import layer_profiler`。
+# 由于新版逻辑已迁入 `sglang.srt.utils_profiler`，这里动态构造一个虚拟子模块
+# 并注入到 `sys.modules`，避免 ImportError。
+
+import sys as _sys
+from types import ModuleType as _ModuleType
+from sglang.srt.utils_profiler import LayerProfiler as _LayerProfiler, layer_profiler as _layer_profiler
+
+_profiler_mod = _ModuleType(__name__ + ".profiler")
+_profiler_mod.LayerProfiler = _LayerProfiler
+_profiler_mod.layer_profiler = _layer_profiler
+_sys.modules[_profiler_mod.__name__] = _profiler_mod
+
+del _sys, _ModuleType, _LayerProfiler, _layer_profiler, _profiler_mod

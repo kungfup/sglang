@@ -62,6 +62,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils.profiler import layer_profiler
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         dim: int,
         intermediate_dim: int,
         num_heads: int,
+        *,
+        layer_idx: int = 0,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
         attn_implementation: Optional[str] = "sdpa",
@@ -124,6 +127,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
@@ -172,6 +176,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
     ) -> torch.Tensor:
+        layer_profiler.start_record(f"vit_block.{self.layer_idx}")
+
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
@@ -184,6 +190,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
         x = x + mlp
+
+        layer_profiler.end_record(f"vit_block.{self.layer_idx}")
         return x
 
 
@@ -271,6 +279,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
+                    layer_idx=i,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     attn_implementation="sdpa",
@@ -287,6 +296,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
         )
+
+        # Profile model size
+        if layer_profiler.enabled:
+            params = sum(p.numel() for p in self.parameters())
+            bytes = params * 2  # fp16
+            layer_profiler.add_static_info("vit_total_params", f"{params / 1e6:.2f}M")
+            layer_profiler.add_static_info("vit_total_size_mb", f"{bytes / 1024 / 1024:.2f}MB")
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -381,6 +397,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        layer_profiler.start_record("vit_total_forward")
+
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -439,6 +457,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
 
+        layer_profiler.end_record("vit_total_forward")
         return x
 
 
@@ -526,6 +545,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.image_token_idx = config.image_token_id
+
+        # Profile model size
+        if layer_profiler.enabled and self.pp_group.is_first_rank:
+            # This is an approximation. Real usage depends on activations.
+            params = sum(p.numel() for p in self.model.model.embed_tokens.parameters())
+            bytes = params * 2
+            layer_profiler.add_static_info("llm_embed_tokens_params", f"{params / 1e6:.2f}M")
+            layer_profiler.add_static_info("llm_embed_tokens_size_mb", f"{bytes / 1024 / 1024:.2f}MB")
 
     @property
     def device(self) -> torch.device:

@@ -16,7 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union, List
 
 import torch
 from torch import nn
@@ -55,6 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils_profiler import layer_profiler
 
 Qwen2Config = None
 
@@ -422,6 +423,20 @@ class Qwen2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+        # Profile model size
+        if layer_profiler.enabled:
+            for i, layer in enumerate(self.model.layers):
+                params = sum(p.numel() for p in layer.parameters())
+                bytes = params * 2  # fp16
+                layer_profiler.add_static_info(f"llm_block_{i}_params", f"{params / 1e6:.2f}M")
+                layer_profiler.add_static_info(f"llm_block_{i}_size_mb", f"{bytes / 1024 / 1024:.2f}MB")
+            
+            if self.pp_group.is_last_rank:
+                params = sum(p.numel() for p in self.lm_head.parameters())
+                bytes = params * 2
+                layer_profiler.add_static_info("lm_head_params", f"{params / 1e6:.2f}M")
+                layer_profiler.add_static_info("lm_head_size_mb", f"{bytes / 1024 / 1024:.2f}MB")
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
 
@@ -447,10 +462,13 @@ class Qwen2ForCausalLM(nn.Module):
         )
 
         if self.pp_group.is_last_rank:
+            layer_profiler.start_record("lm_head")
+            logits = self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+            layer_profiler.end_record("lm_head")
             if not get_embedding:
-                return self.logits_processor(
-                    input_ids, hidden_states, self.lm_head, forward_batch
-                )
+                return logits
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:

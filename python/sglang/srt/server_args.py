@@ -177,9 +177,9 @@ class ServerArgs:
     ds_sparse_decode_threshold: int = 4096
 
     # Optimization/debug options
-    disable_radix_cache: bool = False
+    disable_radix_cache: bool = True
     cuda_graph_max_bs: Optional[int] = None
-    cuda_graph_bs: Optional[List[int]] = None
+    cuda_graph_bs: Optional[int] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -230,6 +230,9 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+
+    # New field
+    enable_profiling: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1535,6 +1538,13 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+
+        # New field
+        parser.add_argument(
+            "--enable-profiling",
+            action="store_true",
+            help="Enable profiling for layer execution times.",
         )
 
     @classmethod
