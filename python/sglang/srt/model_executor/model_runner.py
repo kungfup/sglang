@@ -37,7 +37,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state, get_pp_group, GroupCoordinator
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -471,6 +471,45 @@ class ModelRunner:
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
             )
+
+            # ---- 新增逻辑：确保 Pipeline-Parallel 组使用 NCCL 后端 ----
+            try:
+                current_pp = get_pp_group()
+                cur_backend = torch.distributed.get_backend(current_pp.device_group)
+            except Exception:
+                current_pp = None  # noqa: F841
+                cur_backend = None  # noqa: F841
+
+            if self.device == "cuda" and self.pp_size > 1 and cur_backend != "nccl":
+                # 重新创建一个仅用于 PP 的 NCCL 组（同一 PP-Stage 内 ranks_same_stage）
+                ranks_same_stage = list(range(self.pp_rank * self.tp_size,
+                                              (self.pp_rank + 1) * self.tp_size))
+
+                pp_device_group = dist.new_group(ranks=ranks_same_stage, backend="nccl")
+                # 同时创建 CPU 组 (gloo) 以兼容现有接口
+                pp_cpu_group = dist.new_group(ranks=ranks_same_stage, backend="gloo")
+
+                # 构造新的 GroupCoordinator 并替换全局 _PP 引用
+                new_pp = GroupCoordinator(
+                    group_ranks=[ranks_same_stage],
+                    local_rank=self.tp_rank,
+                    torch_distributed_backend="nccl",
+                    use_pynccl=False,
+                    use_pymscclpp=False,
+                    use_custom_all_reduce=False,
+                    use_hpu_communicator=False,
+                    use_xpu_communicator=False,
+                    use_npu_communicator=False,
+                    group_name="pp",
+                    use_message_queue_broadcaster=False,
+                )
+                new_pp.device_group = pp_device_group  # type: ignore
+                new_pp.cpu_group = pp_cpu_group  # type: ignore
+
+                import sglang.srt.distributed.parallel_state as _ps  # noqa: E402
+                _ps._PP = new_pp  # type: ignore
+                logger.info("Recreated PP group with NCCL backend: %s", ranks_same_stage)
+
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
