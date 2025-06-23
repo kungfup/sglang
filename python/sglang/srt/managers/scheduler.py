@@ -2520,3 +2520,21 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+    # ----------------- 新增：Flush & 销毁 PP 组，防止 gloo 长尾 -----------------
+        try:
+            from sglang.srt.distributed.parallel_state import get_pp_group
+
+            pg = None
+            try:
+                pg = get_pp_group()
+            except Exception:
+                pg = None  # 未初始化 PP 组
+
+            if pg is not None:
+                try:
+                    pg.barrier()  # 确保前一轮 Send/Recv 全部完成
+                finally:
+                    pg.destroy()  # 彻底关闭 device_group & cpu_group
+        except Exception as _e:
+            logger.warning(f"Error when flushing/destroying pp_group: {_e}")
