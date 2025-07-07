@@ -47,7 +47,10 @@ from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     register_disaggregation_server,
 )
-from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.engine import (
+    _launch_semi_pd_subprocesses,
+    _launch_subprocesses,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -831,9 +834,14 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args
-    )
+    if server_args.enable_semi_pd:
+        tokenizer_manager, template_manager, scheduler_info = _launch_semi_pd_subprocesses(
+            server_args=server_args
+        )
+    else:
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+            server_args=server_args
+        )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,

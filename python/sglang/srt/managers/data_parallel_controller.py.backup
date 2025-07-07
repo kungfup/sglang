@@ -15,6 +15,7 @@
 
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -24,6 +25,10 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.semi_pd.utils import (
+    AggregatedSocket,
+    InstanceRole,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
@@ -31,7 +36,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.semi_pd.utils import AggregatedSocket, InstanceRole
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
@@ -115,7 +119,7 @@ class DataParallelController:
                     decode_socket = get_zmq_socket(
                         self.context, zmq.PUSH, pa.d_scheduler_input_ipc_name, True
                     )
-                    self.workers[dp_rank] = AggregatedSocket([prefill_socket, decode_socket])
+                    self.workers[dp_rank] = AggregatedSocket(prefill_socket, decode_socket)
             else:
                 for dp_rank in range(server_args.dp_size):
                     self.workers[dp_rank] = get_zmq_socket(
@@ -325,74 +329,6 @@ class DataParallelController:
                     for worker in self.workers[:: self.control_message_step]:
                         worker.send_pyobj(recv_req)
 
-    def launch_semi_pd_tensor_parallel_group(
-        self,
-        server_args: ServerArgs,
-        port_args: SemiPDPortArgs,
-        base_gpu_id: int,
-        dp_rank: int,
-        ready_event: threading.Event,
-    ):
-        """Launch Semi-PD tensor parallel group with simplified approach"""
-        logger.info(f"Launch Semi-PD DP{dp_rank} starting at GPU #{base_gpu_id}.")
-
-        # For now, use a simplified approach that just launches regular schedulers
-        # This allows us to test the basic functionality without the complex 3-process setup
-
-        # Import here to avoid circular imports
-        from sglang.srt.managers.scheduler import run_scheduler_process
-
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
-        tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
-        )
-
-        # Launch simplified Semi-PD schedulers (one per TP rank for now)
-        scheduler_pipe_readers = []
-        for tp_rank in tp_rank_range:
-            gpu_id = base_gpu_id + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-
-            logger.info(f"Launch Semi-PD instance TP {tp_rank} on GPU {gpu_id}")
-
-            reader, writer = mp.Pipe(duplex=False)
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
-                    dp_rank,
-                    writer,
-                    None,  # ipc_info_queue (simplified)
-                    False,  # bypass_load_weight=False (simplified)
-                    InstanceRole.OTHER,  # instance_role (simplified)
-                ),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            self.scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-
-        # Wait for all schedulers to be ready
-        for i, reader in enumerate(scheduler_pipe_readers):
-            logger.info(f"Waiting for Semi-PD instance {tp_rank_range.start + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            if i == 0:
-                self.max_total_num_tokens = data["max_total_num_tokens"]
-                self.max_req_input_len = data["max_req_input_len"]
-
-        # Signal that this DP rank is ready
-        ready_event.set()
-        logger.info(f"Semi-PD DP{dp_rank} is ready")
-
 
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
@@ -423,3 +359,181 @@ def run_data_parallel_controller_process(
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+    # Semi-PD specific methods for DataParallelController
+    def get_semi_pd_dp_attention_world_info(
+        self,
+        server_args: ServerArgs,
+        port_args: SemiPDPortArgs,
+        tp_rank: int,
+        dp_rank: int,
+    ):
+        """Get DP attention world info for Semi-PD"""
+        rank_port_args = SemiPDPortArgs.init_new(server_args, dp_rank)
+        rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+        rank_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+        return rank_port_args, dp_rank
+
+    def launch_semi_pd_tensor_parallel_group(
+        self,
+        server_args: ServerArgs,
+        port_args: SemiPDPortArgs,
+        base_gpu_id: int,
+        dp_rank: int,
+        ready_event: threading.Event,
+    ):
+        """Launch Semi-PD tensor parallel group with Standalone + Prefill + Decode schedulers"""
+        from sglang.srt.managers.semi_pd_scheduler import (
+            run_scheduler_process,
+            run_standalone_scheduler_process,
+        )
+
+        if not server_args.enable_dp_attention:
+            logger.info(f"Launch Semi-PD DP{dp_rank} starting at GPU #{base_gpu_id}.")
+
+        # Launch tensor parallel scheduler processes
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+        )
+
+        p_ipc_info_queues = [mp.Queue() for _ in range(tp_size_per_node)]
+        d_ipc_info_queues = [mp.Queue() for _ in range(tp_size_per_node)]
+
+        # Step 1: Launch Standalone Scheduler (for unified memory allocation)
+        s_reader, s_writer = mp.Pipe(duplex=False)
+        s_proc = mp.Process(
+            target=run_standalone_scheduler_process,
+            args=(
+                server_args,
+                port_args,
+                base_gpu_id,  # Use first GPU for standalone scheduler
+                0,  # tp_rank=0 for standalone
+                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                dp_rank,
+                s_writer,
+                False,  # bypass_load_weight=False for standalone
+                p_ipc_info_queues[0],  # Share IPC info with prefill
+                d_ipc_info_queues[0],  # Share IPC info with decode
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            s_proc.start()
+        self.scheduler_procs.append(s_proc)
+
+    # Wait for standalone scheduler to be ready
+    logger.info("Waiting for Standalone Scheduler to be ready")
+    data = s_reader.recv()
+    assert data["status"] == "ready"
+    server_args.max_total_tokens = data["max_total_num_tokens"]
+
+    # Step 2: Launch Decode Schedulers (先启动Decode，等待ready)
+    d_scheduler_pipe_readers = []
+    for tp_rank in tp_rank_range:
+        rank_port_args = port_args
+        if server_args.enable_dp_attention:
+            rank_port_args, dp_rank = self.get_semi_pd_dp_attention_world_info(
+                server_args, port_args, tp_rank, dp_rank
+            )
+
+        gpu_id = base_gpu_id + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+        queue_idx = tp_rank % tp_size_per_node
+        d_ipc_info_queue = d_ipc_info_queues[queue_idx]
+
+        # Set CUDA MPS for Decode instance
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+            server_args.semi_pd_decode_sm_percentage
+        )
+        logger.info(
+            f"Launch D instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+        )
+
+        d_reader, d_writer = mp.Pipe(duplex=False)
+        d_proc = mp.Process(
+            target=run_scheduler_process,
+            args=(
+                server_args,
+                rank_port_args,
+                gpu_id,
+                tp_rank,
+                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                dp_rank,
+                d_writer,
+                d_ipc_info_queue,  # ipc_info_queue
+                False,  # bypass_load_weight=False for Decode
+                InstanceRole.DECODE,  # instance_role
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            d_proc.start()
+        self.scheduler_procs.append(d_proc)
+        d_scheduler_pipe_readers.append(d_reader)
+
+    # Wait for all Decode schedulers to be ready
+    for i, reader in enumerate(d_scheduler_pipe_readers):
+        logger.info(f"Waiting for Decode instance {tp_rank_range.start + i} to be ready")
+        data = reader.recv()
+        assert data["status"] == "ready"
+        if i > 0:
+            assert server_args.max_total_tokens == data["max_total_num_tokens"]
+
+    # Step 3: Launch Prefill Schedulers (后启动Prefill)
+    p_scheduler_pipe_readers = []
+    for tp_rank in tp_rank_range:
+        rank_port_args = port_args
+        if server_args.enable_dp_attention:
+            rank_port_args, dp_rank = self.get_semi_pd_dp_attention_world_info(
+                server_args, port_args, tp_rank, dp_rank
+            )
+
+        queue_idx = tp_rank % tp_size_per_node
+        p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+
+        # Set CUDA MPS for Prefill instance
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+            server_args.semi_pd_prefill_sm_percentage
+        )
+
+        gpu_id = base_gpu_id + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+        logger.info(
+            f"Launch P instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+        )
+
+        p_reader, p_writer = mp.Pipe(duplex=False)
+        p_proc = mp.Process(
+            target=run_scheduler_process,
+            args=(
+                server_args,
+                rank_port_args,
+                gpu_id,
+                tp_rank,
+                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                dp_rank,
+                p_writer,
+                p_ipc_info_queue,  # ipc_info_queue
+                True,  # bypass_load_weight=True for Prefill
+                InstanceRole.PREFILL,  # instance_role
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            p_proc.start()
+        self.scheduler_procs.append(p_proc)
+        p_scheduler_pipe_readers.append(p_reader)
+
+    # Wait for all Prefill schedulers to be ready
+    for i, reader in enumerate(p_scheduler_pipe_readers):
+        logger.info(f"Waiting for Prefill instance {tp_rank_range.start + i} to be ready")
+        data = reader.recv()
+        assert data["status"] == "ready"
+
+        self.max_total_num_tokens = server_args.max_total_tokens
+        self.max_req_input_len = data["max_req_input_len"]
+
+        # Signal that this DP rank is ready
+        ready_event.set()

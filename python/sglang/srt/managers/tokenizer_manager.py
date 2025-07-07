@@ -113,7 +113,8 @@ from sglang.srt.managers.multimodal_processor import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.semi_pd.utils import AggregatedSocket
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
@@ -182,13 +183,28 @@ class TokenizerManager:
         )
 
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name, True
-        )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+        if server_args.enable_semi_pd:
+            # Semi-PD: 3 sockets (recv + 2 send for P&D)
+            context = zmq.asyncio.Context(3)
+            assert isinstance(port_args, SemiPDPortArgs)
+            self.recv_from_detokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.tokenizer_ipc_name, True
+            )
+            send_to_p_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, True
+            )
+            send_to_d_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, True
+            )
+            self.send_to_scheduler = AggregatedSocket([send_to_p_scheduler, send_to_d_scheduler])
+        else:
+            context = zmq.asyncio.Context(2)
+            self.recv_from_detokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.tokenizer_ipc_name, True
+            )
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -274,42 +290,45 @@ class TokenizerManager:
             )
 
         # Communicators
+        # Semi-PD: fan_out is 2 * dp_size for P&D instances
+        fan_out_size = server_args.dp_size * 2 if server_args.enable_semi_pd else server_args.dp_size
+
         self.init_weights_update_group_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.update_weights_from_tensor_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.get_weights_by_name_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.slow_down_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.flush_cache_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.profile_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
         self.expert_distribution_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out_size
         )
 
         self._result_dispatcher = TypeBasedDispatcher(
@@ -660,7 +679,9 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        logger.info(f"[TOKENIZER] _send_one_request called, rid={obj.rid}, type={type(tokenized_obj)}")
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        logger.info(f"[TOKENIZER] Request sent to scheduler, rid={obj.rid}")
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         return state

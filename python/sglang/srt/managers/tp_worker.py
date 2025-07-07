@@ -59,6 +59,8 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        bypass_load_weight: bool = False,
+        instance_role = None,  # Will import InstanceRole later to avoid circular import
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -89,6 +91,8 @@ class TpModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -110,9 +114,15 @@ class TpModelWorker:
                 )
         self.device = self.model_runner.device
 
-        # Init nccl groups
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        # Init nccl groups - Handle Semi-PD single GPU mode
+        try:
+            self.pp_group = get_pp_group()
+        except AssertionError:
+            self.pp_group = None
+        try:
+            self.world_group = get_world_group()
+        except AssertionError:
+            self.world_group = None
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
@@ -137,12 +147,16 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # Handle Semi-PD single GPU mode
+        if self.world_group is not None:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
+        else:
+            self.random_seed = server_args.random_seed
         set_random_seed(self.random_seed)
 
         # A reference make this class has the same member as TpModelWorkerClient
@@ -189,6 +203,23 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    # Semi-PD specific methods
+    def get_ipc_info(self):
+        """Get IPC information for Semi-PD weight sharing"""
+        return self.model_runner.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info):
+        """Share parameters from IPC for Semi-PD"""
+        return self.model_runner.share_params_from_ipc(ipc_info)
+
+    def init_attention_backend(self):
+        """Initialize attention backend for Semi-PD"""
+        self.model_runner.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        """Initialize CUDA graphs for Semi-PD"""
+        self.model_runner.init_cuda_graphs()
 
     def forward_batch_generation(
         self,

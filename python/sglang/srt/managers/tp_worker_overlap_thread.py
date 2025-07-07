@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 import psutil
 import torch
 
+from sglang.semi_pd.utils import InstanceRole, IPCInfo
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -59,10 +60,19 @@ class TpModelWorkerClient:
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -267,6 +277,23 @@ class TpModelWorkerClient:
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         return self.worker.get_weights_by_name(recv_req)
+
+    # Semi-PD specific methods
+    def get_ipc_info(self) -> IPCInfo:
+        """Get IPC information for Semi-PD weight sharing"""
+        return self.worker.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        """Share parameters from IPC for Semi-PD Prefill instances"""
+        self.worker.share_params_from_ipc(ipc_info)
+
+    def init_attention_backend(self):
+        """Initialize attention backend for Semi-PD delayed initialization"""
+        self.worker.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        """Initialize CUDA graphs for Semi-PD delayed initialization"""
+        self.worker.init_cuda_graphs()
 
     def __delete__(self):
         self.input_queue.put((None, None))

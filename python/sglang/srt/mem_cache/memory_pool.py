@@ -53,6 +53,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        bypass_create_buffers: bool = False,
     ):
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -62,10 +63,14 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
-            )
+        if not bypass_create_buffers:
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.req_to_token = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+        else:
+            # Semi-PD: Skip buffer creation for Prefill instances
+            self.req_to_token = None
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
@@ -105,6 +110,7 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        bypass_create_buffers: bool = False,
     ):
         self.size = size
         self.page_size = page_size
@@ -180,6 +186,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        bypass_create_buffers: bool = False,
     ):
         super().__init__(
             size,
@@ -190,6 +197,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            bypass_create_buffers,
         )
 
         self.head_num = head_num
@@ -208,7 +216,12 @@ class MHATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        self._create_buffers()
+        if not bypass_create_buffers:
+            self._create_buffers()
+            k_size, v_size = self.get_kv_size_bytes()
+            logger.info(
+                f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+            )
 
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)

@@ -208,11 +208,25 @@ class LogitsProcessor(nn.Module):
             )
             self.do_tensor_parallel_all_gather_dp_attn = False
         else:
+            # Handle Semi-PD single GPU mode
+            try:
+                tp_world_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_world_size = 1
+
             self.do_tensor_parallel_all_gather = (
-                not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+                not skip_all_gather and tp_world_size > 1
             )
+
+            try:
+                attention_dp_size = get_attention_dp_size()
+            except (AssertionError, AttributeError):
+                # Semi-PD single GPU mode
+                attention_dp_size = 1
+
             self.do_tensor_parallel_all_gather_dp_attn = (
-                self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+                self.do_tensor_parallel_all_gather and attention_dp_size != 1
             )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None

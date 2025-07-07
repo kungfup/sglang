@@ -344,9 +344,17 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_rank = 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_size = 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
@@ -499,9 +507,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_rank = 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_size = 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
@@ -794,9 +810,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_rank = 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_size = 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
@@ -1173,9 +1197,17 @@ class RowParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_rank = 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            try:
+                tp_size = get_tensor_model_parallel_world_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                tp_size = 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None

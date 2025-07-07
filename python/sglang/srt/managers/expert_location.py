@@ -213,7 +213,7 @@ class ExpertLocationMetadata:
                     num_gpus=ep_size,
                     num_physical_experts=num_physical_experts,
                     # TODO improve when we have real EP rank
-                    ep_rank=torch.distributed.get_rank() % ep_size,
+                    ep_rank=(torch.distributed.get_rank() if torch.distributed.is_initialized() else 0) % ep_size,
                 )
                 if server_args.ep_dispatch_algorithm == "static"
                 else None

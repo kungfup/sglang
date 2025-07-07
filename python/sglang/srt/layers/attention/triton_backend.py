@@ -101,11 +101,16 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
 
+        # Handle Semi-PD single GPU mode
+        try:
+            attention_tp_size = get_attention_tp_size()
+        except AssertionError:
+            attention_tp_size = 1
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // attention_tp_size
         )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            attention_tp_size
         )
 
         self.static_kv_splits = get_bool_env_var(

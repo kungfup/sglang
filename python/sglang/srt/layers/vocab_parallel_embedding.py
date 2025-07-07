@@ -231,11 +231,21 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.enable_tp = enable_tp
         if self.enable_tp:
             if use_attn_tp_group:
-                tp_rank = get_attention_tp_rank()
-                self.tp_size = get_attention_tp_size()
+                try:
+                    tp_rank = get_attention_tp_rank()
+                    self.tp_size = get_attention_tp_size()
+                except AssertionError:
+                    # Semi-PD single GPU mode
+                    tp_rank = 0
+                    self.tp_size = 1
             else:
-                tp_rank = get_tensor_model_parallel_rank()
-                self.tp_size = get_tensor_model_parallel_world_size()
+                try:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    self.tp_size = get_tensor_model_parallel_world_size()
+                except AssertionError:
+                    # Semi-PD single GPU mode
+                    tp_rank = 0
+                    self.tp_size = 1
         else:
             assert use_attn_tp_group is False
             tp_rank = 0

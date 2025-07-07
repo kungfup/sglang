@@ -1074,10 +1074,26 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-        context
-    ):
-        yield context
+    try:
+        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
+            context
+        ):
+            yield context
+    except AssertionError:
+        # Semi-PD mode: tensor/pipeline model parallel groups not initialized
+        # Create a simple graph capture context
+        import torch
+        from contextlib import nullcontext
+
+        stream = torch.cuda.Stream()
+        context = GraphCaptureContext(stream)
+
+        curr_stream = torch.cuda.current_stream()
+        if curr_stream != stream:
+            curr_stream.wait_stream(stream)
+
+        with torch.cuda.stream(stream), nullcontext():
+            yield context
 
 
 logger = logging.getLogger(__name__)
@@ -1299,7 +1315,11 @@ def get_tensor_model_parallel_world_size():
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
+    try:
+        return get_tp_group().rank_in_group
+    except AssertionError:
+        # Semi-PD mode: tensor model parallel group not initialized, assume rank 0
+        return 0
 
 
 def destroy_model_parallel():
@@ -1437,3 +1457,33 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+
+def initialize_model_parallel_dummy():
+    """
+    Initialize minimal parallel state for Semi-PD single GPU mode.
+    This avoids distributed initialization while maintaining compatibility.
+    """
+    global _TP
+    global _PP
+    global _WORLD
+
+    # For single GPU mode, we don't need actual GroupCoordinator objects
+    # Just set them to None to indicate single GPU mode
+    if _WORLD is None:
+        _WORLD = None
+
+    if _TP is None:
+        _TP = None
+
+    if _PP is None:
+        _PP = None
+
+    # Set basic parallel state for single GPU
+    import sglang.srt.distributed.parallel_state as ps
+    if hasattr(ps, '_TENSOR_MODEL_PARALLEL_RANK'):
+        ps._TENSOR_MODEL_PARALLEL_RANK = 0
+        ps._TENSOR_MODEL_PARALLEL_WORLD_SIZE = 1
+    if hasattr(ps, '_PIPELINE_MODEL_PARALLEL_RANK'):
+        ps._PIPELINE_MODEL_PARALLEL_RANK = 0
+        ps._PIPELINE_MODEL_PARALLEL_WORLD_SIZE = 1

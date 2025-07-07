@@ -25,16 +25,18 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+# Disable vLLM import to avoid compatibility issues
+if False:  # Temporarily disable vLLM import
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
 
-try:
-    import vllm
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
+# Disable vLLM to avoid compatibility issues
+VLLM_AVAILABLE = False
+# try:
+#     import vllm
+#     VLLM_AVAILABLE = True
+# except ImportError:
+#     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 

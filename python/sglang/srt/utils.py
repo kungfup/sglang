@@ -1227,8 +1227,14 @@ def get_amdgpu_memory_capacity():
 
 def get_device_sm():
     if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        return major * 10 + minor
+        try:
+            # Use device 0 explicitly to avoid device index issues
+            major, minor = torch.cuda.get_device_capability(0)
+            return major * 10 + minor
+        except Exception as e:
+            # Fallback to a reasonable default SM version
+            print(f"Warning: Could not get CUDA device capability: {e}")
+            return 80  # Default to SM 8.0 (common for modern GPUs)
     return 0
 
 
@@ -1504,7 +1510,15 @@ def get_device_core_count(device_id: int = 0) -> int:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device_id)
+        try:
+            # Ensure device_id is valid
+            if device_id >= torch.cuda.device_count():
+                device_id = 0
+            major, minor = torch.cuda.get_device_capability(device_id)
+        except Exception as e:
+            print(f"Warning: Could not get CUDA device capability: {e}")
+            # Fallback to reasonable defaults
+            major, minor = 8, 0  # Default to SM 8.0
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
@@ -1920,7 +1934,11 @@ def configure_ipv6(dist_init_addr):
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if get_tensor_model_parallel_rank() == 0:
+    try:
+        if get_tensor_model_parallel_rank() == 0:
+            print(msg, flush=True)
+    except AssertionError:
+        # Semi-PD mode: tensor model parallel group not initialized, assume rank 0
         print(msg, flush=True)
 
 

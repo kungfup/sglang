@@ -75,13 +75,18 @@ USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 def cutlass_fp8_supported():
     if not _is_cuda:
         return False
-    major, minor = get_device_capability()
-    cuda_version = get_cuda_version()
-    if major >= 9:
-        return cuda_version >= (12, 0)
-    elif major == 8 and minor == 9:
-        return cuda_version >= (12, 4)
-    return False
+    try:
+        major, minor = get_device_capability()
+        cuda_version = get_cuda_version()
+        if major >= 9:
+            return cuda_version >= (12, 0)
+        elif major == 8 and minor == 9:
+            return cuda_version >= (12, 4)
+        return False
+    except Exception as e:
+        # Fallback if CUDA device capability detection fails
+        print(f"Warning: Could not detect CUDA capability for FP8 support: {e}")
+        return False
 
 
 def normalize_e4m3fn_to_e4m3fnuz(

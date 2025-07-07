@@ -582,7 +582,9 @@ class CudaGraphRunner:
 
         for _ in range(2):
             torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
+            # Semi-PD mode: tp_group might be None
+            if self.model_runner.tp_group is not None:
+                self.model_runner.tp_group.barrier()
 
             run_once()
 

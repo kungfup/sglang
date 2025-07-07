@@ -27,6 +27,10 @@ class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
+
+    Semi-PD changes:
+    - Disable prefill overlap mode.
+    - Do next_token_ids.tolist() only when necessary.
     """
 
     def process_batch_result_prefill(
@@ -50,13 +54,16 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            if self.enable_overlap:
+            # Semi-PD
+            if self.enable_overlap and not self.server_args.enable_semi_pd:
                 logits_output, next_token_ids, _ = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
+                # Semi-PD
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
                         logits_output.next_token_logprobs = (

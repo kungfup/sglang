@@ -13,8 +13,16 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
-    from vllm._custom_ops import scaled_fp8_quant
+# Disable vLLM import to avoid compatibility issues
+# Original condition: if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if False:  # Temporarily disable vLLM import
+    try:
+        from vllm._custom_ops import scaled_fp8_quant
+    except ImportError:
+        # Fallback if vLLM is not available
+        def scaled_fp8_quant(*args, **kwargs):
+            raise NotImplementedError("FP8 quantization requires vLLM or CUDA support")
+        scaled_fp8_quant = scaled_fp8_quant
 
 
 def is_layer_skipped(

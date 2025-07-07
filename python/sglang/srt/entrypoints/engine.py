@@ -42,6 +42,23 @@ from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+
+# Module-level wrapper function for multiprocessing spawn compatibility
+def test_detokenizer_wrapper_module_level(server_args, port_args, pipe_writer):
+    """Module-level wrapper function to test multiprocessing spawn mode"""
+    # Write to a file immediately to confirm function is called
+    try:
+        with open("/tmp/detokenizer_wrapper_module_debug.log", "w") as f:
+            f.write("🔧 [MODULE WRAPPER] Function called - starting initialization\n")
+            f.flush()
+    except Exception as e:
+        pass
+
+    # Add immediate debug output to stdout
+    print("🔧 [MODULE WRAPPER] Function called - starting initialization", flush=True)
+
+    # Now call the actual function
+    return run_detokenizer_process(server_args, port_args, pipe_writer)
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -119,10 +136,16 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=port_args,
-        )
+        if getattr(server_args, 'enable_semi_pd', False):
+            tokenizer_manager, template_manager, scheduler_info = _launch_semi_pd_subprocesses(
+                server_args=server_args,
+                port_args=port_args,
+            )
+        else:
+            tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+                server_args=server_args,
+                port_args=port_args,
+            )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -741,14 +764,22 @@ def _launch_subprocesses(
         return None, None, None
 
     # Launch detokenizer process
+    detoken_reader, detoken_writer = mp.Pipe(duplex=False)
     detoken_proc = mp.Process(
         target=run_detokenizer_process,
         args=(
             server_args,
             port_args,
+            detoken_writer,
         ),
     )
     detoken_proc.start()
+
+    # Wait for detokenizer to be ready
+    logger.info("Waiting for Detokenizer to be ready")
+    data = detoken_reader.recv()
+    assert data["status"] == "ready"
+    logger.info("Detokenizer is ready")
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
@@ -780,6 +811,246 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+
+    # Assume all schedulers have the same scheduler_info
+    scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    return tokenizer_manager, template_manager, scheduler_info
+
+
+def _launch_semi_pd_subprocesses(
+    server_args: ServerArgs,
+    port_args: Optional[PortArgs] = None,
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    """
+    Launch Semi-PD subprocesses: Standalone Scheduler + Prefill Scheduler + Decode Scheduler
+    """
+    from sglang.srt.managers.semi_pd_scheduler import (
+        run_standalone_scheduler_process,
+        run_scheduler_process,
+    )
+    from sglang.srt.server_args import SemiPDPortArgs
+    from sglang.semi_pd.utils import InstanceRole
+
+    # Configure global environment
+    configure_logger(server_args)
+    server_args.check_server_args()
+    _set_envs_and_config(server_args)
+
+    # Allocate ports for inter-process communications
+    if port_args is None:
+        port_args = SemiPDPortArgs.init_new(server_args)
+        logger.info(f"{server_args=}")
+
+    # If using model from www.modelscope.cn, first download the model.
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+        server_args.model_path, server_args.tokenizer_path
+    )
+
+    scheduler_procs = []
+    scheduler_infos = []
+
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+
+        p_scheduler_pipe_readers = []
+        d_scheduler_pipe_readers = []
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
+        tp_rank_range = range(
+            tp_size_per_node * server_args.node_rank,
+            tp_size_per_node * (server_args.node_rank + 1),
+        )
+
+        p_ipc_info_queues: List[mp.Queue] = [
+            mp.Queue() for _ in range(tp_size_per_node)
+        ]
+        d_ipc_info_queues: List[mp.Queue] = [
+            mp.Queue() for _ in range(tp_size_per_node)
+        ]
+
+        tp_rank_base = tp_size_per_node * server_args.node_rank
+
+        # Step 1: Launch Standalone Scheduler (for unified memory allocation)
+        s_reader, s_writer = mp.Pipe(duplex=False)
+        s_proc = mp.Process(
+            target=run_standalone_scheduler_process,
+            args=(
+                server_args,
+                port_args,
+                server_args.base_gpu_id,  # Use first GPU for standalone scheduler
+                0,  # tp_rank=0 for standalone
+                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                None,  # dp_rank=None
+                s_writer,
+                False,  # bypass_load_weight=False for standalone
+                p_ipc_info_queues[0],  # Share IPC info with prefill
+                d_ipc_info_queues[0],  # Share IPC info with decode
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            s_proc.start()
+        scheduler_procs.append(s_proc)
+
+        # Wait for standalone scheduler to be ready
+        logger.info("Waiting for Standalone Scheduler to be ready")
+        data = s_reader.recv()
+        assert data["status"] == "ready"
+        scheduler_infos.append(data)
+        server_args.max_total_tokens = data["max_total_num_tokens"]
+
+        # Step 2: Launch Decode Schedulers (先启动Decode，等待ready)
+        for tp_rank in tp_rank_range:
+            queue_idx = tp_rank % tp_size_per_node
+            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+
+            # Set CUDA MPS for Decode instance
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                server_args.semi_pd_decode_sm_percentage
+            )
+            logger.info(
+                f"Launch Decode instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+            )
+
+            d_reader, d_writer = mp.Pipe(duplex=False)
+            d_proc = mp.Process(
+                target=run_scheduler_process,
+                args=(
+                    server_args,
+                    port_args,
+                    gpu_id,
+                    tp_rank,
+                    0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                    None,  # dp_rank=None
+                    d_writer,
+                    d_ipc_info_queue,  # ipc_info_queue
+                    False,  # bypass_load_weight=False for Decode
+                    InstanceRole.DECODE,  # instance_role
+                ),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                d_proc.start()
+            scheduler_procs.append(d_proc)
+            d_scheduler_pipe_readers.append(d_reader)
+
+        # Wait for all Decode schedulers to be ready
+        for i, reader in enumerate(d_scheduler_pipe_readers):
+            logger.info(f"Waiting for Decode instance {tp_rank_base + i} to be ready")
+            data = reader.recv()
+            assert data["status"] == "ready"
+            scheduler_infos.append(data)
+            if i > 0:
+                assert (
+                    server_args.max_total_tokens == data["max_total_num_tokens"]
+                )
+
+        # Step 3: Launch Prefill Schedulers (后启动Prefill)
+        for tp_rank in tp_rank_range:
+            queue_idx = tp_rank % tp_size_per_node
+            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+
+            # Set CUDA MPS for Prefill instance
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                server_args.semi_pd_prefill_sm_percentage
+            )
+
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+            logger.info(
+                f"Launch Prefill instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+            )
+
+            p_reader, p_writer = mp.Pipe(duplex=False)
+            p_proc = mp.Process(
+                target=run_scheduler_process,
+                args=(
+                    server_args,
+                    port_args,
+                    gpu_id,
+                    tp_rank,
+                    0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
+                    None,  # dp_rank=None
+                    p_writer,
+                    p_ipc_info_queue,  # ipc_info_queue
+                    True,  # bypass_load_weight=True for Prefill
+                    InstanceRole.PREFILL,  # instance_role
+                ),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                p_proc.start()
+            scheduler_procs.append(p_proc)
+            p_scheduler_pipe_readers.append(p_reader)
+
+        # Wait for all Prefill schedulers to be ready
+        for i, reader in enumerate(p_scheduler_pipe_readers):
+            logger.info(f"Waiting for Prefill instance {tp_rank_base + i} to be ready")
+            data = reader.recv()
+            assert data["status"] == "ready"
+            scheduler_infos.append(data)
+    else:
+        # Data parallel mode - not implemented for Semi-PD yet
+        raise NotImplementedError("Semi-PD does not support data parallel mode yet")
+
+    # Launch detokenizer process using module-level wrapper
+    detoken_reader, detoken_writer = mp.Pipe(duplex=False)
+    detoken_proc = mp.Process(
+        target=test_detokenizer_wrapper_module_level,
+        args=(
+            server_args,
+            port_args,
+            detoken_writer,
+        ),
+    )
+    logger.info("Starting Detokenizer process...")
+    detoken_proc.start()
+    scheduler_procs.append(detoken_proc)
+    logger.info(f"Detokenizer process started with PID: {detoken_proc.pid}")
+
+    # Wait for detokenizer to be ready with timeout
+    logger.info("Waiting for Detokenizer to be ready")
+    try:
+        import select
+        if detoken_reader.poll(timeout=30):  # 30 second timeout
+            data = detoken_reader.recv()
+            if data["status"] == "ready":
+                logger.info("Detokenizer is ready")
+            else:
+                logger.error(f"Detokenizer failed to start: {data}")
+                raise RuntimeError(f"Detokenizer failed: {data}")
+        else:
+            logger.error("Detokenizer startup timeout after 30 seconds")
+            logger.error(f"Detokenizer process alive: {detoken_proc.is_alive()}")
+            logger.error(f"Detokenizer process exitcode: {detoken_proc.exitcode}")
+            raise RuntimeError("Detokenizer startup timeout")
+    except Exception as e:
+        logger.error(f"Error waiting for Detokenizer: {e}")
+        if detoken_proc.is_alive():
+            logger.info("Terminating Detokenizer process...")
+            detoken_proc.terminate()
+            detoken_proc.join(timeout=5)
+        raise
+
+    # Launch tokenizer manager in the main process
+    tokenizer_manager = TokenizerManager(
+        server_args, port_args
+    )
+
+    # Launch template manager in the main process
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]

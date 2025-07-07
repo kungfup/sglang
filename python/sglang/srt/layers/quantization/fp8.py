@@ -8,22 +8,30 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
+# Disable vLLM marlin import to avoid compatibility issues
+MARLIN_FP8_AVAILABLE = False
+
+def dummy_func(*args, **kwargs):
+    raise ImportError(
+        "marlin FP8 requires some operators from vllm. Please install vllm."
     )
 
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
+apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
+# Original code (disabled):
+# try:
+#     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+#         apply_fp8_marlin_linear,
+#         prepare_fp8_layer_for_marlin,
+#     )
+#     MARLIN_FP8_AVAILABLE = True
+# except ImportError:
+#     MARLIN_FP8_AVAILABLE = False
+#     def dummy_func(*args, **kwargs):
+#         raise ImportError(
+#             "marlin FP8 requires some operators from vllm. Please install vllm."
+#         )
+#     apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -92,7 +100,8 @@ if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+# Disable vLLM import to avoid compatibility issues
+if False:  # Temporarily disable vLLM import
     from vllm._custom_ops import scaled_fp8_quant
 
 

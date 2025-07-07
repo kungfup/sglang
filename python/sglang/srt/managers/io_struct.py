@@ -717,6 +717,11 @@ class BatchEmbeddingOut:
 
 
 @dataclass
+class FlushCacheReq:
+    pass
+
+
+@dataclass
 class FlushCacheReqInput:
     pass
 
@@ -994,3 +999,28 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+# Semi-PD specific classes for v0.4.8 compatibility
+@dataclass
+class BatchProcessPrefillResultReq:
+    """Request to process prefill results in Semi-PD decode scheduler"""
+    next_token_ids: List[int]
+    next_token_logits: Optional[List[List[float]]] = None
+
+
+@dataclass
+class GetNextPrefillBatchInput:
+    """Input for getting next prefill batch in Semi-PD"""
+    rids: List[str]
+
+
+@dataclass
+class GetNextPrefillBatchOutput:
+    """Output for getting next prefill batch in Semi-PD"""
+    rids: List[str]
+    chunked_rid: Optional[str] = None
+    req_pool_indices: List[int] = None
+    prefix_lens: List[int] = None
+    extend_input_lens: List[int] = None
+    finished_reasons: Optional[List[BaseFinishReason]] = None

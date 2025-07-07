@@ -109,7 +109,12 @@ class Qwen2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        # Handle Semi-PD single GPU mode
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            tp_size = 1
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -251,7 +256,20 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        # Handle Semi-PD single GPU mode
+        try:
+            self.pp_group = get_pp_group()
+        except AssertionError:
+            # Semi-PD single GPU mode - create a dummy PP group
+            from types import SimpleNamespace
+            self.pp_group = SimpleNamespace(
+                is_first_rank=True,
+                is_last_rank=True,
+                rank_in_group=0,
+                world_size=1,
+                first_rank=0,
+                last_rank=0
+            )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -333,8 +351,14 @@ class Qwen2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        # Handle Semi-PD single GPU mode
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            tp_size = 1
+            tp_rank = 0
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -380,7 +404,22 @@ class Qwen2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        # Handle Semi-PD single GPU mode
+        try:
+            self.pp_group = get_pp_group()
+        except AssertionError:
+            # Semi-PD single GPU mode - create a dummy PP group
+            from types import SimpleNamespace
+            self.pp_group = SimpleNamespace(
+                is_first_rank=True,
+                is_last_rank=True,
+                rank_in_group=0,
+                world_size=1,
+                first_rank=0,
+                last_rank=0,
+                send=lambda *args, **kwargs: None,
+                recv=lambda *args, **kwargs: None
+            )
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2Model(

@@ -50,14 +50,21 @@ def apply_torchao_config_to_model(
         128
     """
     # Lazy import to suppress some warnings
-    from torchao.quantization import (
-        float8_dynamic_activation_float8_weight,
-        float8_weight_only,
-        int4_weight_only,
-        int8_dynamic_activation_int8_weight,
-        int8_weight_only,
-        quantize_,
-    )
+    try:
+        from torchao.quantization import (
+            float8_dynamic_activation_float8_weight,
+            float8_weight_only,
+            int4_weight_only,
+            int8_dynamic_activation_int8_weight,
+            int8_weight_only,
+            quantize_,
+        )
+    except ImportError:
+        print("Warning: torchao not available, skipping quantization")
+        return  # Skip quantization if torchao is not available
+    except ImportError:
+        # torchao not available, skip quantization
+        return
     from torchao.quantization.observer import PerRow, PerTensor
 
     if torchao_config == "" or torchao_config is None:

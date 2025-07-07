@@ -156,6 +156,8 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        bypass_load_weight: bool = False,
+        instance_role = None,  # Will import InstanceRole later to avoid circular import
     ):
         # Parse args
         self.model_config = model_config
@@ -186,6 +188,10 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+
+        # Semi-PD specific parameters
+        self.bypass_load_weight = bypass_load_weight
+        self.instance_role = instance_role
         self.attention_chunk_size = model_config.attention_chunk_size
 
         self.forward_pass_id = 0
@@ -261,10 +267,16 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
-        )
+        # Handle Semi-PD case where model might not be loaded
+        if hasattr(self, 'model') and self.model is not None:
+            self.start_layer = getattr(self.model, "start_layer", 0)
+            self.end_layer = getattr(
+                self.model, "end_layer", self.model_config.num_hidden_layers
+            )
+        else:
+            # Semi-PD fallback: use default values
+            self.start_layer = 0
+            self.end_layer = self.model_config.num_hidden_layers
         self.num_effective_layers = self.end_layer - self.start_layer
 
         # Apply torchao quantization
@@ -296,8 +308,13 @@ class ModelRunner:
         )
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
-            self.init_cuda_graphs()
+            # Semi-PD: delay attention and cuda graph init for P & D instances
+            if not getattr(server_args, 'enable_semi_pd', False):
+                self.init_attention_backend()
+                self.init_cuda_graphs()
+            else:
+                # Will be initialized later via init_attention_backend() and init_cuda_graphs()
+                self.cuda_graph_runner = None
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
@@ -471,36 +488,63 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
-            # Only initialize the distributed environment on the target model worker.
-            init_distributed_environment(
-                backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
-                local_rank=self.gpu_id,
-                distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
-            )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                pipeline_model_parallel_size=self.pp_size,
-            )
-            initialize_dp_attention(
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
-            )
+            # Skip distributed initialization for Semi-PD in single GPU mode
+            skip_distributed = False
+            try:
+                if (hasattr(self.server_args, 'enable_semi_pd') and
+                    self.server_args.enable_semi_pd and
+                    self.tp_size == 1):
+                    skip_distributed = True
+                    logger.info("✅ Skipping distributed initialization for Semi-PD single GPU mode")
+            except Exception as e:
+                logger.warning(f"Could not check Semi-PD mode: {e}")
 
-        min_per_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
-        )
-        self.tp_group = get_tp_group()
-        self.attention_tp_group = get_attention_tp_group()
+            if skip_distributed:
+                # Initialize minimal parallel state for single GPU
+                from sglang.srt.distributed.parallel_state import initialize_model_parallel_dummy
+                initialize_model_parallel_dummy()
+            else:
+                # Only initialize the distributed environment on the target model worker.
+                init_distributed_environment(
+                    backend=backend,
+                    world_size=self.tp_size * self.pp_size,
+                    rank=self.tp_size * (self.pp_rank or 0) + self.tp_rank,
+                    local_rank=self.gpu_id,
+                    distributed_init_method=dist_init_method,
+                    timeout=self.server_args.dist_timeout,
+                )
+                initialize_model_parallel(
+                    tensor_model_parallel_size=self.tp_size,
+                    pipeline_model_parallel_size=self.pp_size,
+                )
+                initialize_dp_attention(
+                    enable_dp_attention=self.server_args.enable_dp_attention,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dp_size=self.server_args.dp_size,
+                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
+                    pp_size=self.server_args.pp_size,
+                )
+
+        # Handle Semi-PD single GPU mode
+        if skip_distributed:
+            min_per_gpu_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=False,
+                cpu_group=None,
+            )
+            self.tp_group = None
+            self.attention_tp_group = None
+        else:
+            min_per_gpu_memory = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=get_world_group().world_size > 1,
+                cpu_group=get_world_group().cpu_group,
+            )
+            self.tp_group = get_tp_group()
+            self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -523,6 +567,10 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        # Semi-PD: Log bypass but continue to create model with meta device
+        if self.bypass_load_weight:
+            logger.info("Semi-PD: Bypassing weight loading for this instance")
+
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -560,7 +608,7 @@ class ModelRunner:
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=DeviceConfig("meta" if self.bypass_load_weight else self.device),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -606,12 +654,18 @@ class ModelRunner:
         )
 
         # Handle the case where some ranks do not finish loading.
+        # Skip barrier in Semi-PD single GPU mode
         try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
+            tp_group = get_tp_group()
+            if tp_group is not None:
+                dist.monitored_barrier(
+                    group=tp_group.cpu_group,
+                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    wait_all_ranks=True,
+                )
+        except AssertionError:
+            # Semi-PD single GPU mode - skip barrier
+            pass
         except RuntimeError:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
@@ -815,11 +869,21 @@ class ModelRunner:
         logger.info("LoRA manager ready.")
 
     def profile_max_num_token(self, total_gpu_memory: int):
+        # Handle Semi-PD single GPU mode
+        try:
+            world_group = get_world_group()
+            distributed = world_group.world_size > 1
+            cpu_group = world_group.cpu_group
+        except AssertionError:
+            # Semi-PD single GPU mode
+            distributed = False
+            cpu_group = None
+
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=distributed,
+            cpu_group=cpu_group,
         )
         if self.is_draft_worker:
             num_layers = getattr(
@@ -838,8 +902,15 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
+            # Handle Semi-PD single GPU mode
+            try:
+                attention_tp_size = get_attention_tp_size()
+            except AssertionError:
+                # Semi-PD single GPU mode
+                attention_tp_size = 1
+
             cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                self.model_config.get_num_kv_heads(attention_tp_size)
                 * self.model_config.head_dim
                 * num_layers
                 * 2
@@ -857,6 +928,30 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
+        # Handle Semi-PD single GPU mode
+        try:
+            attention_tp_size = get_attention_tp_size()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            attention_tp_size = 1
+        # Handle Semi-PD single GPU mode
+        try:
+            attention_tp_size = get_attention_tp_size()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            attention_tp_size = 1
+        # Handle Semi-PD single GPU mode
+        try:
+            attention_tp_size = get_attention_tp_size()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            attention_tp_size = 1
+        # Handle Semi-PD single GPU mode
+        try:
+            attention_tp_size = get_attention_tp_size()
+        except AssertionError:
+            # Semi-PD single GPU mode
+            attention_tp_size = 1
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -978,7 +1073,7 @@ class ModelRunner:
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_num=self.model_config.get_num_kv_heads(attention_tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
@@ -992,7 +1087,7 @@ class ModelRunner:
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_num=self.model_config.get_num_kv_heads(attention_tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
@@ -1358,7 +1453,136 @@ class LocalSerializedTensor:
     """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
     The i-th element in the list corresponds to i-th rank's GPU."""
 
-    values: List[bytes]
+    def __getitem__(self, index):
+        return self.tensors[index]
 
-    def get(self, rank: int):
-        return MultiprocessingSerializer.deserialize(self.values[rank])
+    def get(self, index):
+        return self.tensors[index]
+
+
+# Semi-PD IPC methods - Add to ModelRunner class
+def get_ipc_info(self):
+    """Get IPC information for Semi-PD weight sharing"""
+    from sglang.semi_pd.utils import HAS_IPC, IPCInfo
+
+    if not HAS_IPC:
+        # Fallback mode: return empty IPC info
+        logger.info("Semi-PD IPC extension not available, using fallback mode")
+        return IPCInfo(
+            params_info={},
+            weight_handles={},
+            register_buffer_handles={},
+            kv_cache_handles=[],
+            kvcache_info={},
+            req_to_token_handle=[],
+            req_to_token_info={}
+        )
+
+    # IPC mode: get actual IPC handles
+    import semi_pd_ipc
+    from sglang.semi_pd.utils import get_ipc_handle
+
+    handle_to_name = {}
+    tensor_info = {}
+    weight_handles = {}
+    register_buffer_handles = {}
+
+    def check_duplicate_handle(handle_to_name_, handle_, name_):
+        hashed = tuple(handle_[0]), handle_[1]
+        if handle_to_name_.get(hashed, None) is not None and handle_ != "BYPASS":
+            logger.warning(
+                f"Duplicate handle found, {handle_to_name_[hashed]} and {name_}"
+            )
+        handle_to_name_[hashed] = name_
+
+    # Get weight handles
+    for name, param in self.model.named_parameters():
+        if param.data.is_cuda:
+            handle = get_ipc_handle(param.data)
+            check_duplicate_handle(handle_to_name, handle, name)
+            weight_handles[name] = handle
+            tensor_info[name] = (param.shape, param.dtype, param.device)
+
+    # Get buffer handles
+    for name, buffer in self.model.named_buffers():
+        if buffer.data.is_cuda:
+            handle = get_ipc_handle(buffer.data)
+            check_duplicate_handle(handle_to_name, handle, name)
+            register_buffer_handles[name] = handle
+            tensor_info[name] = (buffer.shape, buffer.dtype, buffer.device)
+
+    # Get KV cache handles (simplified for fallback compatibility)
+    kv_cache_handles = []
+    kvcache_info = {}
+
+    # Get ReqToToken handles
+    req_to_token_tensor = self.req_to_token_pool.req_to_token
+    req_to_token_handles = [get_ipc_handle(req_to_token_tensor)]
+    req_to_token_info = {
+        "req_to_token_shape": req_to_token_tensor.shape,
+        "req_to_token_dtype": req_to_token_tensor.dtype,
+        "req_to_token_device": req_to_token_tensor.device,
+    }
+
+    logger.info(f"Generated IPC info for {len(weight_handles)} parameters")
+    return IPCInfo(
+        params_info=tensor_info,
+        weight_handles=weight_handles,
+        register_buffer_handles=register_buffer_handles,
+        kv_cache_handles=kv_cache_handles,
+        kvcache_info=kvcache_info,
+        req_to_token_handle=req_to_token_handles,
+        req_to_token_info=req_to_token_info,
+    )
+
+
+def share_params_from_ipc(self, ipc_info):
+    """Share parameters from IPC for Semi-PD Prefill instances"""
+    from sglang.semi_pd.utils import HAS_IPC
+
+    if not HAS_IPC:
+        # Fallback mode: skip IPC sharing, parameters are already loaded
+        logger.info("Semi-PD IPC extension not available, using fallback mode - parameters already loaded")
+        return
+
+    # IPC mode: share parameters via IPC
+    import semi_pd_ipc
+    from sglang.semi_pd.utils import convert_ipc_handle_to_tensor
+
+    logger.info(f"Sharing parameters from IPC")
+
+    # Replace model parameters with IPC shared tensors
+    for name, param in self.model.named_parameters():
+        if name in ipc_info.weight_handles:
+            ipc_handle = ipc_info.weight_handles[name]
+            shape, dtype, device = ipc_info.params_info[name]
+
+            shared_tensor = convert_ipc_handle_to_tensor(
+                ipc_handle, shape, dtype, device
+            )
+
+            # Replace the parameter data
+            param.data = shared_tensor
+            logger.debug(f"Shared parameter: {name}, shape: {param.shape}")
+
+    # Replace model buffers with IPC shared tensors
+    for name, buffer in self.model.named_buffers():
+        if name in ipc_info.register_buffer_handles:
+            ipc_handle = ipc_info.register_buffer_handles[name]
+            shape, dtype, device = ipc_info.params_info[name]
+
+            if shape is not None:
+                shared_tensor = convert_ipc_handle_to_tensor(
+                    ipc_handle, shape, dtype, device
+                )
+
+                # Replace the buffer data
+                buffer.data = shared_tensor
+                logger.debug(f"Shared buffer: {name}, shape: {buffer.shape}")
+
+    logger.info("Parameter sharing from IPC completed")
+
+
+# Add these methods to ModelRunner class
+ModelRunner.get_ipc_info = get_ipc_info
+ModelRunner.share_params_from_ipc = share_params_from_ipc

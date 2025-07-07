@@ -34,6 +34,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.semi_pd.utils import InstanceRole, IPCInfo
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
@@ -132,7 +133,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
@@ -213,11 +214,13 @@ class Scheduler(
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: Union[PortArgs, "SemiPDPortArgs"],
         gpu_id: int,
         tp_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Parse args
         self.server_args = server_args
@@ -255,9 +258,33 @@ class Scheduler(
         self.idle_sleeper = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
+            if self.server_args.enable_semi_pd:
+                assert isinstance(port_args, SemiPDPortArgs)
+                if instance_role == InstanceRole.PREFILL:
+                    logger.debug(
+                        f"bind to p_scheduler_input_ipc_name: {port_args.p_scheduler_input_ipc_name}"
+                    )
+                    self.recv_from_tokenizer = get_zmq_socket(
+                        context, zmq.PULL, port_args.p_scheduler_input_ipc_name, True
+                    )
+                elif instance_role == InstanceRole.DECODE:
+                    logger.debug(
+                        f"bind to d_scheduler_input_ipc_name: {port_args.d_scheduler_input_ipc_name}"
+                    )
+                    self.recv_from_tokenizer = get_zmq_socket(
+                        context, zmq.PULL, port_args.d_scheduler_input_ipc_name, True
+                    )
+                elif instance_role == InstanceRole.OTHER:
+                    # Standalone scheduler for Semi-PD - no tokenizer connection needed
+                    logger.debug("Standalone scheduler - no tokenizer connection")
+                    self.recv_from_tokenizer = None
+                else:
+                    raise ValueError(f"Invalid instance role: {instance_role}")
+            else:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -312,13 +339,27 @@ class Scheduler(
         else:
             TpWorkerClass = TpModelWorker
 
+        # Semi-PD: Select correct NCCL port based on instance role
+        if server_args.enable_semi_pd:
+            assert isinstance(port_args, SemiPDPortArgs)
+            if instance_role == InstanceRole.PREFILL:
+                nccl_port = port_args.p_nccl_port
+            elif instance_role == InstanceRole.DECODE:
+                nccl_port = port_args.d_nccl_port
+            else:
+                nccl_port = port_args.s_nccl_port  # Standalone
+        else:
+            nccl_port = port_args.nccl_port
+
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
+            nccl_port=nccl_port,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
 
         # Launch a draft worker for speculative decoding
@@ -356,11 +397,17 @@ class Scheduler(
             )
 
         self.tp_group = self.tp_worker.get_tp_group()
-        self.tp_cpu_group = self.tp_group.cpu_group
+        self.tp_cpu_group = self.tp_group.cpu_group if self.tp_group else None
         self.attn_tp_group = self.tp_worker.get_attention_tp_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        try:
+            self.pp_group = get_pp_group()
+        except AssertionError:
+            self.pp_group = None
+        try:
+            self.world_group = get_world_group()
+        except AssertionError:
+            self.world_group = None
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
@@ -924,12 +971,13 @@ class Scheduler(
             if self.attn_tp_rank == 0:
                 recv_reqs = []
 
-                while True:
-                    try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                if self.recv_from_tokenizer is not None:
+                    while True:
+                        try:
+                            recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            break
+                        recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -2566,6 +2614,23 @@ class Scheduler(
             if events:
                 batch = KVEventBatch(ts=time.time(), events=events)
                 self.kv_event_publisher.publish(batch)
+
+    # Semi-PD specific methods
+    def get_ipc_info(self) -> IPCInfo:
+        """Get IPC information for Semi-PD weight sharing"""
+        return self.tp_worker.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        """Share parameters from IPC for Semi-PD Prefill instances"""
+        self.tp_worker.share_params_from_ipc(ipc_info)
+
+    def init_attention_backend(self):
+        """Initialize attention backend for Semi-PD delayed initialization"""
+        self.tp_worker.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        """Initialize CUDA graphs for Semi-PD delayed initialization"""
+        self.tp_worker.init_cuda_graphs()
 
 
 def is_health_check_generate_req(recv_req):

@@ -30,10 +30,22 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
-        self.tp_sync_group = get_tp_group().device_group
+
+        # Handle Semi-PD single GPU mode
+        try:
+            tp_group = get_tp_group()
+            self.tp_sync_group = tp_group.device_group if tp_group else None
+        except (AssertionError, AttributeError):
+            # Semi-PD single GPU mode - no TP group needed
+            self.tp_sync_group = None
 
         if global_server_args_dict["enable_dp_attention"]:
-            self.tp_sync_group = get_attention_tp_group().device_group
+            try:
+                attention_tp_group = get_attention_tp_group()
+                self.tp_sync_group = attention_tp_group.device_group if attention_tp_group else None
+            except (AssertionError, AttributeError):
+                # Semi-PD single GPU mode - no attention TP group needed
+                self.tp_sync_group = None
 
     def forward(
         self,
@@ -142,11 +154,13 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            # Skip all_reduce in Semi-PD single GPU mode
+            if self.tp_sync_group is not None:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
         return batch_next_token_ids
 
