@@ -1474,10 +1474,34 @@ def initialize_model_parallel_dummy():
         _WORLD = None
 
     if _TP is None:
-        _TP = None
+        # Create a dummy group for single GPU mode
+        class DummyGroup:
+            def __init__(self):
+                self.rank = 0
+                self.world_size = 1
+                self.device_group = None  # For dp_attention compatibility
+                self.rank_in_group = 0  # For VocabParallelEmbedding compatibility
+                self.cpu_group = None  # For model loading compatibility
+                self.is_first_rank = True  # For pipeline parallel compatibility
+                self.is_last_rank = True  # For pipeline parallel compatibility
+
+            def graph_capture(self, context=None):
+                # Return a dummy context manager for CUDA graph capture
+                from contextlib import contextmanager
+                import torch
+
+                @contextmanager
+                def dummy_graph_capture():
+                    class DummyContext:
+                        def __init__(self):
+                            self.stream = torch.cuda.Stream()
+                    yield DummyContext()
+
+                return dummy_graph_capture()
+        _TP = DummyGroup()
 
     if _PP is None:
-        _PP = None
+        _PP = DummyGroup()
 
     # Set basic parallel state for single GPU
     import sglang.srt.distributed.parallel_state as ps

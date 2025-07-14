@@ -17,12 +17,29 @@ def get_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
     device_config: DeviceConfig,
+    bypass_load_weight: bool = False,
 ) -> nn.Module:
     loader = get_model_loader(load_config)
-    return loader.load_model(
-        model_config=model_config,
-        device_config=device_config,
-    )
+
+    # Check if the loader supports bypass_load_weight parameter
+    import inspect
+    load_model_signature = inspect.signature(loader.load_model)
+    if 'bypass_load_weight' in load_model_signature.parameters:
+        return loader.load_model(
+            model_config=model_config,
+            device_config=device_config,
+            bypass_load_weight=bypass_load_weight,
+        )
+    else:
+        # Fallback for loaders that don't support bypass_load_weight
+        if bypass_load_weight:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Model loader {type(loader).__name__} does not support bypass_load_weight, ignoring parameter")
+        return loader.load_model(
+            model_config=model_config,
+            device_config=device_config,
+        )
 
 
 __all__ = [

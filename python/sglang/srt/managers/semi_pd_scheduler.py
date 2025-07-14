@@ -72,6 +72,7 @@ class SemiPDScheduler(Scheduler):
           - handle retracted requests
         """
         logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
+        logger.info(f"[SEMI_PD] 🔧 Received sampling_params: temperature={recv_req.sampling_params.temperature}, top_k={recv_req.sampling_params.top_k}, top_p={recv_req.sampling_params.top_p}")
 
         # Create a new request
         if (
@@ -136,7 +137,7 @@ class SemiPDScheduler(Scheduler):
 
         # Handle multimodal inputs
         # TODO: Update for v0.4.8 multimodal handling
-        if recv_req.image_inputs is not None:
+        if recv_req.mm_inputs is not None:
             # For now, skip image processing in Semi-PD
             # This will be updated when we add full multimodal support
             pass
@@ -148,7 +149,7 @@ class SemiPDScheduler(Scheduler):
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.mm_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -248,9 +249,8 @@ class SemiPDStandaloneScheduler:
     def get_ipc_info(self):
         return self.tp_worker.get_ipc_info()
 
-    def event_loop(self):
-        while True:
-            time.sleep(1)
+    # Remove the custom event_loop method - let it use the inherited one from Scheduler
+    # The base Scheduler class already has proper event_loop_normal and event_loop_overlap implementations
 
 
 class MemoryCachingContext:
@@ -342,7 +342,6 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
-    pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
     ipc_info_queue: multiprocessing.Queue = None,
@@ -365,6 +364,19 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    # For Prefill instances, get IPC info from Decode instance first
+    ipc_info = None
+    if bypass_load_weight:
+        logger.info(f"🔥 Receiving IPC handles from Decode instance... (tp_rank={tp_rank}, queue={ipc_info_queue})")
+        try:
+            logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
+            logger.info(f"🔍 About to call ipc_info_queue.get() with 60s timeout...")
+            ipc_info = ipc_info_queue.get(timeout=60)  # 60 second timeout
+            logger.info(f"✅ Successfully received IPC handles from Decode instance! (type={type(ipc_info)})")
+        except Exception as e:
+            logger.error(f"❌ Failed to receive IPC handles: {e}")
+            raise
+
     # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" {instance_role.name} TP{tp_rank}")
@@ -377,14 +389,15 @@ def run_scheduler_process(
     from sglang.semi_pd.utils import get_device_sm_count
 
     real_sm = get_device_sm_count(gpu_id)
-    logger.info(f"Available SMs: {real_sm}")
+    mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "100")
+    logger.info(f"🔥 Available SMs: {real_sm}, MPS allocation: {mps_percentage}%")
+    logger.info(f"✅ CUDA MPS successfully configured for {instance_role.name} instance")
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
-    if bypass_load_weight:
-        ipc_info = ipc_info_queue.get()
+    # IPC info already received above for Prefill instances
 
     # Create a scheduler and run the event loop
     try:
@@ -403,8 +416,11 @@ def run_scheduler_process(
             )
 
             if not bypass_load_weight:
+                logger.info(f"🔥 Creating IPC handles for weight and KV cache sharing... (tp_rank={tp_rank}, queue={ipc_info_queue})")
                 ipc_info = scheduler.get_ipc_info()
+                logger.info(f"🔍 Generated IPC info: {type(ipc_info)}")
                 ipc_info_queue.put(ipc_info)
+                logger.info(f"✅ IPC handles created and shared successfully! Queue size after put: {ipc_info_queue.qsize()}")
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
@@ -415,7 +431,7 @@ def run_scheduler_process(
                 port_args,
                 gpu_id,
                 tp_rank,
-                pp_rank,  # 🆕 添加pp_rank参数
+                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
                 dp_rank,
                 bypass_load_weight,
             )
@@ -424,6 +440,7 @@ def run_scheduler_process(
 
         if bypass_load_weight:
             scheduler.share_params_from_ipc(ipc_info)
+            logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
 
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:

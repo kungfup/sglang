@@ -14,8 +14,10 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
+import threading
+import time
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -31,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.utils import broadcast_pyobj, get_bool_env_var, get_zmq_socket
@@ -196,6 +198,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,  # v0.4.8 requires page_size as first parameter
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -238,11 +241,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
+                # v0.4.8 removed enable_hierarchical_cache parameter
             )
 
             res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
+                req, self.chunked_req is not None
+                # v0.4.8 removed enable_hierarchical_cache parameter
             )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -311,38 +315,44 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         return new_batch
 
     def get_next_prefill_batch(self, recv_req: GetNextPrefillBatchInput):
+        logger.info(f"[DECODE] 🔥 get_next_prefill_batch called with rids: {recv_req.rids}")
+
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
 
+        logger.info(f"[DECODE] Calling get_new_batch_prefill with rids: {recv_req.rids}")
         batch = self.get_new_batch_prefill(recv_req.rids)
+        logger.info(f"[DECODE] get_new_batch_prefill returned: {batch is not None}")
 
         if batch is None:
-            self.bridge_socket.send_pyobj(
-                GetNextPrefillBatchOutput(
-                    rids=[],
-                    chunked_rid=None,
-                    req_pool_indices=[],
-                    prefix_lens=[],
-                    extend_input_lens=[],
-                )
+            response = GetNextPrefillBatchOutput(
+                rids=[],
+                chunked_rid=None,
+                req_pool_indices=[],
+                prefix_lens=[],
+                extend_input_lens=[],
             )
+            logger.debug(f"[DECODE] Send empty response to P worker: {response}")
+            self.bridge_socket.send_pyobj(response)
         else:
             # Serialize the essential information of the batch
-            self.bridge_socket.send_pyobj(
-                GetNextPrefillBatchOutput(
-                    rids=[r.rid for r in batch.reqs],
-                    chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
-                    req_pool_indices=[r.req_pool_idx for r in batch.reqs],
-                    prefix_lens=[len(r.prefix_indices) for r in batch.reqs],
-                    extend_input_lens=[r.extend_input_len for r in batch.reqs],
-                )
+            response = GetNextPrefillBatchOutput(
+                rids=[r.rid for r in batch.reqs],
+                chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                req_pool_indices=[r.req_pool_idx for r in batch.reqs],
+                prefix_lens=[len(r.prefix_indices) for r in batch.reqs],
+                extend_input_lens=[r.extend_input_len for r in batch.reqs],
             )
+            logger.info(f"[DECODE] Send response to P worker: {response}")
+            self.bridge_socket.send_pyobj(response)
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
+        logger.info(f"[DECODE] 🔥 process_prefill_result started, next_token_ids={recv_req.next_token_ids}")
         batch = self.scheduled_prefill_batches.pop(0)
+        logger.info(f"[DECODE] 🔥 Got batch with {len(batch.reqs)} requests")
         assert len(batch.reqs) == len(recv_req.next_token_ids)
 
         logits_processor_output = None
@@ -355,26 +365,186 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             )
 
         # TODO: return logprobs is not supported in Semi-PD mode
+        # Provide proper extend_input_len_per_req and extend_logprob_start_len_per_req
+        extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+        extend_logprob_start_len_per_req = [0 for _ in batch.reqs]  # Start from beginning
+
         result = GenerationBatchResult(
-            next_token_ids=recv_req.next_token_ids,
             logits_output=logits_processor_output,
-            extend_input_len_per_req=None,
-            extend_logprob_start_len_per_req=None,
+            pp_hidden_states_proxy_tensors=None,  # v0.4.8 requires this parameter
+            next_token_ids=recv_req.next_token_ids,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=-1,  # doesn't matter
+            can_run_cuda_graph=False,  # v0.4.8 requires this parameter
         )
 
         if self.attn_tp_size > 1:
             dist.barrier(group=self.attn_tp_cpu_group)
 
+        logger.info(f"[DECODE] 🔥 Setting batch.output_ids...")
         batch.output_ids = torch.from_numpy(
             np.array(result.next_token_ids, dtype=np.int64)
         ).to(self.device, dtype=torch.int64, non_blocking=True)
-        self.process_batch_result_prefill(batch, result)
 
+        logger.info(f"[DECODE] 🔥 Calling process_batch_result_prefill...")
+        self.process_batch_result_prefill(batch, result)
+        logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed!")
+
+        logger.info(f"[DECODE] 🔥 Filtering batch...")
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
 
+        logger.info(f"[DECODE] 🔥 Merging batch to running_batch...")
         if not batch.is_empty():
             if self.running_batch.is_empty():
                 self.running_batch = batch
             else:
                 self.running_batch.merge_batch(batch)
+
+        logger.info(f"[DECODE] 🔥 process_prefill_result completed successfully!")
+
+    def process_batch_result_prefill(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
+    ):
+        """Override the base method to handle Semi-PD specific prefill result processing.
+
+        This method is based on SGLang v0.4.8's scheduler_output_processor_mixin.py
+        but adapted for Semi-PD Decode instance.
+        """
+        logger.info(f"[DECODE] 🔥 process_batch_result_prefill called for Semi-PD Decode instance")
+
+        skip_stream_req = None
+
+        if self.is_generation:
+            (
+                logits_output,
+                next_token_ids,
+                extend_input_len_per_req,
+                extend_logprob_start_len_per_req,
+            ) = (
+                result.logits_output,
+                result.next_token_ids,
+                result.extend_input_len_per_req,
+                result.extend_logprob_start_len_per_req,
+            )
+
+            # Semi-PD: Handle overlap mode differently
+            if self.enable_overlap and not self.server_args.enable_semi_pd:
+                logits_output, next_token_ids, _ = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
+            else:
+                # Move next_token_ids and logprobs to cpu
+                # Semi-PD: Only convert to list if not already a list
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
+                if batch.return_logprob:
+                    if logits_output.next_token_logprobs is not None:
+                        logits_output.next_token_logprobs = (
+                            logits_output.next_token_logprobs.tolist()
+                        )
+                    if logits_output.input_token_logprobs is not None:
+                        logits_output.input_token_logprobs = tuple(
+                            logits_output.input_token_logprobs.tolist()
+                        )
+
+            hidden_state_offset = 0
+
+            # Check finish conditions
+            logprob_pt = 0
+            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if req.is_retracted:
+                    continue
+
+                if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                    # Free the one delayed token for the mixed decode batch
+                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    continue
+
+                if req.is_chunked <= 0:
+                    # req output_ids are set here
+                    req.output_ids.append(next_token_id)
+                    req.check_finished()
+
+                    if req.finished():
+                        self.tree_cache.cache_finished_req(req)
+                        req.time_stats.completion_time = time.time()
+                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        # This updates radix so others can match
+                        self.tree_cache.cache_unfinished_req(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+
+                # Handle logprobs if needed
+                if batch.return_logprob and req.is_chunked <= 0:
+                    # Process logprobs similar to original implementation
+                    if logits_output.input_token_logprobs is not None:
+                        self.process_input_logprobs(
+                            i, req, req.fill_ids, logits_output, req.is_chunked == 0
+                        )
+
+                    if logits_output.next_token_logprobs is not None:
+                        req.output_token_logprobs.append(
+                            logits_output.next_token_logprobs[i]
+                        )
+
+                    logprob_pt += len(req.fill_ids)
+
+                # Handle hidden states if needed
+                if result.logits_output and result.logits_output.hidden_states is not None:
+                    if req.return_hidden_states:
+                        req.hidden_states = result.logits_output.hidden_states[
+                            hidden_state_offset : hidden_state_offset + len(req.fill_ids)
+                        ].tolist()
+                    hidden_state_offset += len(req.fill_ids)
+
+        else:  # embedding or reward model
+            embeddings, bid = result.embeddings, result.bid
+            embeddings = embeddings.tolist()
+
+            # Check finish conditions
+            for i, req in enumerate(batch.reqs):
+                if req.is_retracted:
+                    continue
+
+                req.embedding = embeddings[i]
+                if req.is_chunked <= 0:
+                    # Dummy output token for embedding models
+                    req.output_ids.append(0)
+                    req.check_finished()
+
+                    if req.finished():
+                        self.tree_cache.cache_finished_req(req)
+                    else:
+                        self.tree_cache.cache_unfinished_req(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+
+        # Stream output to detokenizer - this is the key missing piece!
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+        logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed for Semi-PD")
+
+    def process_batch_result_decode(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
+    ):
+        """Handle Semi-PD specific decode result processing.
+
+        This method is crucial for updating request output_ids during decode phase.
+        Without this, tokens are never added to requests, causing repetitive generation.
+        """
+        logger.info(f"[DECODE] 🔥 process_batch_result_decode called for Semi-PD Decode instance")
+
+        # Call the base implementation which handles token updates
+        super().process_batch_result_decode(batch, result, launch_done)
+
+        logger.info(f"[DECODE] 🔥 process_batch_result_decode completed for Semi-PD")

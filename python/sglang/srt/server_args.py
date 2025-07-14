@@ -237,8 +237,8 @@ class ServerArgs:
 
     # For Semi-PD (Semi-Prefill-Decode) disaggregation
     enable_semi_pd: bool = False
-    semi_pd_prefill_sm_percentage: int = 100
-    semi_pd_decode_sm_percentage: int = 80
+    semi_pd_prefill_sm_percentage: int = 80   # 修正：Prefill使用80% SM (与原版Semi-PD一致)
+    semi_pd_decode_sm_percentage: int = 100   # 修正：Decode使用100% SM (与原版Semi-PD一致)
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -273,7 +273,17 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        gpu_mem = get_device_memory_capacity(self.device)
+        # Set memory capacity with fallback for missing nvidia-smi
+        try:
+            gpu_mem = get_device_memory_capacity(self.device)
+        except RuntimeError as e:
+            if "nvidia-smi not found" in str(e):
+                logger.warning(f"nvidia-smi not available: {e}")
+                logger.warning("Using fallback memory capacity for CPU/testing mode")
+                # Use a reasonable default for CPU mode or testing
+                gpu_mem = 8 * 1024 * 1024 * 1024  # 8GB default
+            else:
+                raise
 
         # Set mem fraction static
         if self.mem_fraction_static is None:
@@ -1645,13 +1655,13 @@ class ServerArgs:
             "--semi-pd-prefill-sm-percentage",
             type=int,
             default=ServerArgs.semi_pd_prefill_sm_percentage,
-            help="Percentage of GPU SMs allocated to Prefill instance in Semi-PD mode. Default is 100%.",
+            help="Percentage of GPU SMs allocated to Prefill instance in Semi-PD mode. Default is 80%%.",
         )
         parser.add_argument(
             "--semi-pd-decode-sm-percentage",
             type=int,
             default=ServerArgs.semi_pd_decode_sm_percentage,
-            help="Percentage of GPU SMs allocated to Decode instance in Semi-PD mode. Default is 80%.",
+            help="Percentage of GPU SMs allocated to Decode instance in Semi-PD mode. Default is 100%%.",
         )
 
         parser.add_argument(
@@ -1777,14 +1787,18 @@ class SemiPDPortArgs:
         d_port = SemiPDPortArgs.get_nccl_port(server_args)
 
         if not server_args.enable_dp_attention:
+            # 🔧 [PORT_ARGS] Create unified IPC addresses - all processes use the same addresses
+            # Generate unique prefix based on server port to avoid conflicts
+            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
+
             return SemiPDPortArgs(
-                tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                s_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                p_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                d_scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                bridge_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
+                s_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_s_scheduler",
+                p_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_p_scheduler",
+                d_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_d_scheduler",
+                detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
+                bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
+                rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
                 s_nccl_port=s_port,
                 p_nccl_port=p_port,
                 d_nccl_port=d_port,
@@ -1818,6 +1832,7 @@ class SemiPDPortArgs:
                 d_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 2}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 bridge_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 3}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 4}",
                 s_nccl_port=s_port,
                 p_nccl_port=p_port,
                 d_nccl_port=d_port,

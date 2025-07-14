@@ -159,6 +159,23 @@ class TpModelWorker:
             self.random_seed = server_args.random_seed
         set_random_seed(self.random_seed)
 
+        # Semi-PD methods for delayed initialization and IPC sharing
+    def init_attention_backend(self):
+        """Initialize attention backend for Semi-PD delayed initialization."""
+        self.model_runner.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        """Initialize CUDA graphs for Semi-PD delayed initialization."""
+        self.model_runner.init_cuda_graphs()
+
+    def get_ipc_info(self):
+        """Get IPC info for Semi-PD parameter sharing."""
+        return self.model_runner.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info):
+        """Share parameters from IPC for Semi-PD."""
+        self.model_runner.share_params_from_ipc(ipc_info)
+
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
@@ -215,7 +232,9 @@ class TpModelWorker:
 
     def init_attention_backend(self):
         """Initialize attention backend for Semi-PD"""
+        logger.info("🔧 [TP_WORKER] Starting attention backend initialization...")
         self.model_runner.init_attention_backend()
+        logger.info("✅ [TP_WORKER] Attention backend initialization completed")
 
     def init_cuda_graphs(self):
         """Initialize CUDA graphs for Semi-PD"""
@@ -229,7 +248,9 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
+        logger.info(f"🔧 [TP_WORKER] forward_batch_generation called, batch_size={len(model_worker_batch.req_pool_indices)}")
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logger.info(f"🔧 [TP_WORKER] ForwardBatch created successfully")
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -240,18 +261,22 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
+            logger.info(f"🔧 [TP_WORKER] About to call model_runner.forward()")
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            logger.info(f"🔧 [TP_WORKER] model_runner.forward() completed, logits_output type: {type(logits_output)}")
             if launch_done is not None:
                 launch_done.set()
 
             if skip_sample:
                 next_token_ids = None
             else:
+                logger.info(f"🔧 [TP_WORKER] About to call model_runner.sample()")
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
+                logger.info(f"🔧 [TP_WORKER] model_runner.sample() completed, next_token_ids: {next_token_ids}")
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:

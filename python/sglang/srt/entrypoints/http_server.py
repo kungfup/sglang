@@ -834,7 +834,9 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    print(f"🔧 [HTTP_SERVER] Checking Semi-PD: enable_semi_pd={server_args.enable_semi_pd}", flush=True)
     if server_args.enable_semi_pd:
+        print("🔥 [HTTP_SERVER] Semi-PD is enabled, launching Semi-PD subprocesses...", flush=True)
         tokenizer_manager, template_manager, scheduler_info = _launch_semi_pd_subprocesses(
             server_args=server_args
         )

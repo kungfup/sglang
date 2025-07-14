@@ -753,9 +753,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
 
-        self.w_kc = None
-        self.w_vc = None
-        self.w_scale = 1.0
+        # These will be initialized as buffers below for Semi-PD compatibility
 
         self.w_scale_k = None
         self.w_scale_v = None

@@ -90,22 +90,31 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    tp_group = get_tp_group()
-    _ATTN_TP_GROUP = GroupCoordinator(
-        [
-            list(range(head, head + _ATTN_TP_SIZE))
-            for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
-        ],
-        local_rank,
-        torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
-        use_pymscclpp=False,
-        use_custom_allreduce=False,
-        use_hpu_communicator=False,
-        use_xpu_communicator=False,
-        use_npu_communicator=False,
-        group_name="attention_tp",
-    )
+    # Check if distributed is initialized (for Semi-PD single GPU mode)
+    if not torch.distributed.is_initialized():
+        # Semi-PD single GPU mode - skip GroupCoordinator creation
+        _ATTN_TP_GROUP = None
+    else:
+        tp_group = get_tp_group()
+        if tp_group is None:
+            # Fallback for cases where tp_group is None
+            _ATTN_TP_GROUP = None
+        else:
+            _ATTN_TP_GROUP = GroupCoordinator(
+                [
+                    list(range(head, head + _ATTN_TP_SIZE))
+                    for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
+                ],
+                local_rank,
+                torch.distributed.get_backend(tp_group.device_group),
+                use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+                use_pymscclpp=False,
+                use_custom_allreduce=False,
+                use_hpu_communicator=False,
+                use_xpu_communicator=False,
+                use_npu_communicator=False,
+                group_name="attention_tp",
+            )
 
 
 def get_attention_tp_group():

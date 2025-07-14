@@ -88,6 +88,9 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
+                # 🔧 DEBUG: Track chunked prefill behavior
+                logger.info(f"🔧 [CHUNKED] req.rid={req.rid}, is_chunked={req.is_chunked}, next_token_id={next_token_id}, output_ids={req.output_ids}")
+
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -550,9 +553,7 @@ class SchedulerOutputProcessorMixin:
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
                 else:
-                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
-                req.send_decode_id_offset = len(decode_ids)
+                    decode_ids_list.append(decode_ids)
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])

@@ -38,6 +38,11 @@ import torch
 import uvloop
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.semi_pd.utils import (
+    DECODE_ENGINE_SM_PERCENTILE,
+    PREFILL_ENGINE_SM_PERCENTILE,
+    InstanceRole,
+)
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -59,6 +64,76 @@ def test_detokenizer_wrapper_module_level(server_args, port_args, pipe_writer):
 
     # Now call the actual function
     return run_detokenizer_process(server_args, port_args, pipe_writer)
+
+# Safe wrapper for detokenizer process
+def safe_run_detokenizer_process(server_args, port_args, pipe_writer):
+    """Safe wrapper for detokenizer process with error handling"""
+    try:
+        # Write debug info immediately
+        with open("/tmp/detokenizer_safe_wrapper_debug.log", "w") as f:
+            f.write("🔧 [SAFE WRAPPER] Function called - starting initialization\n")
+            f.flush()
+
+        print("🔧 [SAFE WRAPPER] Function called - starting initialization", flush=True)
+
+        # Import here to avoid import issues in multiprocessing
+        import sys
+        import os
+
+        # Add the path to ensure imports work
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+        print("🔧 [SAFE WRAPPER] About to call run_detokenizer_process", flush=True)
+
+        # Write more debug info
+        with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
+            f.write("🔧 [SAFE WRAPPER] About to call run_detokenizer_process\n")
+            f.write(f"🔧 [SAFE WRAPPER] server_args type: {type(server_args)}\n")
+            f.write(f"🔧 [SAFE WRAPPER] port_args type: {type(port_args)}\n")
+            f.write(f"🔧 [SAFE WRAPPER] pipe_writer type: {type(pipe_writer)}\n")
+            f.flush()
+
+        # Test if the function can be imported and check its signature
+        try:
+            from sglang.srt.managers.detokenizer_manager import run_detokenizer_process as test_import
+            import inspect
+            sig = inspect.signature(test_import)
+            with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
+                f.write("🔧 [SAFE WRAPPER] Import test successful\n")
+                f.write(f"🔧 [SAFE WRAPPER] Function signature: {sig}\n")
+                f.write(f"🔧 [SAFE WRAPPER] Function file: {test_import.__code__.co_filename}\n")
+                f.flush()
+        except Exception as import_error:
+            with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
+                f.write(f"🔧 [SAFE WRAPPER] Import test failed: {import_error}\n")
+                f.flush()
+            raise import_error
+
+        # Call the actual function
+        return test_import(server_args, port_args, pipe_writer)
+
+    except Exception as e:
+        # Log the error
+        try:
+            with open("/tmp/detokenizer_safe_wrapper_error.log", "w") as f:
+                import traceback
+                f.write(f"🔧 [SAFE WRAPPER] Error: {str(e)}\n")
+                f.write(f"🔧 [SAFE WRAPPER] Traceback: {traceback.format_exc()}\n")
+                f.flush()
+        except:
+            pass
+
+        print(f"🔧 [SAFE WRAPPER] Error: {str(e)}", flush=True)
+
+        # Send error signal if pipe is available
+        if pipe_writer is not None:
+            try:
+                pipe_writer.send({"status": "error", "error": str(e)})
+            except:
+                pass
+
+        raise
+
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -136,7 +211,13 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
-        if getattr(server_args, 'enable_semi_pd', False):
+        enable_semi_pd_value = getattr(server_args, 'enable_semi_pd', False)
+        print(f"🔧 [ENGINE] Checking Semi-PD: enable_semi_pd={enable_semi_pd_value}, type={type(enable_semi_pd_value)}", flush=True)
+        logger.info(f"🔧 [ENGINE] Checking Semi-PD: enable_semi_pd={enable_semi_pd_value}, type={type(enable_semi_pd_value)}")
+
+        if enable_semi_pd_value:
+            print("🔥 [ENGINE] Semi-PD is enabled, launching Semi-PD subprocesses...", flush=True)
+            logger.info("🔥 [ENGINE] Semi-PD is enabled, launching Semi-PD subprocesses...")
             tokenizer_manager, template_manager, scheduler_info = _launch_semi_pd_subprocesses(
                 server_args=server_args,
                 port_args=port_args,
@@ -766,7 +847,7 @@ def _launch_subprocesses(
     # Launch detokenizer process
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
     detoken_proc = mp.Process(
-        target=run_detokenizer_process,
+        target=safe_run_detokenizer_process,
         args=(
             server_args,
             port_args,
@@ -823,12 +904,12 @@ def _launch_semi_pd_subprocesses(
     port_args: Optional[PortArgs] = None,
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
-    Launch Semi-PD subprocesses: Standalone Scheduler + Prefill Scheduler + Decode Scheduler
+    Launch Semi-PD subprocesses: Decode Scheduler + Prefill Scheduler (2-process architecture)
     """
-    from sglang.srt.managers.semi_pd_scheduler import (
-        run_standalone_scheduler_process,
-        run_scheduler_process,
-    )
+    print("🔥 [ENGINE] _launch_semi_pd_subprocesses called!", flush=True)
+    logger.info("🔥 [ENGINE] _launch_semi_pd_subprocesses called!")
+
+    from sglang.srt.managers.semi_pd_scheduler import run_scheduler_process
     from sglang.srt.server_args import SemiPDPortArgs
     from sglang.semi_pd.utils import InstanceRole
 
@@ -864,58 +945,26 @@ def _launch_semi_pd_subprocesses(
             tp_size_per_node * (server_args.node_rank + 1),
         )
 
+        # Create IPC info queues for Decode->Prefill communication (2-process architecture)
         p_ipc_info_queues: List[mp.Queue] = [
-            mp.Queue() for _ in range(tp_size_per_node)
-        ]
-        d_ipc_info_queues: List[mp.Queue] = [
             mp.Queue() for _ in range(tp_size_per_node)
         ]
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
 
-        # Step 1: Launch Standalone Scheduler (for unified memory allocation)
-        s_reader, s_writer = mp.Pipe(duplex=False)
-        s_proc = mp.Process(
-            target=run_standalone_scheduler_process,
-            args=(
-                server_args,
-                port_args,
-                server_args.base_gpu_id,  # Use first GPU for standalone scheduler
-                0,  # tp_rank=0 for standalone
-                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
-                None,  # dp_rank=None
-                s_writer,
-                False,  # bypass_load_weight=False for standalone
-                p_ipc_info_queues[0],  # Share IPC info with prefill
-                d_ipc_info_queues[0],  # Share IPC info with decode
-            ),
-        )
-        with memory_saver_adapter.configure_subprocess():
-            s_proc.start()
-        scheduler_procs.append(s_proc)
-
-        # Wait for standalone scheduler to be ready
-        logger.info("Waiting for Standalone Scheduler to be ready")
-        data = s_reader.recv()
-        assert data["status"] == "ready"
-        scheduler_infos.append(data)
-        server_args.max_total_tokens = data["max_total_num_tokens"]
-
-        # Step 2: Launch Decode Schedulers (先启动Decode，等待ready)
+        # Step 1: Launch ALL Decode and Prefill Schedulers simultaneously (NCCL requirement)
         for tp_rank in tp_rank_range:
             queue_idx = tp_rank % tp_size_per_node
-            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
+            p_ipc_info_queue = p_ipc_info_queues[queue_idx]  # Decode will put IPC info here
             gpu_id = (
                 server_args.base_gpu_id
                 + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
             )
 
-            # Set CUDA MPS for Decode instance
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                server_args.semi_pd_decode_sm_percentage
-            )
+            # Launch Decode instance first
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = "90"
             logger.info(
-                f"Launch Decode instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+                f"🚀 Launch D instance TP {tp_rank} with 90% SMs (MPS enabled)"
             )
 
             d_reader, d_writer = mp.Pipe(duplex=False)
@@ -926,11 +975,10 @@ def _launch_semi_pd_subprocesses(
                     port_args,
                     gpu_id,
                     tp_rank,
-                    0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
                     None,  # dp_rank=None
                     d_writer,
-                    d_ipc_info_queue,  # ipc_info_queue
-                    False,  # bypass_load_weight=False for Decode
+                    p_ipc_info_queue,  # Decode puts IPC info here for Prefill
+                    False,  # bypass_load_weight=False for Decode (loads weights)
                     InstanceRole.DECODE,  # instance_role
                 ),
             )
@@ -939,33 +987,10 @@ def _launch_semi_pd_subprocesses(
             scheduler_procs.append(d_proc)
             d_scheduler_pipe_readers.append(d_reader)
 
-        # Wait for all Decode schedulers to be ready
-        for i, reader in enumerate(d_scheduler_pipe_readers):
-            logger.info(f"Waiting for Decode instance {tp_rank_base + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
-            if i > 0:
-                assert (
-                    server_args.max_total_tokens == data["max_total_num_tokens"]
-                )
-
-        # Step 3: Launch Prefill Schedulers (后启动Prefill)
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-
-            # Set CUDA MPS for Prefill instance
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                server_args.semi_pd_prefill_sm_percentage
-            )
-
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
+            # Launch Prefill instance immediately after (for NCCL synchronization)
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = "80"
             logger.info(
-                f"Launch Prefill instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+                f"🚀 Launch P instance TP {tp_rank} with 80% SMs (MPS enabled)"
             )
 
             p_reader, p_writer = mp.Pipe(duplex=False)
@@ -976,11 +1001,10 @@ def _launch_semi_pd_subprocesses(
                     port_args,
                     gpu_id,
                     tp_rank,
-                    0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
                     None,  # dp_rank=None
                     p_writer,
-                    p_ipc_info_queue,  # ipc_info_queue
-                    True,  # bypass_load_weight=True for Prefill
+                    p_ipc_info_queue,  # Prefill gets IPC info from Decode
+                    True,  # bypass_load_weight=True for Prefill (uses IPC)
                     InstanceRole.PREFILL,  # instance_role
                 ),
             )
@@ -989,53 +1013,67 @@ def _launch_semi_pd_subprocesses(
             scheduler_procs.append(p_proc)
             p_scheduler_pipe_readers.append(p_reader)
 
-        # Wait for all Prefill schedulers to be ready
-        for i, reader in enumerate(p_scheduler_pipe_readers):
-            logger.info(f"Waiting for Prefill instance {tp_rank_base + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
+        # Step 2: Wait for ALL schedulers to be ready (after all are started)
+        logger.info("Waiting for all Decode schedulers to be ready...")
+        for i, d_reader in enumerate(d_scheduler_pipe_readers):
+            d_data = d_reader.recv()
+            if d_data["status"] == "ready":
+                logger.info(f"✅ Decode scheduler {i} is ready")
+                scheduler_infos.append(d_data)
+            else:
+                logger.error(f"❌ Decode scheduler {i} failed to start: {d_data}")
+                raise RuntimeError(f"Decode scheduler {i} failed to start: {d_data}")
+
+        logger.info("Waiting for all Prefill schedulers to be ready...")
+        for i, p_reader in enumerate(p_scheduler_pipe_readers):
+            p_data = p_reader.recv()
+            if p_data["status"] == "ready":
+                logger.info(f"✅ Prefill scheduler {i} is ready")
+            else:
+                logger.error(f"❌ Prefill scheduler {i} failed to start: {p_data}")
+                raise RuntimeError(f"Prefill scheduler {i} failed to start: {p_data}")
+
+
+
     else:
         # Data parallel mode - not implemented for Semi-PD yet
         raise NotImplementedError("Semi-PD does not support data parallel mode yet")
 
-    # Launch detokenizer process using module-level wrapper
+    # Launch detokenizer process with pipe for ready signal (Semi-PD fix)
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
     detoken_proc = mp.Process(
-        target=test_detokenizer_wrapper_module_level,
+        target=safe_run_detokenizer_process,
         args=(
             server_args,
             port_args,
-            detoken_writer,
+            detoken_writer,  # Pass pipe_writer for ready signal
         ),
     )
-    logger.info("Starting Detokenizer process...")
     detoken_proc.start()
-    scheduler_procs.append(detoken_proc)
-    logger.info(f"Detokenizer process started with PID: {detoken_proc.pid}")
 
-    # Wait for detokenizer to be ready with timeout
-    logger.info("Waiting for Detokenizer to be ready")
+    # Wait for detokenizer to be ready
+    logger.info("Waiting for Detokenizer to be ready...")
+
+    # Add timeout and debugging for pipe communication
+    import time
+    timeout_seconds = 30
+    start_time = time.time()
+
     try:
-        import select
-        if detoken_reader.poll(timeout=30):  # 30 second timeout
-            data = detoken_reader.recv()
-            if data["status"] == "ready":
-                logger.info("Detokenizer is ready")
+        # Check if pipe has data available with timeout
+        if detoken_reader.poll(timeout_seconds):
+            detoken_data = detoken_reader.recv()
+            logger.info(f"🔧 [ENGINE] Received data from detokenizer: {detoken_data}")
+            if detoken_data["status"] == "ready":
+                logger.info("✅ Detokenizer is ready")
             else:
-                logger.error(f"Detokenizer failed to start: {data}")
-                raise RuntimeError(f"Detokenizer failed: {data}")
+                logger.error(f"❌ Detokenizer failed to start: {detoken_data}")
         else:
-            logger.error("Detokenizer startup timeout after 30 seconds")
-            logger.error(f"Detokenizer process alive: {detoken_proc.is_alive()}")
-            logger.error(f"Detokenizer process exitcode: {detoken_proc.exitcode}")
-            raise RuntimeError("Detokenizer startup timeout")
+            logger.error(f"❌ Timeout waiting for Detokenizer ready signal after {timeout_seconds} seconds")
+            logger.error("🔧 [ENGINE] Detokenizer process may have failed to send ready signal")
+            raise RuntimeError("Detokenizer ready timeout")
     except Exception as e:
-        logger.error(f"Error waiting for Detokenizer: {e}")
-        if detoken_proc.is_alive():
-            logger.info("Terminating Detokenizer process...")
-            detoken_proc.terminate()
-            detoken_proc.join(timeout=5)
+        logger.error(f"❌ Error waiting for Detokenizer: {e}")
         raise
 
     # Launch tokenizer manager in the main process

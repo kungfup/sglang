@@ -74,7 +74,9 @@ class ReqToTokenPool:
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
-        self.req_to_token[indices] = values
+        if self.req_to_token is not None:
+            self.req_to_token[indices] = values
+        # else: Semi-PD bypass mode, skip writing
 
     def available_size(self):
         return len(self.free_slots)
@@ -276,8 +278,10 @@ class MHATokenToKVPool(KVCache):
         del self.v_buffer
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
+        # Handle bypass_create_buffers case for Semi-PD
+        if not hasattr(self, "k_buffer") or not hasattr(self, "v_buffer"):
+            return 0, 0
+
         k_size_bytes = 0
         for k_cache in self.k_buffer:
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize

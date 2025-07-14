@@ -191,12 +191,15 @@ class TokenizerManager:
                 context, zmq.PULL, port_args.tokenizer_ipc_name, True
             )
             send_to_p_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, True
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
             )
             send_to_d_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, True
+                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
             )
-            self.send_to_scheduler = AggregatedSocket([send_to_p_scheduler, send_to_d_scheduler])
+            # Decode first, for better performance (following original Semi-PD)
+            self.send_to_scheduler = AggregatedSocket([send_to_d_scheduler, send_to_p_scheduler])
+            logger.info(f"[TOKENIZER] 🔗 Connected to Decode scheduler: {port_args.d_scheduler_input_ipc_name}")
+            logger.info(f"[TOKENIZER] 🔗 Connected to Prefill scheduler: {port_args.p_scheduler_input_ipc_name}")
         else:
             context = zmq.asyncio.Context(2)
             self.recv_from_detokenizer = get_zmq_socket(
@@ -590,9 +593,17 @@ class TokenizerManager:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        logger.info(f"[TOKENIZER] 🔧 Original obj.sampling_params: {obj.sampling_params}")
+        logger.info(f"[TOKENIZER] 🔧 Final sampling_kwargs: {sampling_kwargs}")
         sampling_params = SamplingParams(**sampling_kwargs)
+        logger.info(f"[TOKENIZER] 🔧 Created SamplingParams: temperature={sampling_params.temperature}, top_k={sampling_params.top_k}, top_p={sampling_params.top_p}")
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
+
+        # Debug tokenization
+        logger.info(f"[TOKENIZER] 🔧 Input text: {repr(input_text)}")
+        logger.info(f"[TOKENIZER] 🔧 Input IDs: {input_ids}")
+        logger.info(f"[TOKENIZER] 🔧 Input IDs length: {len(input_ids) if input_ids else 0}")
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

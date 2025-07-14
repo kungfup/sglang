@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -117,7 +120,19 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+
+        # Handle Semi-PD Prefill instance with minimal KV Pool
+        try:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        except (AttributeError, IndexError) as e:
+            # For Semi-PD Prefill instance with minimal KV Pool
+            if model_runner.server_args.enable_semi_pd and hasattr(model_runner, 'bypass_load_weight') and model_runner.bypass_load_weight:
+                # Use a default value for v_head_dim that will be replaced when IPC sharing is complete
+                logger.info("Semi-PD Prefill instance: Using default v_head_dim for triton backend")
+                self.v_head_dim = model_runner.model_config.head_dim
+            else:
+                # For other cases, re-raise the exception
+                raise e
 
         self.forward_metadata: ForwardMetadata = None
 
@@ -294,20 +309,29 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Handle Semi-PD Prefill instance where req_to_token might be None
+            if self.req_to_token is not None:
+                req_to_token_tensor = self.req_to_token
+                req_to_token_stride = self.req_to_token.stride(0)
+            else:
+                # For Semi-PD Prefill instance, create a dummy tensor
+                req_to_token_tensor = torch.zeros((bs, 8192), dtype=torch.int32, device=self.device)
+                req_to_token_stride = 8192
+
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token_tensor,
                 forward_batch.req_pool_indices,
                 forward_batch.extend_prefix_lens,
                 kv_indptr,
                 None,
                 kv_indices,
-                self.req_to_token.stride(0),
+                req_to_token_stride,
             )
             # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 window_kv_indptr, window_kv_indices, _ = update_sliding_window_buffer(
                     self.window_kv_indptr,
-                    self.req_to_token,
+                    req_to_token_tensor,  # Use the tensor we created above
                     self.sliding_window_size,
                     forward_batch.extend_prefix_lens,
                     forward_batch.req_pool_indices,

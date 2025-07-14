@@ -22,6 +22,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import numpy as np
+from numpy import typing as npt
+
 from sglang.srt.mm_utils import has_valid_data
 
 # handle serialization of Image for pydantic
@@ -476,6 +479,9 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # Semi-PD: Whether this request has been retracted
+    is_retracted: bool = False
 
 
 @dataclass
@@ -1002,6 +1008,14 @@ class RpcReqOutput:
 
 
 # Semi-PD specific classes for v0.4.8 compatibility
+
+@dataclass
+class SemiPDImageDataItem:
+    """Semi-PD specific image data item for IPC communication"""
+    image_id: str
+    binary_jpeg: bytes
+
+
 @dataclass
 class BatchProcessPrefillResultReq:
     """Request to process prefill results in Semi-PD decode scheduler"""

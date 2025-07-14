@@ -308,16 +308,19 @@ class ModelRunner:
         )
         if self.device == "cuda":
             self.init_cublas()
-            # Semi-PD: delay attention and cuda graph init for P & D instances
+            # Semi-PD: skip attention and cuda graph init for both D and P instances
+            # They will be initialized later in the Semi-PD scheduler
             if not getattr(server_args, 'enable_semi_pd', False):
                 self.init_attention_backend()
                 self.init_cuda_graphs()
             else:
-                # Will be initialized later via init_attention_backend() and init_cuda_graphs()
+                # Semi-PD: Skip initialization here, will be done in Semi-PD scheduler
+                logger.info("Semi-PD instance: Skipping attention backend and CUDA graph initialization (will be done in Semi-PD scheduler)")
                 self.cuda_graph_runner = None
         else:
             self.cuda_graph_runner = None
-            self.init_attention_backend()
+            if not (getattr(server_args, 'enable_semi_pd', False) and self.bypass_load_weight):
+                self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -496,6 +499,10 @@ class ModelRunner:
                     self.tp_size == 1):
                     skip_distributed = True
                     logger.info("✅ Skipping distributed initialization for Semi-PD single GPU mode")
+                elif (hasattr(self.server_args, 'enable_semi_pd') and
+                      self.server_args.enable_semi_pd and
+                      self.tp_size > 1):
+                    logger.info(f"🔥 Semi-PD multi-GPU mode (tp_size={self.tp_size}), enabling NCCL communication")
             except Exception as e:
                 logger.warning(f"Could not check Semi-PD mode: {e}")
 
@@ -503,6 +510,20 @@ class ModelRunner:
                 # Initialize minimal parallel state for single GPU
                 from sglang.srt.distributed.parallel_state import initialize_model_parallel_dummy
                 initialize_model_parallel_dummy()
+
+                # For Semi-PD single GPU mode, set minimal dp_attention globals
+                logger.info("✅ Setting minimal dp_attention globals for Semi-PD single GPU mode")
+                from sglang.srt.layers.dp_attention import (
+                    _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE,
+                    _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
+                )
+                import sglang.srt.layers.dp_attention as dp_attn
+                dp_attn._ATTN_TP_RANK = 0
+                dp_attn._ATTN_TP_SIZE = 1
+                dp_attn._ATTN_DP_RANK = 0
+                dp_attn._ATTN_DP_SIZE = 1
+                dp_attn._LOCAL_ATTN_DP_SIZE = 1
+                dp_attn._LOCAL_ATTN_DP_RANK = 0
             else:
                 # Only initialize the distributed environment on the target model worker.
                 init_distributed_environment(
@@ -609,6 +630,7 @@ class ModelRunner:
                 model_config=self.model_config,
                 load_config=self.load_config,
                 device_config=DeviceConfig("meta" if self.bypass_load_weight else self.device),
+                bypass_load_weight=self.bypass_load_weight,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -657,14 +679,15 @@ class ModelRunner:
         # Skip barrier in Semi-PD single GPU mode
         try:
             tp_group = get_tp_group()
-            if tp_group is not None:
+            if tp_group is not None and hasattr(tp_group, 'cpu_group') and tp_group.cpu_group is not None:
                 dist.monitored_barrier(
                     group=tp_group.cpu_group,
                     timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
                     wait_all_ranks=True,
                 )
-        except AssertionError:
+        except (AssertionError, ValueError):
             # Semi-PD single GPU mode - skip barrier
+            logger.info("✅ Skipping monitored_barrier for Semi-PD single GPU mode")
             pass
         except RuntimeError:
             raise ValueError(
@@ -1041,17 +1064,56 @@ class ModelRunner:
                     pre_alloc_size=pre_alloc_size,
                 )
             else:
+                # For Semi-PD Prefill instances, bypass buffer creation
+                bypass_buffers = (self.server_args.enable_semi_pd and
+                                hasattr(self, 'bypass_load_weight') and
+                                self.bypass_load_weight)
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len + 4,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    bypass_create_buffers=bypass_buffers,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        if self.use_mla_backend:
+        # For Semi-PD Prefill instances, create minimal KV Cache on CPU (will be replaced by IPC shared cache)
+        if self.server_args.enable_semi_pd and hasattr(self, 'bypass_load_weight') and self.bypass_load_weight:
+            logger.info("Semi-PD Prefill instance: Creating minimal KV Cache on CPU (will be replaced by IPC shared cache)")
+            # Create minimal cache on CPU for scheduler initialization, will be replaced later
+            minimal_tokens = 1  # Minimal allocation for initialization
+            cpu_device = "cpu"  # Use CPU device to avoid GPU memory allocation
+            if self.use_mla_backend:
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    minimal_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    device=cpu_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    bypass_create_buffers=True,  # Skip buffer creation for Semi-PD Prefill
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    minimal_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(attention_tp_size),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=cpu_device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    bypass_create_buffers=True,  # Skip buffer creation for Semi-PD Prefill
+                )
+        elif self.use_mla_backend:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1097,7 +1159,26 @@ class ModelRunner:
             )
 
         if self.token_to_kv_pool_allocator is None:
-            if self.page_size == 1:
+            # Create minimal allocator for Semi-PD Prefill instances on meta device (will be replaced via IPC)
+            if self.server_args.enable_semi_pd and hasattr(self, 'bypass_load_weight') and self.bypass_load_weight:
+                logger.info("Semi-PD Prefill instance: Creating minimal KV Pool Allocator on meta device (will be replaced via IPC)")
+                # Create minimal allocator on CPU for scheduler initialization
+                if self.page_size == 1:
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        1,  # minimal tokens
+                        dtype=self.kv_cache_dtype,
+                        device=cpu_device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        1,  # minimal tokens
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=cpu_device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+            elif self.page_size == 1:
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -1463,20 +1544,9 @@ class LocalSerializedTensor:
 # Semi-PD IPC methods - Add to ModelRunner class
 def get_ipc_info(self):
     """Get IPC information for Semi-PD weight sharing"""
-    from sglang.semi_pd.utils import HAS_IPC, IPCInfo
+    from sglang.semi_pd.utils import IPCInfo
 
-    if not HAS_IPC:
-        # Fallback mode: return empty IPC info
-        logger.info("Semi-PD IPC extension not available, using fallback mode")
-        return IPCInfo(
-            params_info={},
-            weight_handles={},
-            register_buffer_handles={},
-            kv_cache_handles=[],
-            kvcache_info={},
-            req_to_token_handle=[],
-            req_to_token_info={}
-        )
+    logger.info("Semi-PD IPC extension available, using IPC mode")
 
     # IPC mode: get actual IPC handles
     import semi_pd_ipc
@@ -1511,9 +1581,33 @@ def get_ipc_info(self):
             register_buffer_handles[name] = handle
             tensor_info[name] = (buffer.shape, buffer.dtype, buffer.device)
 
-    # Get KV cache handles (simplified for fallback compatibility)
-    kv_cache_handles = []
-    kvcache_info = {}
+    # Get KV Cache Handles (like original Semi-PD)
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    if isinstance(self.token_to_kv_pool, MHATokenToKVPool):
+        k_caches = self.token_to_kv_pool.k_buffer
+        v_caches = self.token_to_kv_pool.v_buffer
+        k_cache_handles = [get_ipc_handle(k_cache) for k_cache in k_caches]
+        v_cache_handles = [get_ipc_handle(v_cache) for v_cache in v_caches]
+
+        kvcache_info = {
+            "cache_shape": k_caches[0].shape,
+            "cache_dtype": k_caches[0].dtype,
+            "cache_device": k_caches[0].device,
+        }
+        kv_cache_handles = [k_cache_handles, v_cache_handles]
+    elif isinstance(self.token_to_kv_pool, MLATokenToKVPool):
+        kv_caches = self.token_to_kv_pool.kv_buffer
+        kv_cache_handles = [get_ipc_handle(kv_cache) for kv_cache in kv_caches]
+        kvcache_info = {
+            "cache_shape": kv_caches[0].shape,
+            "cache_dtype": kv_caches[0].dtype,
+            "cache_device": kv_caches[0].device,
+        }
+    else:
+        raise ValueError(
+            f"Unsupported token to kv pool type: {type(self.token_to_kv_pool)}"
+        )
 
     # Get ReqToToken handles
     req_to_token_tensor = self.req_to_token_pool.req_to_token
@@ -1538,47 +1632,212 @@ def get_ipc_info(self):
 
 def share_params_from_ipc(self, ipc_info):
     """Share parameters from IPC for Semi-PD Prefill instances"""
-    from sglang.semi_pd.utils import HAS_IPC
-
-    if not HAS_IPC:
-        # Fallback mode: skip IPC sharing, parameters are already loaded
-        logger.info("Semi-PD IPC extension not available, using fallback mode - parameters already loaded")
-        return
+    logger.info("Semi-PD IPC extension available, sharing parameters via IPC")
 
     # IPC mode: share parameters via IPC
     import semi_pd_ipc
+    import torch.nn as nn
     from sglang.semi_pd.utils import convert_ipc_handle_to_tensor
 
     logger.info(f"Sharing parameters from IPC")
 
-    # Replace model parameters with IPC shared tensors
-    for name, param in self.model.named_parameters():
+    # Replace model parameters with IPC shared tensors (like original Semi-PD)
+    for name, _ in self.model.named_parameters():
         if name in ipc_info.weight_handles:
-            ipc_handle = ipc_info.weight_handles[name]
+            # Get the path to the parameter
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+
+            # Get the parameter name (last part of the path)
+            param_name = path[-1]
+
+            share_param_handle = ipc_info.weight_handles.get(name, None)
             shape, dtype, device = ipc_info.params_info[name]
 
-            shared_tensor = convert_ipc_handle_to_tensor(
-                ipc_handle, shape, dtype, device
-            )
+            # Calculate size from shape (like original Semi-PD)
+            from functools import reduce
+            size = reduce(lambda x, y: x * y, shape) if shape else 1
 
-            # Replace the parameter data
-            param.data = shared_tensor
-            logger.debug(f"Shared parameter: {name}, shape: {param.shape}")
+            assert (
+                share_param_handle is not None
+            ), f"Parameter {name} not found in meta_info"
 
-    # Replace model buffers with IPC shared tensors
-    for name, buffer in self.model.named_buffers():
+            try:
+                if shape == torch.Size([0]):
+                    share_param_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    share_param_tensor = convert_ipc_handle_to_tensor(
+                        share_param_handle, size, dtype, device
+                    ).view(shape)
+            except Exception as ex:
+                raise NotImplementedError(f"Parameter {name, size, dtype, device} is not supported in Semi-PD: {ex}")
+
+            new_param = nn.Parameter(share_param_tensor, requires_grad=False)
+            setattr(module, param_name, new_param)
+            logger.debug(f"Shared parameter: {name}, shape: {share_param_tensor.shape}")
+
+    # Replace model buffers with IPC shared tensors (like original Semi-PD)
+    for name, _ in self.model.named_buffers():
         if name in ipc_info.register_buffer_handles:
-            ipc_handle = ipc_info.register_buffer_handles[name]
+            # Get the path to the buffer
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+
+            # Get the buffer name (last part of the path)
+            buffer_name = path[-1]
+
+            share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
             shape, dtype, device = ipc_info.params_info[name]
 
             if shape is not None:
-                shared_tensor = convert_ipc_handle_to_tensor(
-                    ipc_handle, shape, dtype, device
-                )
+                # Calculate size from shape (like original Semi-PD)
+                size = reduce(lambda x, y: x * y, shape) if shape else 1
 
-                # Replace the buffer data
-                buffer.data = shared_tensor
-                logger.debug(f"Shared buffer: {name}, shape: {buffer.shape}")
+                assert (
+                    share_buffer_handle is not None
+                ), f"Buffer {name} not found in meta_info"
+
+                if buffer_name == "inv_freq" and len(shape) == 2:
+                    share_buffer_tensor = (
+                        convert_ipc_handle_to_tensor(
+                            share_buffer_handle, size, dtype, device
+                        )
+                        .view(shape)
+                        .transpose(1, 2)
+                    )
+                else:
+                    share_buffer_tensor = convert_ipc_handle_to_tensor(
+                        share_buffer_handle, size, dtype, device
+                    ).view(shape)
+                module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+                logger.debug(f"Shared buffer: {name}, shape: {share_buffer_tensor.shape}")
+
+    # Share KV Cache from IPC (like original Semi-PD)
+    if ipc_info.kv_cache_handles:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+        # Create the appropriate KV pool type based on the shared cache
+        cache_shape = ipc_info.kvcache_info["cache_shape"]
+        cache_dtype = ipc_info.kvcache_info["cache_dtype"]
+        cache_device = ipc_info.kvcache_info["cache_device"]
+
+        if len(ipc_info.kv_cache_handles) == 2:  # MHA: [k_handles, v_handles]
+            k_buffer = []
+            v_buffer = []
+            for k_cache_handle, v_cache_handle in zip(
+                ipc_info.kv_cache_handles[0], ipc_info.kv_cache_handles[1]
+            ):
+                size = reduce(lambda x, y: x * y, cache_shape)
+                k_cache_tensor = convert_ipc_handle_to_tensor(
+                    k_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                v_cache_tensor = convert_ipc_handle_to_tensor(
+                    v_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                k_buffer.append(k_cache_tensor)
+                v_buffer.append(v_cache_tensor)
+
+            # For Semi-PD: Replace the minimal CPU KV pool with shared GPU buffers
+            if hasattr(self, 'bypass_load_weight') and self.bypass_load_weight:
+                # Create a new KV pool with shared buffers (Semi-PD optimization)
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(1),  # attention_tp_size=1 for Semi-PD
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    bypass_create_buffers=True,  # Don't create new buffers, we'll use shared ones
+                )
+                # Use the shared buffers from IPC
+                self.token_to_kv_pool.k_buffer = k_buffer
+                self.token_to_kv_pool.v_buffer = v_buffer
+            else:
+                # Normal case: just replace buffers
+                self.token_to_kv_pool.k_buffer = k_buffer
+                self.token_to_kv_pool.v_buffer = v_buffer
+            logger.info(f"✅ Mapped KV Cache from IPC, no extra GPU memory allocated: {len(k_buffer)} K buffers, {len(v_buffer)} V buffers, size={self.token_to_kv_pool.size}")
+        else:  # MLA: [kv_handles]
+            kv_buffer = []
+            for kv_cache_handle in ipc_info.kv_cache_handles:
+                size = reduce(lambda x, y: x * y, cache_shape)
+                kv_cache_tensor = convert_ipc_handle_to_tensor(
+                    kv_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                kv_buffer.append(kv_cache_tensor)
+
+            # For Semi-PD: Replace the minimal CPU KV pool with shared GPU buffers
+            if hasattr(self, 'bypass_load_weight') and self.bypass_load_weight:
+                # Create a new KV pool with shared buffers (Semi-PD optimization)
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    bypass_create_buffers=True,  # Don't create new buffers, we'll use shared ones
+                )
+                # Use the shared buffers from IPC
+                self.token_to_kv_pool.kv_buffer = kv_buffer
+            else:
+                # Normal case: just replace buffers
+                self.token_to_kv_pool.kv_buffer = kv_buffer
+            logger.info(f"✅ Mapped KV Cache from IPC, no extra GPU memory allocated: {len(kv_buffer)} KV buffers, size={self.token_to_kv_pool.size}")
+
+        # For Semi-PD Prefill instances, use shared allocator from IPC
+        if hasattr(self, 'bypass_load_weight') and self.bypass_load_weight:
+            # Semi-PD Prefill: Use the shared allocator from Decode instance
+            if hasattr(ipc_info, 'allocator_info') and ipc_info.allocator_info:
+                logger.info("Semi-PD Prefill: Using shared allocator from Decode instance")
+                # TODO: Implement shared allocator from IPC
+                # For now, create minimal allocator
+                allocator_size = 0  # Prefill doesn't allocate, only uses shared cache
+            else:
+                allocator_size = 0  # Minimal allocator for Semi-PD Prefill
+            logger.info(f"Creating minimal allocator for Semi-PD Prefill with size={allocator_size}")
+        else:
+            allocator_size = self.token_to_kv_pool.size
+            logger.info(f"Creating allocator for KV Cache with size={allocator_size}")
+
+        if self.page_size == 1:
+            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                allocator_size,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                kvcache=self.token_to_kv_pool,
+            )
+        else:
+            self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                allocator_size,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                kvcache=self.token_to_kv_pool,
+            )
+        logger.info(f"Allocator created with available_size={self.token_to_kv_pool_allocator.available_size()}")
 
     logger.info("Parameter sharing from IPC completed")
 

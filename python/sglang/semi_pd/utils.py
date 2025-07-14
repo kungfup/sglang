@@ -3,47 +3,18 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List
 
+try:
+    import semi_pd_ipc
+    SEMI_PD_IPC_AVAILABLE = True
+    print("✅ Semi-PD IPC extension loaded successfully")
+except ImportError as e:
+    print(f"⚠️  Semi-PD IPC extension not available: {e}")
+    print("🔄 Falling back to FALLBACK mode")
+    semi_pd_ipc = None
+    SEMI_PD_IPC_AVAILABLE = False
+
 import torch
 import zmq
-
-# Force fallback mode for now (can be changed later)
-# To use IPC mode, set FORCE_FALLBACK = False after compiling semi_pd_ipc
-FORCE_FALLBACK = True
-
-if FORCE_FALLBACK:
-    print("🔧 Forcing Semi-PD fallback mode (FORCE_FALLBACK=True)")
-    HAS_IPC = False
-    semi_pd_ipc = None
-else:
-    # Try to import semi_pd_ipc, but allow fallback if not available
-    try:
-        import semi_pd_ipc
-        # Test if semi_pd_ipc actually works by creating a small test tensor
-        import torch
-        if torch.cuda.is_available():
-            test_tensor = torch.randn(10, 10).cuda()
-            try:
-                # Test if IPC functions work
-                test_handle = semi_pd_ipc.get_ipc_handle(test_tensor)
-                sm_count = semi_pd_ipc.get_device_sm_count(0)
-                HAS_IPC = True
-                print("✅ Semi-PD IPC extension loaded and functional")
-            except Exception as e:
-                print(f"⚠️ Semi-PD IPC extension loaded but not functional: {e}")
-                print("   Using fallback mode instead")
-                HAS_IPC = False
-                semi_pd_ipc = None
-            finally:
-                del test_tensor
-        else:
-            print("⚠️ CUDA not available, using Semi-PD fallback mode")
-            HAS_IPC = False
-            semi_pd_ipc = None
-    except ImportError as e:
-        print(f"ℹ️ Semi-PD IPC extension not available: {e}")
-        print("   Using fallback mode (this is normal and expected)")
-        HAS_IPC = False
-        semi_pd_ipc = None
 
 PREFILL_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_PREFILL_SM_PERCENTILE", 80))
 DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_DECODE_SM_PERCENTILE", 100))
@@ -102,32 +73,37 @@ DTYPE_TO_ATEN = {
 
 
 def get_ipc_handle(tensor: torch.Tensor):
-    if not HAS_IPC:
-        raise RuntimeError("semi_pd_ipc not available, cannot get IPC handle")
-
     # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
-    (
-        device,
-        handle,
-        storage_size_bytes,  # size(in bytes) of the storage
-        storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
-    ) = tensor.storage()._share_cuda_()[:4]
+    # PyTorch compatibility: handle both 4-tuple and 5-tuple returns
+    shared = tensor.storage()._share_cuda_()
+    if len(shared) >= 4:
+        (
+            device,
+            handle,
+            storage_size_bytes,  # size(in bytes) of the storage
+            storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
+        ) = shared[:4]
+    else:
+        raise RuntimeError(f"Unexpected _share_cuda_() return format: {len(shared)} elements")
     assert storage_size_bytes == tensor.numel() * tensor.element_size()
 
-    return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
+    # Try to use semi_pd_ipc extension with fallback
+    try:
+        ipc_handle = semi_pd_ipc.get_ipc_handle(tensor)
+        return ipc_handle, storage_offset_bytes
+    except (ImportError, AttributeError, RuntimeError) as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"semi_pd_ipc not available: {e}")
+        logger.warning("Falling back to standard tensor sharing mode")
+        # Return None to indicate fallback mode
+        return None, 0
 
 
 def convert_ipc_handle_to_tensor(ipc_handle, size, dtype, device):
-    if not HAS_IPC:
-        raise RuntimeError("semi_pd_ipc not available, cannot convert IPC handle")
-
     dtype_str = DTYPE_TO_ATEN[dtype]
     return semi_pd_ipc.convert_ipc_handle_to_tensor(ipc_handle, size, dtype_str, device)
 
 
 def get_device_sm_count(rank: int = 0):
-    if not HAS_IPC:
-        # Fallback: return a reasonable default SM count
-        return 108  # Common for many GPUs, can be overridden
-
     return semi_pd_ipc.get_device_sm_count(rank)

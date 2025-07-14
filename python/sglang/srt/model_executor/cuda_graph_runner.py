@@ -70,9 +70,20 @@ def model_capture_mode():
     global is_capture_mode
     is_capture_mode = True
 
-    yield
+    # Disable Triton autotune during CUDA graph capture to avoid kernel compilation issues
+    old_triton_autotune = os.environ.get("TRITON_AUTOTUNE_MODE", None)
+    os.environ["TRITON_AUTOTUNE_MODE"] = "disabled"
 
-    is_capture_mode = False
+    try:
+        yield
+    finally:
+        # Restore original Triton autotune setting
+        if old_triton_autotune is None:
+            os.environ.pop("TRITON_AUTOTUNE_MODE", None)
+        else:
+            os.environ["TRITON_AUTOTUNE_MODE"] = old_triton_autotune
+
+        is_capture_mode = False
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):

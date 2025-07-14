@@ -928,14 +928,23 @@ class FlashInferIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
+            # Handle Semi-PD Prefill instance where req_to_token might be None
+            if self.req_to_token is not None:
+                req_to_token_tensor = self.req_to_token
+                req_to_token_shape = self.req_to_token.shape[1]
+            else:
+                # For Semi-PD Prefill instance, create a dummy tensor
+                req_to_token_tensor = torch.zeros((bs, 8192), dtype=torch.int32, device=req_pool_indices.device)
+                req_to_token_shape = 8192
+
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
+                req_to_token_tensor,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
                 kv_indices,
-                self.req_to_token.shape[1],
+                req_to_token_shape,
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
