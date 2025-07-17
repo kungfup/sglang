@@ -94,8 +94,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         """
         Semi-PD changes:
           - add the retracted requests to the prefill scheduler
+          - add EOS token detection for decode phase
         """
         initial_bs = batch.batch_size()
+
+        # Semi-PD: Remove extra EOS detection from update_running_batch
+        # Let process_batch_result_decode handle EOS detection properly like original SGLang
 
         batch.filter_batch()
         if batch.is_empty():
@@ -403,6 +407,80 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         logger.info(f"[DECODE] 🔥 process_prefill_result completed successfully!")
 
+    def process_batch_result_decode(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
+    ):
+        """Semi-PD decode scheduler processes decode results with EOS token detection.
+
+        This is a simplified version based on standard SGLang but adapted for Semi-PD.
+        """
+        try:
+            logger.info(f"[DECODE] 🔥 process_batch_result_decode called for Semi-PD decode")
+
+            # Handle overlap mode first (like standard SGLang)
+            if self.enable_overlap:
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
+            else:
+                # Get next token IDs from result
+                next_token_ids = result.next_token_ids
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
+
+            logger.info(f"[DECODE] 🔥 Processing {len(batch.reqs)} requests with {len(next_token_ids)} tokens")
+
+            # Update requests with new tokens and check completion conditions (like original SGLang)
+            for i, req in enumerate(batch.reqs):
+                if req.is_retracted or i >= len(next_token_ids):
+                    continue
+
+                # Add the new token to the request (like original SGLang)
+                next_token_id = next_token_ids[i]
+                req.output_ids.append(next_token_id)
+
+                # Semi-PD: Ensure EOS detection fields are set correctly before check_finished
+                if req.eos_token_ids is None or len(req.eos_token_ids) == 0:
+                    req.eos_token_ids = {151645}  # Qwen EOS token
+                if req.sampling_params.stop_token_ids is None:
+                    req.sampling_params.stop_token_ids = [151645]
+                elif 151645 not in req.sampling_params.stop_token_ids:
+                    req.sampling_params.stop_token_ids.append(151645)
+
+                # Debug: Log token info every 50 tokens
+                if len(req.output_ids) % 50 == 0:
+                    logger.info(f"[DECODE] 📊 Request {req.rid}: {len(req.output_ids)} tokens, last_token={next_token_id}")
+
+                # Check completion conditions using req.check_finished() (like original SGLang)
+                req.check_finished()
+
+                # Semi-PD: Add safety net for very long generations (8K to match max_new_tokens)
+                if not req.finished() and len(req.output_ids) >= 8000:  # Match 8K max_new_tokens setting
+                    logger.info(f"[DECODE] ⚠️ Force stopping request {req.rid} after {len(req.output_ids)} tokens (safety net)")
+                    from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                    req.time_stats.completion_time = time.time()
+                    logger.info(f"[DECODE] 🔥 Request {req.rid} finished: {req.finished_reason}")
+                else:
+                    self.tree_cache.cache_unfinished_req(req)
+
+            # Stream output to detokenizer
+            skip_stream_req = []
+            self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+            logger.info(f"[DECODE] 🔥 process_batch_result_decode completed for Semi-PD")
+
+        except Exception as e:
+            logger.error(f"[DECODE] ❌ Error in process_batch_result_decode: {e}")
+            # Don't re-raise to avoid crashing the server
+            pass
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -531,20 +609,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed for Semi-PD")
 
-    def process_batch_result_decode(
-        self,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
-    ):
-        """Handle Semi-PD specific decode result processing.
 
-        This method is crucial for updating request output_ids during decode phase.
-        Without this, tokens are never added to requests, causing repetitive generation.
-        """
-        logger.info(f"[DECODE] 🔥 process_batch_result_decode called for Semi-PD Decode instance")
 
-        # Call the base implementation which handles token updates
-        super().process_batch_result_decode(batch, result, launch_done)
 
-        logger.info(f"[DECODE] 🔥 process_batch_result_decode completed for Semi-PD")

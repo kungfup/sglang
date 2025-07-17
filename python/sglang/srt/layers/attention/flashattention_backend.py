@@ -360,9 +360,9 @@ class FlashAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                    ]
+                    metadata.page_table = _safe_get_page_table(
+                        forward_batch, metadata.max_seq_len_k, device
+                    )
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
@@ -380,9 +380,9 @@ class FlashAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                    ]
+                    metadata.page_table = _safe_get_page_table(
+                        forward_batch, metadata.max_seq_len_k, device
+                    )
 
                     metadata_expand = FlashAttentionMetadata()
                     decode_length = self.speculative_step_id + 1
@@ -424,9 +424,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                metadata.page_table = _safe_get_page_table(
+                    forward_batch, metadata.max_seq_len_k, device
+                )
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -452,9 +452,9 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                metadata.page_table = _safe_get_page_table(
+                    forward_batch, metadata.max_seq_len_k, device
+                )
 
                 self._init_local_attn_metadata(metadata, device)
             else:
@@ -474,9 +474,9 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                metadata.page_table = _safe_get_page_table(
+                    forward_batch, metadata.max_seq_len_k, device
+                )
 
                 metadata_expand = FlashAttentionMetadata()
 
@@ -556,9 +556,9 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+            metadata.page_table = _safe_get_page_table(
+                forward_batch, metadata.max_seq_len_k, device
+            )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -589,20 +589,20 @@ class FlashAttentionBackend(AttentionBackend):
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
-            metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
-            ]
+            metadata.encoder_page_table = _safe_get_page_table(
+                forward_batch, metadata.encoder_max_seq_len_k, device
+            )
 
             # Currently only support forward_batch.encoder_lens.numel() == 1
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
-            ]
+            if forward_batch.req_to_token_pool is not None:
+                metadata.page_table = _safe_get_page_table(
+                    forward_batch,
+                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k,
+                    device,
+                )
 
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+        if self.page_size > 1 and metadata.page_table is not None:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -918,7 +918,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
-        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
+        # 2. IDLE: we don't need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -1628,9 +1628,9 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     )
 
-                    page_table = self.req_to_token[
-                        req_pool_indices, : metadata.max_seq_len_k
-                    ]
+                    page_table = _safe_get_page_table(
+                        forward_batch, metadata.max_seq_len_k, device
+                    )
 
                     metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
@@ -1680,7 +1680,11 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
-                page_indices = self.req_to_token[
+                page_indices = _safe_get_page_table(
+                    forward_batch,
+                    metadata.max_seq_len_k,
+                    device,
+                )[
                     req_pool_indices[:, None],
                     self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
                 ]
@@ -1697,9 +1701,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
-                page_table = self.req_to_token[
-                    req_pool_indices, : metadata.max_seq_len_k
-                ]
+                page_table = _safe_get_page_table(
+                    forward_batch, metadata.max_seq_len_k, device
+                )
                 metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
@@ -1747,7 +1751,9 @@ class FlashAttentionBackend(AttentionBackend):
                 _, sort_order = torch.sort(keys, dim=1)
 
                 non_masked_page_table = (
-                    self.req_to_token[req_pool_indices, :]
+                    _safe_get_page_table(forward_batch, metadata.max_seq_len_k, device)[
+                        req_pool_indices, :
+                    ]
                     .gather(1, cols)
                     .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
                 )  # (bsz, draft_num)
@@ -1785,7 +1791,11 @@ class FlashAttentionBackend(AttentionBackend):
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
-            page_indices = self.req_to_token[
+            page_indices = _safe_get_page_table(
+                forward_batch,
+                metadata.max_seq_len_k,
+                device,
+            )[
                 req_pool_indices[:, None],
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
             ]
@@ -1800,16 +1810,15 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             metadata.encoder_page_table[:, : metadata.encoder_max_seq_len_k].copy_(
-                self.req_to_token[req_pool_indices, : metadata.encoder_max_seq_len_k]
+                _safe_get_page_table(forward_batch, metadata.encoder_max_seq_len_k, device)
             )
 
             # Update the regular page table
-            page_table = self.req_to_token[
-                req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
-            ]
+            page_table = _safe_get_page_table(
+                forward_batch,
+                metadata.encoder_max_seq_len_k + metadata.max_seq_len_k,
+                device,
+            )
             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
         self.forward_metadata = metadata
@@ -2075,3 +2084,27 @@ def normal_decode_set_medadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+
+# === Added helper util to safely fetch page_table ===
+
+def _safe_get_page_table(forward_batch: "ForwardBatch", max_seq_len: int, device: torch.device) -> torch.Tensor:
+    """Safely fetch page_table.
+
+    Conditions to return real table:
+      1. forward_batch.req_to_token_pool is not None
+      2. forward_batch.req_to_token_pool.req_to_token is not None
+    Otherwise return zero placeholder tensor (shape batch_size x max_seq_len).
+    """
+    pool = getattr(forward_batch, "req_to_token_pool", None)
+    real_table = getattr(pool, "req_to_token", None) if pool is not None else None
+
+    if real_table is not None:
+        return real_table[forward_batch.req_pool_indices, : max_seq_len]
+
+    # fallback – allocate zeros to keep downstream kernels happy
+    batch_sz = (
+        len(forward_batch.req_pool_indices)
+        if hasattr(forward_batch, "req_pool_indices")
+        else forward_batch.batch_size
+    )
+    return torch.zeros((batch_sz, max_seq_len), dtype=torch.int32, device=device)

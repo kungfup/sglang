@@ -208,6 +208,16 @@ class SamplingBatchInfo:
             self.linear_penalty = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
+        # --- 开始添加的代码 ---
+        import os
+        import logging
+        logger = logging.getLogger(__name__)
+        if os.environ.get("SGLANG_DEBUG_PENALIZER", "0") == "1":
+            logger.info(f"SGLANG_DEBUG: apply_logits_bias called, linear_penalty={self.linear_penalty is not None}, penalizer_orchestrator={self.penalizer_orchestrator is not None}")
+            if self.penalizer_orchestrator:
+                logger.info(f"SGLANG_DEBUG: penalizer_orchestrator.is_required={self.penalizer_orchestrator.is_required}")
+        # --- 结束添加的代码 ---
+
         if self.linear_penalty is not None:
             # Used in the overlap mode
             logits.add_(self.linear_penalty)

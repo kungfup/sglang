@@ -233,7 +233,6 @@ class TpModelWorkerClient:
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
-            penalizer_orchestrator=None,
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.

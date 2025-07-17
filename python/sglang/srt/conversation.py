@@ -955,6 +955,9 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    # Add support for regular Qwen text models
+    if re.search(r"qwen", model_path, re.IGNORECASE):
+        return "chatml"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,

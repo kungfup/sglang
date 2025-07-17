@@ -51,7 +51,19 @@ class BatchedPenalizerOrchestrator:
         Returns:
             torch.Tensor: The logits after applying the penalizers.
         """
+        # --- 开始添加的代码 ---
+        import os
+        import logging
+        logger = logging.getLogger(__name__)
+        if os.environ.get("SGLANG_DEBUG_PENALIZER", "0") == "1":
+            logger.info(f"SGLANG_DEBUG: Orchestrator.apply called, is_required={self.is_required}, num_penalizers={len(self.penalizers)}")
+        # --- 结束添加的代码 ---
+
         for penalizer in self.penalizers.values():
+            # --- 开始添加的代码 ---
+            if os.environ.get("SGLANG_DEBUG_PENALIZER", "0") == "1":
+                logger.info(f"SGLANG_DEBUG: Checking penalizer: {penalizer.__class__.__name__}, is_prepared={penalizer.is_prepared()}")
+            # --- 结束添加的代码 ---
             penalizer.apply(logits)
 
     def filter(self, keep_indices: torch.Tensor):

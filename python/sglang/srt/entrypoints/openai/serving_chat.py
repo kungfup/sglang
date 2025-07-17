@@ -300,6 +300,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop.append(request.stop)
             else:
                 stop.extend(request.stop)
+        else:
+            # Add default stop tokens for Qwen models if no stop tokens provided
+            # This helps with EOS detection for Semi-PD and other scenarios
+            import os
+            default_stop_tokens = list(map(int, os.getenv("SGLANG_DEFAULT_STOP_TOKENS", "151645").split(",")))
+            stop.extend([str(token) for token in default_stop_tokens])
 
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)

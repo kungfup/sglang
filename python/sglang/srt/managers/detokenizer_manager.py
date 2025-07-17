@@ -61,6 +61,8 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
+    # Offset that's sent to tokenizer for incremental update (only for non-Semi-PD mode).
+    sent_offset: int = 0
 
 
 class DetokenizerManager:
@@ -71,24 +73,31 @@ class DetokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        logger.info("🔧 [DETOKENIZER] Starting ZMQ socket initialization...")
         # Init inter-process communication
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
+        logger.info(f"🔧 [DETOKENIZER] recv_from_scheduler socket bound to: {port_args.detokenizer_ipc_name}")
+
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+        logger.info(f"🔧 [DETOKENIZER] send_to_tokenizer socket connected to: {port_args.tokenizer_ipc_name}")
 
         if server_args.skip_tokenizer_init:
+            logger.info("🔧 [DETOKENIZER] Skipping tokenizer initialization (skip_tokenizer_init=True)")
             self.tokenizer = None
         else:
+            logger.info(f"🔧 [DETOKENIZER] Starting tokenizer loading from: {server_args.tokenizer_path}")
             self.tokenizer = get_tokenizer(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            logger.info("🔧 [DETOKENIZER] Tokenizer loading completed!")
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = server_args.load_format == "dummy"
@@ -152,7 +161,7 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids = recv_obj.decode_ids[i]
+                s.decode_ids.extend(recv_obj.decode_ids[i])
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -227,13 +236,15 @@ class DetokenizerManager:
                 else:
                     new_text = find_printable_text(new_text)
 
-            output_strs.append(
-                self.trim_matched_stop(
-                    s.decoded_text + new_text,
-                    recv_obj.finished_reasons[i],
-                    recv_obj.no_stop_trim[i],
-                )
+            output_str = self.trim_matched_stop(
+                s.decoded_text + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
             )
+            # Incrementally send text.
+            incremental_output = output_str[s.sent_offset :]
+            s.sent_offset = len(output_str)
+            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,
@@ -287,15 +298,20 @@ def run_detokenizer_process(
     parent_process = psutil.Process().parent()
 
     try:
+        logger.info("🔧 [DETOKENIZER] Starting DetokenizerManager initialization...")
         manager = DetokenizerManager(server_args, port_args)
+        logger.info("🔧 [DETOKENIZER] DetokenizerManager initialization completed!")
 
         # Send ready signal to parent process if pipe_writer is provided
         if pipe_writer:
             try:
+                logger.info("🔧 [DETOKENIZER] Sending ready signal to parent process...")
                 pipe_writer.send({"status": "ready"})
+                logger.info("🔧 [DETOKENIZER] Ready signal sent successfully!")
             except Exception as e:
                 logger.error(f"Error sending ready signal: {e}")
 
+        logger.info("🔧 [DETOKENIZER] Starting event loop...")
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()

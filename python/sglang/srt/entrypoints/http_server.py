@@ -43,6 +43,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+# Default stop tokens for Qwen models
+DEFAULT_STOP_TOKENS = list(map(int, os.getenv("SGLANG_DEFAULT_STOP_TOKENS", "151645").split(",")))
+
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     register_disaggregation_server,

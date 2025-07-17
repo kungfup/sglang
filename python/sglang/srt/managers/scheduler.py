@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
+from types import SimpleNamespace
 
 import psutil
 import setproctitle
@@ -296,17 +297,14 @@ class Scheduler(
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
-                logger.info(f"🔧 [SCHEDULER] Setting up send_to_detokenizer (tokenizer): {port_args.tokenizer_ipc_name}")
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
             else:
                 # Send to the DetokenizerManager
-                logger.info(f"🔧 [SCHEDULER] Setting up send_to_detokenizer (detokenizer): {port_args.detokenizer_ipc_name}")
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
-                logger.info(f"🔧 [SCHEDULER] Successfully connected send_to_detokenizer: {port_args.detokenizer_ipc_name}")
 
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
@@ -995,16 +993,7 @@ class Scheduler(
                     while True:
                         try:
                             recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                            # Handle different request types
-                            if hasattr(recv_req, 'rid'):
-                                logger.info(f"🔥 [{self.instance_role}] Received request from tokenizer: {recv_req.rid}")
-                            elif hasattr(recv_req, 'rids'):
-                                logger.info(f"🔥 [{self.instance_role}] Received batch request from tokenizer: {recv_req.rids}")
-                            else:
-                                logger.info(f"🔥 [{self.instance_role}] Received request from tokenizer: {type(recv_req)}")
-                        except zmq.ZMQError as e:
-                            if e.errno != zmq.EAGAIN:  # EAGAIN means no message available
-                                logger.error(f"❌ [{self.instance_role}] ZMQ recv error: {e}")
+                        except zmq.ZMQError:
                             break
                         recv_reqs.append(recv_req)
 
@@ -1075,8 +1064,6 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            logger.info(f"[{self.instance_role}] Processing request: {type(recv_req)}")
-
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None or not self.running_batch.is_empty()
@@ -1084,9 +1071,7 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            logger.info(f"[{self.instance_role}] Dispatching request to handler...")
             output = self._request_dispatcher(recv_req)
-            logger.info(f"[{self.instance_role}] Handler returned: {type(output) if output else None}")
 
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -1099,8 +1084,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        # Debug: Log request reception
-        logger.info(f"[{self.instance_role}] 🔥 Received generate request, rid={recv_req.rid}")
+
 
         # Create a new request
         if (
@@ -1864,9 +1848,6 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
-        # 🔧 DEBUG: Log forward mode to understand the issue
-        logger.info(f"🔧 [PROCESS_BATCH] batch.forward_mode={batch.forward_mode}, is_decode={batch.forward_mode.is_decode()}, is_extend={batch.forward_mode.is_extend()}")
-
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
@@ -1875,6 +1856,15 @@ class Scheduler(
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
+        elif batch.forward_mode.is_dummy_first():
+            self.set_next_batch_sampling_info_done(batch)
+
+        if self.return_health_check_ct:
+            # Return some signal for the health check.
+            # This is used to prevent the health check signal being blocked by long context prefill.
+            # However, one minor issue is that this code path does not check the status of detokenizer manager.
+            self.return_health_check_ct -= 1
+            self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
 
 

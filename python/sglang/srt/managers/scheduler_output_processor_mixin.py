@@ -54,25 +54,28 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Semi-PD
+            # Semi-PD: 按照README建议 - 先无条件获取结果，因为 next_token_ids 对于所有模式都至关重要
+            logits_output, next_token_ids, _ = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
+
+            # 仅在非 Semi-PD 模式下，才处理 SGLang 原生的 overlap 逻辑
             if self.enable_overlap and not self.server_args.enable_semi_pd:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-            else:
-                # Move next_token_ids and logprobs to cpu
-                # Semi-PD
-                if not isinstance(next_token_ids, list):
-                    next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    if logits_output.next_token_logprobs is not None:
-                        logits_output.next_token_logprobs = (
-                            logits_output.next_token_logprobs.tolist()
-                        )
-                    if logits_output.input_token_logprobs is not None:
-                        logits_output.input_token_logprobs = tuple(
-                            logits_output.input_token_logprobs.tolist()
-                        )
+                # 这里可以保留或根据需要调整 SGLang 原生的 overlap 特定代码
+                # 如果 Semi-PD 完全不依赖 overlap，这里可能为空
+                pass
+
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.tolist()
+                    )
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = tuple(
+                        logits_output.input_token_logprobs.tolist()
+                    )
 
             hidden_state_offset = 0
 
@@ -87,9 +90,6 @@ class SchedulerOutputProcessorMixin:
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
-
-                # 🔧 DEBUG: Track chunked prefill behavior
-                logger.info(f"🔧 [CHUNKED] req.rid={req.rid}, is_chunked={req.is_chunked}, next_token_id={next_token_id}, output_ids={req.output_ids}")
 
                 if req.is_chunked <= 0:
                     # req output_ids are set here
@@ -553,7 +553,9 @@ class SchedulerOutputProcessorMixin:
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
                 else:
-                    decode_ids_list.append(decode_ids)
+                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+
+                req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])

@@ -147,7 +147,7 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        # Handle Semi-PD single GPU mode
+        # Semi-PD: Handle single GPU mode where world_group is None
         if self.world_group is not None:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
@@ -156,6 +156,7 @@ class TpModelWorker:
                 src=self.world_group.ranks[0],
             )[0]
         else:
+            # Single GPU mode, use the seed directly
             self.random_seed = server_args.random_seed
         set_random_seed(self.random_seed)
 
@@ -248,9 +249,7 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
-        logger.info(f"🔧 [TP_WORKER] forward_batch_generation called, batch_size={len(model_worker_batch.req_pool_indices)}")
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logger.info(f"🔧 [TP_WORKER] ForwardBatch created successfully")
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -261,22 +260,18 @@ class TpModelWorker:
             )
 
         if self.pp_group.is_last_rank:
-            logger.info(f"🔧 [TP_WORKER] About to call model_runner.forward()")
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            logger.info(f"🔧 [TP_WORKER] model_runner.forward() completed, logits_output type: {type(logits_output)}")
             if launch_done is not None:
                 launch_done.set()
 
             if skip_sample:
                 next_token_ids = None
             else:
-                logger.info(f"🔧 [TP_WORKER] About to call model_runner.sample()")
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
-                logger.info(f"🔧 [TP_WORKER] model_runner.sample() completed, next_token_ids: {next_token_ids}")
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
