@@ -461,27 +461,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # Add the new token to the request (like original SGLang)
                 next_token_id = next_token_ids[i]
 
-                # Semi-PD: H20 Fix - Detect and prevent infinite loops
-                if len(req.output_ids) >= 2:
-                    # Check for infinite loops (same token repeated)
-                    recent_tokens = req.output_ids[-2:]
+                # Semi-PD: Only detect true infinite loops (5+ same tokens in a row)
+                if len(req.output_ids) >= 5:
+                    # Check for infinite loops (same token repeated many times)
+                    recent_tokens = req.output_ids[-5:]
                     if len(set(recent_tokens)) == 1 and recent_tokens[0] == next_token_id:
-                        # Infinite loop detected! Force a different token
+                        # True infinite loop detected! Log it but don't force fix
                         with open('/tmp/semi_pd_debug.log', 'a') as f:
-                            f.write(f"[{req.rid[:8]}] LOOP_DETECTED: token {next_token_id} repeated {len(recent_tokens)+1} times, forcing Chinese token\n")
-
-                        # Force a known good Chinese token
-                        next_token_id = 6313  # '！' token
-                        with open('/tmp/semi_pd_debug.log', 'a') as f:
-                            f.write(f"[{req.rid[:8]}] LOOP_FIX: forced token 6313 -> '！'\n")
-
-                # Additional check: if first decode token is problematic, force fix
-                elif len(req.output_ids) == 1 and next_token_id in [15, 13, 16, 17, 18, 19, 20, 21]:  # Common problematic tokens
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
-                        f.write(f"[{req.rid[:8]}] BAD_FIRST_TOKEN: {next_token_id} detected, forcing Chinese token\n")
-                    next_token_id = 6313  # '！' token
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
-                        f.write(f"[{req.rid[:8]}] FIRST_TOKEN_FIX: forced token 6313 -> '！'\n")
+                            f.write(f"[{req.rid[:8]}] TRUE_LOOP_DETECTED: token {next_token_id} repeated {len(recent_tokens)+1} times\n")
+                            f.write(f"[{req.rid[:8]}] This indicates a real Semi-PD issue that needs investigation\n")
 
                 # Semi-PD: Detailed debug for cross-platform issues
                 if len(req.output_ids) <= 5:  # Only log first few tokens
