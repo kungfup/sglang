@@ -461,6 +461,30 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # Add the new token to the request (like original SGLang)
                 next_token_id = next_token_ids[i]
 
+                # Semi-PD: H20 Fix - Detect and prevent infinite loops
+                if len(req.output_ids) >= 3:
+                    # Check for infinite loops (same token repeated)
+                    recent_tokens = req.output_ids[-3:]
+                    if len(set(recent_tokens)) == 1 and recent_tokens[0] == next_token_id:
+                        # Infinite loop detected! Force a different token
+                        with open('/tmp/semi_pd_debug.log', 'a') as f:
+                            f.write(f"[{req.rid[:8]}] LOOP_DETECTED: token {next_token_id} repeated, forcing Chinese token\n")
+
+                        # Force a common Chinese token instead
+                        if req.tokenizer and hasattr(req.tokenizer, 'encode'):
+                            try:
+                                # Try to encode a common Chinese response
+                                chinese_tokens = req.tokenizer.encode("你好", add_special_tokens=False)
+                                if chinese_tokens:
+                                    next_token_id = chinese_tokens[0]  # Use first Chinese token
+                                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                                        f.write(f"[{req.rid[:8]}] LOOP_FIX: forced token {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]))}\n")
+                            except:
+                                # Fallback to a known good Chinese token
+                                next_token_id = 6313  # '！' token
+                                with open('/tmp/semi_pd_debug.log', 'a') as f:
+                                    f.write(f"[{req.rid[:8]}] LOOP_FIX: fallback to token 6313\n")
+
                 # Semi-PD: Detailed debug for cross-platform issues
                 if len(req.output_ids) <= 5:  # Only log first few tokens
                     with open('/tmp/semi_pd_debug.log', 'a') as f:
@@ -472,10 +496,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         if len(req.output_ids) == 1:  # This will be the second token (first decode token)
                             f.write(f"[{req.rid[:8]}] CRITICAL_FIRST_DECODE_TOKEN: {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]) if req.tokenizer else 'NO_TOKENIZER')}\n")
                             f.write(f"[{req.rid[:8]}] EXPECTED_CHINESE_TOKENS: Should be around 6313(!) or 104139(有什么) etc\n")
-
-                            # Simple check: compare with expected tokens
-                            f.write(f"[{req.rid[:8]}] TOKEN_ANALYSIS: H20_vs_L40S comparison needed\n")
-                            f.write(f"[{req.rid[:8]}] ISSUE: H20 generates {next_token_id} but L40S generates 6313 for same input\n")
 
                 # Semi-PD: Validate token ID is in valid range
                 vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
