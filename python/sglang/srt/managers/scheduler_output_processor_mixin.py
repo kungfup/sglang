@@ -548,7 +548,9 @@ class SchedulerOutputProcessorMixin:
 
                 # Semi-PD: Critical debug info for cross-platform issues
                 if len(decode_ids) % 20 == 0:  # Log every 20 tokens to reduce spam
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                    import os
+                    debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
+                    with open(debug_file, 'a') as f:
                         f.write(f"[{req.rid[:8]}] offset:{req.send_decode_id_offset} len:{len(decode_ids)} "
                                f"multimodal:{self.model_config.is_multimodal_gen} "
                                f"tokens:{decode_ids[-5:] if len(decode_ids) >= 5 else decode_ids}\n")
@@ -561,7 +563,8 @@ class SchedulerOutputProcessorMixin:
 
                     # Log critical token info for debugging cross-platform issues
                     if len(incremental_ids) > 0:
-                        with open('/tmp/semi_pd_debug.log', 'a') as f:
+                        debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
+                        with open(debug_file, 'a') as f:
                             f.write(f"[{req.rid[:8]}] SEND incremental_tokens:{incremental_ids} "
                                    f"text_preview:{repr(req.tokenizer.decode(incremental_ids) if req.tokenizer else 'NO_TOKENIZER')}\n")
 

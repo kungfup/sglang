@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -69,12 +70,19 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Log environment info for cross-platform debugging
         import platform
         import torch
-        with open('/tmp/semi_pd_debug.log', 'w') as f:  # Clear previous log
+        import os
+        debug_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = os.path.join(debug_dir, 'semi_pd_debug.log')
+        with open(debug_file, 'w') as f:  # Clear previous log
             f.write(f"=== Semi-PD Debug Log ===\n")
             f.write(f"Platform: {platform.platform()}\n")
             f.write(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'NO_CUDA'}\n")
             f.write(f"CUDA Version: {torch.version.cuda if torch.cuda.is_available() else 'NO_CUDA'}\n")
             f.write(f"Model Path: {server_args.model_path}\n")
+            f.write(f"Instance Role: DECODE\n")
+            f.write(f"Enable Overlap: {getattr(server_args, 'enable_overlap', 'Unknown')}\n")
+            f.write(f"CUDA Graph: {not getattr(server_args, 'disable_cuda_graph', True)}\n")
             f.write(f"=========================\n")
 
         self._request_dispatcher._mapping.extend(
@@ -453,6 +461,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # Add the new token to the request (like original SGLang)
                 next_token_id = next_token_ids[i]
 
+                # Semi-PD: Simple debug for cross-platform issues
+                if len(req.output_ids) <= 3:  # Only log first few tokens
+                    debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
+                    with open(debug_file, 'a') as f:
+                        f.write(f"[{req.rid[:8]}] SIMPLE_DEBUG token_{len(req.output_ids)+1}: next_token_id={next_token_id} from_overlap={self.enable_overlap}\n")
+
                 # Semi-PD: Validate token ID is in valid range
                 vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
                 if not (0 <= next_token_id < vocab_size):
@@ -464,7 +478,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 # Critical debug: Log token details for cross-platform debugging
                 if len(req.output_ids) <= 5 or len(req.output_ids) % 25 == 0:
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                    debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
+                    with open(debug_file, 'a') as f:
                         token_text = req.tokenizer.decode([next_token_id]) if req.tokenizer else f"TOKEN_{next_token_id}"
                         f.write(f"[{req.rid[:8]}] token_{len(req.output_ids)}: {next_token_id} -> {repr(token_text)}\n")
 
