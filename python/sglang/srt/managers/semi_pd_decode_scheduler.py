@@ -79,6 +79,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             f.write(f"Instance Role: DECODE\n")
             f.write(f"Enable Overlap: {getattr(server_args, 'enable_overlap', 'Unknown')}\n")
             f.write(f"CUDA Graph: {not getattr(server_args, 'disable_cuda_graph', True)}\n")
+            f.write(f"TP Size: {getattr(server_args, 'tp_size', 'Unknown')}\n")
+            f.write(f"GPU ID: {gpu_id}\n")
             f.write(f"=========================\n")
 
         self._request_dispatcher._mapping.extend(
@@ -470,6 +472,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         if len(req.output_ids) == 1:  # This will be the second token (first decode token)
                             f.write(f"[{req.rid[:8]}] CRITICAL_FIRST_DECODE_TOKEN: {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]) if req.tokenizer else 'NO_TOKENIZER')}\n")
                             f.write(f"[{req.rid[:8]}] EXPECTED_CHINESE_TOKENS: Should be around 6313(!) or 104139(有什么) etc\n")
+
+                            # Simple check: compare with expected tokens
+                            f.write(f"[{req.rid[:8]}] TOKEN_ANALYSIS: H20_vs_L40S comparison needed\n")
+                            f.write(f"[{req.rid[:8]}] ISSUE: H20 generates {next_token_id} but L40S generates 6313 for same input\n")
 
                 # Semi-PD: Validate token ID is in valid range
                 vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
