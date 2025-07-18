@@ -66,6 +66,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             InstanceRole.DECODE,
         )
 
+        # Log environment info for cross-platform debugging
+        import platform
+        import torch
+        with open('/tmp/semi_pd_debug.log', 'w') as f:  # Clear previous log
+            f.write(f"=== Semi-PD Debug Log ===\n")
+            f.write(f"Platform: {platform.platform()}\n")
+            f.write(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'NO_CUDA'}\n")
+            f.write(f"CUDA Version: {torch.version.cuda if torch.cuda.is_available() else 'NO_CUDA'}\n")
+            f.write(f"Model Path: {server_args.model_path}\n")
+            f.write(f"=========================\n")
+
         self._request_dispatcher._mapping.extend(
             [
                 (GetNextPrefillBatchInput, self.get_next_prefill_batch),
@@ -418,7 +429,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         This is a simplified version based on standard SGLang but adapted for Semi-PD.
         """
         try:
-            logger.info(f"[DECODE] 🔥 process_batch_result_decode called for Semi-PD decode")
+            # Reduced logging - only log every 50 tokens
+            if len(batch.reqs) > 0 and len(batch.reqs[0].output_ids) % 50 == 0:
+                with open('/tmp/semi_pd_debug.log', 'a') as f:
+                    f.write(f"[DECODE] Processing {len(batch.reqs)} requests, current_tokens: {len(batch.reqs[0].output_ids)}\n")
 
             # Handle overlap mode first (like standard SGLang)
             if self.enable_overlap:
@@ -430,8 +444,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 next_token_ids = result.next_token_ids
                 if not isinstance(next_token_ids, list):
                     next_token_ids = next_token_ids.tolist()
-
-            logger.info(f"[DECODE] 🔥 Processing {len(batch.reqs)} requests with {len(next_token_ids)} tokens")
 
             # Update requests with new tokens and check completion conditions (like original SGLang)
             for i, req in enumerate(batch.reqs):
@@ -449,6 +461,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     next_token_id = min(vocab_size - 1, 151643)  # Use a safe token
 
                 req.output_ids.append(next_token_id)
+
+                # Critical debug: Log token details for cross-platform debugging
+                if len(req.output_ids) <= 5 or len(req.output_ids) % 25 == 0:
+                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                        token_text = req.tokenizer.decode([next_token_id]) if req.tokenizer else f"TOKEN_{next_token_id}"
+                        f.write(f"[{req.rid[:8]}] token_{len(req.output_ids)}: {next_token_id} -> {repr(token_text)}\n")
 
                 # Semi-PD: Ensure EOS detection fields are set correctly before check_finished
                 # Use a comprehensive approach to handle Qwen's special tokens
@@ -513,7 +531,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             skip_stream_req = []
             self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-            logger.info(f"[DECODE] 🔥 process_batch_result_decode completed for Semi-PD")
+            # Completed - reduced logging
 
         except Exception as e:
             logger.error(f"[DECODE] ❌ Error in process_batch_result_decode: {e}")

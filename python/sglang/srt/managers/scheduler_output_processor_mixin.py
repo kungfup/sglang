@@ -546,15 +546,24 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
-                # Semi-PD: Debug multimodal detection
-                logger.info(f"[DEBUG] is_multimodal_gen: {self.model_config.is_multimodal_gen}, send_decode_id_offset: {req.send_decode_id_offset}, decode_ids_len: {len(decode_ids)}")
+                # Semi-PD: Critical debug info for cross-platform issues
+                if len(decode_ids) % 20 == 0:  # Log every 20 tokens to reduce spam
+                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                        f.write(f"[{req.rid[:8]}] offset:{req.send_decode_id_offset} len:{len(decode_ids)} "
+                               f"multimodal:{self.model_config.is_multimodal_gen} "
+                               f"tokens:{decode_ids[-5:] if len(decode_ids) >= 5 else decode_ids}\n")
 
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
-                    logger.info(f"[DEBUG] Using multimodal_gen path (full send)")
                 else:
-                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-                    logger.info(f"[DEBUG] Using normal path (incremental send): {len(decode_ids[req.send_decode_id_offset :])}")
+                    incremental_ids = decode_ids[req.send_decode_id_offset :]
+                    decode_ids_list.append(incremental_ids)
+
+                    # Log critical token info for debugging cross-platform issues
+                    if len(incremental_ids) > 0:
+                        with open('/tmp/semi_pd_debug.log', 'a') as f:
+                            f.write(f"[{req.rid[:8]}] SEND incremental_tokens:{incremental_ids} "
+                                   f"text_preview:{repr(req.tokenizer.decode(incremental_ids) if req.tokenizer else 'NO_TOKENIZER')}\n")
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
