@@ -54,28 +54,26 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Semi-PD: 按照README建议 - 先无条件获取结果，因为 next_token_ids 对于所有模式都至关重要
-            logits_output, next_token_ids, _ = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-
-            # 仅在非 Semi-PD 模式下，才处理 SGLang 原生的 overlap 逻辑
+            # Semi-PD: 按照 Semi-PD 的逻辑处理 overlap 和 next_token_ids
             if self.enable_overlap and not self.server_args.enable_semi_pd:
-                # 这里可以保留或根据需要调整 SGLang 原生的 overlap 特定代码
-                # 如果 Semi-PD 完全不依赖 overlap，这里可能为空
-                pass
+                logits_output, next_token_ids, _ = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
+            else:
+                # Move next_token_ids and logprobs to cpu
+                # Semi-PD: 检查类型，避免对已经是 list 的对象调用 tolist()
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
 
-            # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
+                if batch.return_logprob:
+                    if logits_output.next_token_logprobs is not None:
+                        logits_output.next_token_logprobs = (
+                            logits_output.next_token_logprobs.tolist()
+                        )
+                    if logits_output.input_token_logprobs is not None:
+                        logits_output.input_token_logprobs = tuple(
+                            logits_output.input_token_logprobs.tolist()
+                        )
 
             hidden_state_offset = 0
 
@@ -533,10 +531,8 @@ class SchedulerOutputProcessorMixin:
                     )
                     should_output = len(req.output_ids) % stream_interval == 0
                 else:
-                    should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        and not self.model_config.is_multimodal_gen
-                    )
+                    # Semi-PD: Always output for non-streaming to ensure proper offset updates
+                    should_output = True
 
             if should_output:
                 send_token_offset = req.send_token_offset
@@ -550,10 +546,15 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
+                # Semi-PD: Debug multimodal detection
+                logger.info(f"[DEBUG] is_multimodal_gen: {self.model_config.is_multimodal_gen}, send_decode_id_offset: {req.send_decode_id_offset}, decode_ids_len: {len(decode_ids)}")
+
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
+                    logger.info(f"[DEBUG] Using multimodal_gen path (full send)")
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                    logger.info(f"[DEBUG] Using normal path (incremental send): {len(decode_ids[req.send_decode_id_offset :])}")
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)

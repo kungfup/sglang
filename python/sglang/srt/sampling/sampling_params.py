@@ -30,7 +30,7 @@ class SamplingParams:
 
     def __init__(
         self,
-        max_new_tokens: int = 8192,  # Semi-PD: 8K tokens default (already set as requested)
+        max_new_tokens: int = 1000,  # Semi-PD: Reasonable default for better EOS testing
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,

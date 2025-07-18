@@ -440,15 +440,54 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 # Add the new token to the request (like original SGLang)
                 next_token_id = next_token_ids[i]
+
+                # Semi-PD: Validate token ID is in valid range
+                vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
+                if not (0 <= next_token_id < vocab_size):
+                    logger.warning(f"[DECODE] Invalid token ID {next_token_id} (vocab_size={vocab_size}), forcing EOS")
+                    # Force EOS by using a valid token that will trigger stopping
+                    next_token_id = min(vocab_size - 1, 151643)  # Use a safe token
+
                 req.output_ids.append(next_token_id)
 
                 # Semi-PD: Ensure EOS detection fields are set correctly before check_finished
+                # Use a comprehensive approach to handle Qwen's special tokens
+                eos_token_ids = []
+
+                if req.tokenizer:
+                    vocab_size = getattr(req.tokenizer, 'vocab_size', 50000)
+
+                    # For Qwen models, use <|endoftext|> as the primary EOS token
+                    # This is token 151643 which is within vocab range
+                    endoftext_token = vocab_size - 1  # Usually <|endoftext|>
+                    eos_token_ids.append(endoftext_token)
+
+                    # Also check for other potential EOS tokens in valid range
+                    tokenizer_eos = getattr(req.tokenizer, 'eos_token_id', None)
+                    if tokenizer_eos is not None and 0 <= tokenizer_eos < vocab_size:
+                        if tokenizer_eos not in eos_token_ids:
+                            eos_token_ids.append(tokenizer_eos)
+
+                    # Add any other special tokens that are in valid range
+                    for attr in ['bos_token_id', 'pad_token_id', 'unk_token_id']:
+                        token_id = getattr(req.tokenizer, attr, None)
+                        if token_id is not None and 0 <= token_id < vocab_size:
+                            if token_id not in eos_token_ids:
+                                eos_token_ids.append(token_id)
+
+                # Fallback: use correct Qwen EOS token if no valid EOS tokens found
+                if not eos_token_ids:
+                    eos_token_ids = [151645]  # Correct Qwen EOS token ID
+
+                # Set EOS token IDs for the request
                 if req.eos_token_ids is None or len(req.eos_token_ids) == 0:
-                    req.eos_token_ids = {151645}  # Qwen EOS token
+                    req.eos_token_ids = set(eos_token_ids)
                 if req.sampling_params.stop_token_ids is None:
-                    req.sampling_params.stop_token_ids = [151645]
-                elif 151645 not in req.sampling_params.stop_token_ids:
-                    req.sampling_params.stop_token_ids.append(151645)
+                    req.sampling_params.stop_token_ids = eos_token_ids.copy()
+                else:
+                    for eos_id in eos_token_ids:
+                        if eos_id not in req.sampling_params.stop_token_ids:
+                            req.sampling_params.stop_token_ids.append(eos_id)
 
                 # Debug: Log token info every 50 tokens
                 if len(req.output_ids) % 50 == 0:
@@ -457,8 +496,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # Check completion conditions using req.check_finished() (like original SGLang)
                 req.check_finished()
 
-                # Semi-PD: Add safety net for very long generations (8K to match max_new_tokens)
-                if not req.finished() and len(req.output_ids) >= 8000:  # Match 8K max_new_tokens setting
+                # Semi-PD: Add safety net for very long generations (match max_new_tokens)
+                if not req.finished() and len(req.output_ids) >= 800:  # Allow more space for natural EOS
                     logger.info(f"[DECODE] ⚠️ Force stopping request {req.rid} after {len(req.output_ids)} tokens (safety net)")
                     from sglang.srt.managers.schedule_batch import FINISH_LENGTH
                     req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
