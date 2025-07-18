@@ -70,11 +70,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Log environment info for cross-platform debugging
         import platform
         import torch
-        import os
-        debug_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug')
-        os.makedirs(debug_dir, exist_ok=True)
-        debug_file = os.path.join(debug_dir, 'semi_pd_debug.log')
-        with open(debug_file, 'w') as f:  # Clear previous log
+        with open('/tmp/semi_pd_debug.log', 'w') as f:  # Clear previous log
             f.write(f"=== Semi-PD Debug Log ===\n")
             f.write(f"Platform: {platform.platform()}\n")
             f.write(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'NO_CUDA'}\n")
@@ -437,10 +433,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         This is a simplified version based on standard SGLang but adapted for Semi-PD.
         """
         try:
-            # Reduced logging - only log every 50 tokens
-            if len(batch.reqs) > 0 and len(batch.reqs[0].output_ids) % 50 == 0:
+            # Enhanced logging for first few tokens
+            if len(batch.reqs) > 0 and (len(batch.reqs[0].output_ids) <= 5 or len(batch.reqs[0].output_ids) % 50 == 0):
                 with open('/tmp/semi_pd_debug.log', 'a') as f:
                     f.write(f"[DECODE] Processing {len(batch.reqs)} requests, current_tokens: {len(batch.reqs[0].output_ids)}\n")
+                    if len(batch.reqs[0].output_ids) <= 5:
+                        f.write(f"[DECODE] EARLY_STAGE: next_token_ids={next_token_ids[:5] if isinstance(next_token_ids, list) else 'NOT_LIST'}\n")
 
             # Handle overlap mode first (like standard SGLang)
             if self.enable_overlap:
@@ -461,11 +459,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # Add the new token to the request (like original SGLang)
                 next_token_id = next_token_ids[i]
 
-                # Semi-PD: Simple debug for cross-platform issues
-                if len(req.output_ids) <= 3:  # Only log first few tokens
-                    debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
-                    with open(debug_file, 'a') as f:
-                        f.write(f"[{req.rid[:8]}] SIMPLE_DEBUG token_{len(req.output_ids)+1}: next_token_id={next_token_id} from_overlap={self.enable_overlap}\n")
+                # Semi-PD: Detailed debug for cross-platform issues
+                if len(req.output_ids) <= 5:  # Only log first few tokens
+                    with open('/tmp/semi_pd_debug.log', 'a') as f:
+                        f.write(f"[{req.rid[:8]}] DECODE_DEBUG token_{len(req.output_ids)+1}: next_token_id={next_token_id}\n")
+                        f.write(f"[{req.rid[:8]}] DECODE_STATE: overlap={self.enable_overlap} batch_size={len(batch.reqs)} req_index={i}\n")
+                        f.write(f"[{req.rid[:8]}] CURRENT_OUTPUT: {req.output_ids[-10:] if len(req.output_ids) >= 10 else req.output_ids}\n")
+
+                        # Check if this is the problematic first decode token
+                        if len(req.output_ids) == 1:  # This will be the second token (first decode token)
+                            f.write(f"[{req.rid[:8]}] CRITICAL_FIRST_DECODE_TOKEN: {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]) if req.tokenizer else 'NO_TOKENIZER')}\n")
+                            f.write(f"[{req.rid[:8]}] EXPECTED_CHINESE_TOKENS: Should be around 6313(!) or 104139(有什么) etc\n")
 
                 # Semi-PD: Validate token ID is in valid range
                 vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
@@ -478,8 +482,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 # Critical debug: Log token details for cross-platform debugging
                 if len(req.output_ids) <= 5 or len(req.output_ids) % 25 == 0:
-                    debug_file = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'debug', 'semi_pd_debug.log')
-                    with open(debug_file, 'a') as f:
+                    with open('/tmp/semi_pd_debug.log', 'a') as f:
                         token_text = req.tokenizer.decode([next_token_id]) if req.tokenizer else f"TOKEN_{next_token_id}"
                         f.write(f"[{req.rid[:8]}] token_{len(req.output_ids)}: {next_token_id} -> {repr(token_text)}\n")
 
