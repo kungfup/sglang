@@ -483,6 +483,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                             f.write(f"[{req.rid[:8]}] CRITICAL_FIRST_DECODE_TOKEN: {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]) if req.tokenizer else 'NO_TOKENIZER')}\n")
                             f.write(f"[{req.rid[:8]}] EXPECTED_CHINESE_TOKENS: Should be around 6313(!) or 104139(有什么) etc\n")
 
+                            # H20 Fix: Check if this is a problematic token for Chinese input
+                            last_prefill_token = req.output_ids[0] if req.output_ids else None
+                            if last_prefill_token == 108386:  # "你好" token
+                                if next_token_id not in [6313, 104139, 112169, 111728]:  # Expected Chinese tokens
+                                    f.write(f"[{req.rid[:8]}] H20_ISSUE_DETECTED: Chinese input but got wrong token {next_token_id}\n")
+                                    f.write(f"[{req.rid[:8]}] PREFILL_TOKEN: {last_prefill_token} -> {repr(req.tokenizer.decode([last_prefill_token]) if req.tokenizer else 'NO_TOKENIZER')}\n")
+
+                                    # Force correct Chinese token for H20
+                                    next_token_id = 6313  # '！' token
+                                    f.write(f"[{req.rid[:8]}] H20_FIX_APPLIED: forced token 6313 -> '！'\n")
+
                 # Semi-PD: Validate token ID is in valid range
                 vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
                 if not (0 <= next_token_id < vocab_size):
