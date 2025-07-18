@@ -433,13 +433,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         This is a simplified version based on standard SGLang but adapted for Semi-PD.
         """
         try:
-            # Enhanced logging for first few tokens
-            if len(batch.reqs) > 0 and (len(batch.reqs[0].output_ids) <= 5 or len(batch.reqs[0].output_ids) % 50 == 0):
-                with open('/tmp/semi_pd_debug.log', 'a') as f:
-                    f.write(f"[DECODE] Processing {len(batch.reqs)} requests, current_tokens: {len(batch.reqs[0].output_ids)}\n")
-                    if len(batch.reqs[0].output_ids) <= 5:
-                        f.write(f"[DECODE] EARLY_STAGE: next_token_ids={next_token_ids[:5] if isinstance(next_token_ids, list) else 'NOT_LIST'}\n")
-
             # Handle overlap mode first (like standard SGLang)
             if self.enable_overlap:
                 logits_output, next_token_ids, can_run_cuda_graph = (
@@ -450,6 +443,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 next_token_ids = result.next_token_ids
                 if not isinstance(next_token_ids, list):
                     next_token_ids = next_token_ids.tolist()
+
+            # Enhanced logging for first few tokens (after next_token_ids is defined)
+            if len(batch.reqs) > 0 and (len(batch.reqs[0].output_ids) <= 5 or len(batch.reqs[0].output_ids) % 50 == 0):
+                with open('/tmp/semi_pd_debug.log', 'a') as f:
+                    f.write(f"[DECODE] Processing {len(batch.reqs)} requests, current_tokens: {len(batch.reqs[0].output_ids)}\n")
+                    if len(batch.reqs[0].output_ids) <= 5:
+                        f.write(f"[DECODE] EARLY_STAGE: next_token_ids={next_token_ids[:5] if isinstance(next_token_ids, list) else 'NOT_LIST'}\n")
 
             # Update requests with new tokens and check completion conditions (like original SGLang)
             for i, req in enumerate(batch.reqs):
