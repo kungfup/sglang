@@ -410,7 +410,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # DEBUG: Check KV cache allocation status BEFORE processing
         avail_size_before = self.token_to_kv_pool_allocator.available_size()
-        expected_size = self.token_to_kv_pool_allocator.max_total_num_tokens
+        expected_size = self.token_to_kv_pool_allocator.size
         logger.info(f"[DECODE] 🔧 KV Cache Status BEFORE process_batch_result_prefill: avail={avail_size_before}, expected={expected_size}, diff={avail_size_before - expected_size}")
 
         logger.info(f"[DECODE] 🔥 Calling process_batch_result_prefill...")

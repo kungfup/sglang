@@ -341,7 +341,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         # DEBUG: Check KV cache allocation status BEFORE sending to Decode
         avail_size = self.token_to_kv_pool_allocator.available_size()
-        expected_size = self.token_to_kv_pool_allocator.max_total_num_tokens
+        expected_size = self.token_to_kv_pool_allocator.size
         logger.info(f"[PREFILL] 🔧 KV Cache Status BEFORE: avail={avail_size}, expected={expected_size}, diff={avail_size - expected_size}")
 
         # DEBUG: Check if we have out_cache_loc that should be freed
