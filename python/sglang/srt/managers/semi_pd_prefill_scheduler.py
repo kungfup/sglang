@@ -238,6 +238,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             # Semi-PD Prefill: Always generate logits and token IDs (bypass pipeline parallel logic)
             logger.info(f"[PREFILL] 🔥 Semi-PD Prefill: Generating logits (no pipeline parallel)")
 
+            # DEBUG: Check input tokens before forward pass
+            logger.info(f"[PREFILL] 🔧 DEBUG: Input token IDs = {batch.input_ids}")
+            logger.info(f"[PREFILL] 🔧 DEBUG: Input shape = {batch.input_ids.shape}")
+
             # CRITICAL: Check weight sharing before generation
             logger.info(f"[PREFILL] 🚨 CRITICAL: Checking weight sharing before generation...")
             try:
@@ -340,14 +344,28 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 logger.info(f"[PREFILL] 🔧 DEBUG: logits dtype = {logits.dtype}")
                 logger.info(f"[PREFILL] 🔧 DEBUG: logits device = {logits.device}")
 
+                # DEBUG: Check logits statistics
+                logits_mean = torch.mean(logits).item()
+                logits_std = torch.std(logits).item()
+                logits_min = torch.min(logits).item()
+                logits_max = torch.max(logits).item()
+                logger.info(f"[PREFILL] 🔧 DEBUG: logits stats: mean={logits_mean:.6f}, std={logits_std:.6f}, min={logits_min:.6f}, max={logits_max:.6f}")
+
+                # DEBUG: Check if logits contain NaN or Inf
+                nan_count = torch.isnan(logits).sum().item()
+                inf_count = torch.isinf(logits).sum().item()
+                logger.info(f"[PREFILL] 🔧 DEBUG: logits anomalies: nan_count={nan_count}, inf_count={inf_count}")
+
                 # Log top-5 logits for debugging
                 top_logits, top_indices = torch.topk(logits[0], k=5)
                 logger.info(f"[PREFILL] 🔧 DEBUG: top-5 logits = {top_logits.tolist()}")
                 logger.info(f"[PREFILL] 🔧 DEBUG: top-5 indices = {top_indices.tolist()}")
 
-                # Check if token 16 is in top candidates
+                # Check specific important tokens
                 token_16_logit = logits[0, 16].item()
+                token_108386_logit = logits[0, 108386].item() if logits.shape[1] > 108386 else "N/A"
                 logger.info(f"[PREFILL] 🔧 DEBUG: token 16 logit value = {token_16_logit}")
+                logger.info(f"[PREFILL] 🔧 DEBUG: token 108386 logit value = {token_108386_logit}")
 
             logger.info(f"[PREFILL] 🔧 DEBUG: Generated next_token_ids = {next_token_ids}")
             logger.info(f"[PREFILL] 🔧 DEBUG: next_token_ids type = {type(next_token_ids)}")
