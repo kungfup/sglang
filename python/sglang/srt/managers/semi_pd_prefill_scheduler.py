@@ -339,6 +339,18 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
             logger.info(f"[PREFILL] 🔥 next_token_logits shape: {next_token_logits.shape}")
 
+        # DEBUG: Check KV cache allocation status BEFORE sending to Decode
+        avail_size = self.token_to_kv_pool_allocator.available_size()
+        expected_size = self.token_to_kv_pool_allocator.max_total_num_tokens
+        logger.info(f"[PREFILL] 🔧 KV Cache Status BEFORE: avail={avail_size}, expected={expected_size}, diff={avail_size - expected_size}")
+
+        # DEBUG: Check if we have out_cache_loc that should be freed
+        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
+            logger.info(f"[PREFILL] 🔧 batch.out_cache_loc exists: {batch.out_cache_loc}")
+            logger.warning(f"[PREFILL] ⚠️ POTENTIAL MEMORY LEAK: Prefill allocated KV cache but may not be freeing it!")
+        else:
+            logger.info(f"[PREFILL] 🔧 batch.out_cache_loc is None (expected for Semi-PD)")
+
         logger.info(f"[PREFILL] 🔥 Creating BatchProcessPrefillResultReq with next_token_ids={result.next_token_ids.tolist()}")
         req = BatchProcessPrefillResultReq(
             next_token_ids=result.next_token_ids.tolist(),

@@ -408,8 +408,23 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             np.array(result.next_token_ids, dtype=np.int64)
         ).to(self.device, dtype=torch.int64, non_blocking=True)
 
+        # DEBUG: Check KV cache allocation status BEFORE processing
+        avail_size_before = self.token_to_kv_pool_allocator.available_size()
+        expected_size = self.token_to_kv_pool_allocator.max_total_num_tokens
+        logger.info(f"[DECODE] 🔧 KV Cache Status BEFORE process_batch_result_prefill: avail={avail_size_before}, expected={expected_size}, diff={avail_size_before - expected_size}")
+
         logger.info(f"[DECODE] 🔥 Calling process_batch_result_prefill...")
         self.process_batch_result_prefill(batch, result)
+
+        # DEBUG: Check KV cache allocation status AFTER processing
+        avail_size_after = self.token_to_kv_pool_allocator.available_size()
+        logger.info(f"[DECODE] 🔧 KV Cache Status AFTER process_batch_result_prefill: avail={avail_size_after}, expected={expected_size}, diff={avail_size_after - expected_size}")
+
+        if avail_size_after != avail_size_before:
+            logger.info(f"[DECODE] 🔧 KV Cache changed by: {avail_size_after - avail_size_before} tokens")
+        else:
+            logger.warning(f"[DECODE] ⚠️ KV Cache unchanged - potential memory leak!")
+
         logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed!")
 
         logger.info(f"[DECODE] 🔥 Filtering batch...")
