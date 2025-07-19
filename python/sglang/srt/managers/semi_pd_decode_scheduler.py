@@ -93,6 +93,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # For requests that has been sent to the prefill scheduler but not yet finished.
         self.scheduled_prefill_batches: List[ScheduleBatch] = []
 
+        # CRITICAL: Verify weight sharing after initialization
+        logger.info(f"[DECODE] 🔧 CRITICAL: Verifying weight sharing after initialization...")
+        from sglang.srt.managers.semi_pd_scheduler import _verify_weight_sharing
+        _verify_weight_sharing(self, InstanceRole.DECODE)
+
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
 
@@ -552,6 +557,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # This is the key fix mentioned in the KV Cache Bug Guide!
         self.token_to_kv_pool_allocator.free_group_begin()
         logger.info(f"[DECODE] 🔧 CRITICAL FIX: Called free_group_begin() for KV Cache management")
+
+        # DEBUG: Check if Decode instance also has KV cache to manage
+        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
+            logger.info(f"[DECODE] 🔧 DEBUG: Decode batch.out_cache_loc exists: {batch.out_cache_loc}")
+        else:
+            logger.info(f"[DECODE] 🔧 DEBUG: Decode batch.out_cache_loc is None")
 
         skip_stream_req = None
 
