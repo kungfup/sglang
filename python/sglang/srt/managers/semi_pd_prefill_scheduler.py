@@ -344,12 +344,19 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         expected_size = self.token_to_kv_pool_allocator.size
         logger.info(f"[PREFILL] 🔧 KV Cache Status BEFORE: avail={avail_size}, expected={expected_size}, diff={avail_size - expected_size}")
 
-        # DEBUG: Check if we have out_cache_loc that should be freed
+        # CRITICAL FIX: Free KV Cache allocated by Prefill instance
         if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
             logger.info(f"[PREFILL] 🔧 batch.out_cache_loc exists: {batch.out_cache_loc}")
-            logger.warning(f"[PREFILL] ⚠️ POTENTIAL MEMORY LEAK: Prefill allocated KV cache but may not be freeing it!")
+            logger.info(f"[PREFILL] 🔧 CRITICAL FIX: Freeing KV cache allocated by Prefill instance")
+
+            # Free the KV cache allocated by Prefill - this is the key fix!
+            self.token_to_kv_pool_allocator.free_group_begin()
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            self.token_to_kv_pool_allocator.free_group_end()
+
+            logger.info(f"[PREFILL] ✅ CRITICAL FIX: Successfully freed KV cache in Prefill instance")
         else:
-            logger.info(f"[PREFILL] 🔧 batch.out_cache_loc is None (expected for Semi-PD)")
+            logger.info(f"[PREFILL] 🔧 batch.out_cache_loc is None (no KV cache to free)")
 
         logger.info(f"[PREFILL] 🔥 Creating BatchProcessPrefillResultReq with next_token_ids={result.next_token_ids.tolist()}")
         req = BatchProcessPrefillResultReq(
