@@ -238,6 +238,20 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             # Semi-PD Prefill: Always generate logits and token IDs (bypass pipeline parallel logic)
             logger.info(f"[PREFILL] 🔥 Semi-PD Prefill: Generating logits (no pipeline parallel)")
 
+            # CRITICAL: Check weight sharing before generation
+            logger.info(f"[PREFILL] 🚨 CRITICAL: Checking weight sharing before generation...")
+            embed_weight = self.model.embed_tokens.weight
+            embed_checksum = torch.sum(embed_weight.data).item()
+            embed_ptr = embed_weight.data_ptr()
+            logger.info(f"[PREFILL] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
+
+            # Check specific token embeddings
+            if embed_weight.shape[0] > 16:
+                token_15_embedding = embed_weight[15, :5].tolist()
+                token_16_embedding = embed_weight[16, :5].tolist()
+                logger.info(f"[PREFILL] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
+                logger.info(f"[PREFILL] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+
             # DEBUG: Log sampling info before generation
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.temperatures = {batch.sampling_info.temperatures}")
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.top_ks = {batch.sampling_info.top_ks}")
