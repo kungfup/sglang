@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 
 import zmq
+import torch
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import (
@@ -230,9 +231,35 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
             # Semi-PD Prefill: Always generate logits and token IDs (bypass pipeline parallel logic)
             logger.info(f"[PREFILL] 🔥 Semi-PD Prefill: Generating logits (no pipeline parallel)")
+
+            # DEBUG: Log sampling info before generation
+            logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.temperatures = {batch.sampling_info.temperatures}")
+            logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.top_ks = {batch.sampling_info.top_ks}")
+            logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.top_ps = {batch.sampling_info.top_ps}")
+            logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.is_all_greedy = {batch.sampling_info.is_all_greedy}")
+
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.tp_worker.forward_batch_generation(model_worker_batch)
             )
+
+            # DEBUG: Log logits and token generation details
+            if logits_output and logits_output.next_token_logits is not None:
+                logits = logits_output.next_token_logits
+                logger.info(f"[PREFILL] 🔧 DEBUG: logits shape = {logits.shape}")
+                logger.info(f"[PREFILL] 🔧 DEBUG: logits dtype = {logits.dtype}")
+                logger.info(f"[PREFILL] 🔧 DEBUG: logits device = {logits.device}")
+
+                # Log top-5 logits for debugging
+                top_logits, top_indices = torch.topk(logits[0], k=5)
+                logger.info(f"[PREFILL] 🔧 DEBUG: top-5 logits = {top_logits.tolist()}")
+                logger.info(f"[PREFILL] 🔧 DEBUG: top-5 indices = {top_indices.tolist()}")
+
+                # Check if token 16 is in top candidates
+                token_16_logit = logits[0, 16].item()
+                logger.info(f"[PREFILL] 🔧 DEBUG: token 16 logit value = {token_16_logit}")
+
+            logger.info(f"[PREFILL] 🔧 DEBUG: Generated next_token_ids = {next_token_ids}")
+            logger.info(f"[PREFILL] 🔧 DEBUG: next_token_ids type = {type(next_token_ids)}")
             batch.output_ids = next_token_ids
             bid = model_worker_batch.bid
 

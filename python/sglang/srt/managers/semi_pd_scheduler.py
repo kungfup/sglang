@@ -35,6 +35,7 @@ def _verify_weight_sharing(scheduler, instance_role):
     """Verify that Prefill and Decode instances are using the same weights"""
     try:
         role_str = str(instance_role).split('.')[-1]  # Get DECODE or PREFILL
+        logger.info(f"🔧 DEBUG: Starting weight verification for {role_str} instance")
 
         # Try to access model through different paths
         model = None
@@ -56,8 +57,10 @@ def _verify_weight_sharing(scheduler, instance_role):
         # Calculate checksums for key model parameters
         checksums = {}
         param_count = 0
+        embedding_found = False
+
         for name, param in model.named_parameters():
-            if param_count >= 3:  # Only check first 3 parameters for performance
+            if param_count >= 5:  # Check more parameters for debugging
                 break
             if param.numel() > 0:  # Skip empty parameters
                 # Calculate checksum of parameter data
@@ -65,6 +68,20 @@ def _verify_weight_sharing(scheduler, instance_role):
                 data_ptr = param.data.data_ptr()
                 checksums[name] = {'checksum': checksum, 'data_ptr': data_ptr}
                 param_count += 1
+
+                # Special attention to embedding layer (critical for token generation)
+                if "embed_tokens" in name and not embedding_found:
+                    embedding_found = True
+                    logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING LAYER {name}: checksum={checksum:.6f}, ptr=0x{data_ptr:x}")
+                    # Log a few embedding values for debugging
+                    if param.data.numel() >= 5:
+                        embed_sample = param.data.flatten()[:5].tolist()
+                        logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING SAMPLE: {embed_sample}")
+
+                        # Check specific token embeddings that might be problematic
+                        if param.data.shape[0] > 16:  # Make sure token 16 exists
+                            token_16_embedding = param.data[16, :5].tolist()
+                            logger.info(f"🔧 DEBUG [{role_str}] TOKEN 16 EMBEDDING: {token_16_embedding}")
 
         _weight_checksums[role_str] = checksums
 
