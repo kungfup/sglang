@@ -243,17 +243,39 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             try:
                 # Access model through tp_worker
                 model = self.tp_worker.model_runner.model
-                embed_weight = model.embed_tokens.weight
-                embed_checksum = torch.sum(embed_weight.data).item()
-                embed_ptr = embed_weight.data_ptr()
-                logger.info(f"[PREFILL] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
 
-                # Check specific token embeddings
-                if embed_weight.shape[0] > 16:
-                    token_15_embedding = embed_weight[15, :5].tolist()
-                    token_16_embedding = embed_weight[16, :5].tolist()
-                    logger.info(f"[PREFILL] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
-                    logger.info(f"[PREFILL] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+                # Try different embedding layer names for different model types
+                embed_weight = None
+                if hasattr(model, 'embed_tokens'):
+                    embed_weight = model.embed_tokens.weight
+                    logger.info(f"[PREFILL] 🔧 Using embed_tokens")
+                elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                    embed_weight = model.model.embed_tokens.weight
+                    logger.info(f"[PREFILL] 🔧 Using model.embed_tokens")
+                elif hasattr(model, 'transformer') and hasattr(model.transformer, 'wte'):
+                    embed_weight = model.transformer.wte.weight
+                    logger.info(f"[PREFILL] 🔧 Using transformer.wte")
+                else:
+                    # Find embedding layer by searching all parameters
+                    for name, param in model.named_parameters():
+                        if 'embed' in name.lower() and param.dim() == 2:
+                            embed_weight = param
+                            logger.info(f"[PREFILL] 🔧 Found embedding layer: {name}")
+                            break
+
+                if embed_weight is not None:
+                    embed_checksum = torch.sum(embed_weight.data).item()
+                    embed_ptr = embed_weight.data_ptr()
+                    logger.info(f"[PREFILL] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
+
+                    # Check specific token embeddings
+                    if embed_weight.shape[0] > 16:
+                        token_15_embedding = embed_weight[15, :5].tolist()
+                        token_16_embedding = embed_weight[16, :5].tolist()
+                        logger.info(f"[PREFILL] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
+                        logger.info(f"[PREFILL] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+                else:
+                    logger.error(f"[PREFILL] ❌ Could not find embedding layer")
             except Exception as e:
                 logger.error(f"[PREFILL] ❌ Failed to check weight sharing: {e}")
 
