@@ -242,6 +242,31 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.info(f"[PREFILL] 🔧 DEBUG: Input token IDs = {batch.input_ids}")
             logger.info(f"[PREFILL] 🔧 DEBUG: Input shape = {batch.input_ids.shape}")
 
+            # DEBUG: Check embedding output for the last token (which should be 108386 for "你好")
+            try:
+                model = self.tp_worker.model_runner.model
+                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                    embed_layer = model.model.embed_tokens
+                elif hasattr(model, 'embed_tokens'):
+                    embed_layer = model.embed_tokens
+                else:
+                    embed_layer = None
+
+                if embed_layer is not None and batch.input_ids.shape[1] > 0:
+                    last_token_id = batch.input_ids[0, -1].item()  # Get the last token
+                    logger.info(f"[PREFILL] 🔧 DEBUG: Last input token ID = {last_token_id}")
+
+                    # Get embedding for the last token
+                    with torch.no_grad():
+                        last_token_embedding = embed_layer(batch.input_ids[0, -1:])  # Shape: [1, hidden_size]
+                        embed_mean = torch.mean(last_token_embedding).item()
+                        embed_std = torch.std(last_token_embedding).item()
+                        embed_norm = torch.norm(last_token_embedding).item()
+                        logger.info(f"[PREFILL] 🔧 DEBUG: Last token embedding stats: mean={embed_mean:.6f}, std={embed_std:.6f}, norm={embed_norm:.6f}")
+                        logger.info(f"[PREFILL] 🔧 DEBUG: Last token embedding[:5] = {last_token_embedding[0, :5].tolist()}")
+            except Exception as e:
+                logger.error(f"[PREFILL] ❌ Failed to check embedding output: {e}")
+
             # CRITICAL: Check weight sharing before generation
             logger.info(f"[PREFILL] 🚨 CRITICAL: Checking weight sharing before generation...")
             try:
@@ -324,6 +349,22 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                         logger.info(f"[PREFILL] 🚨 TOKEN 108386 OUTPUT WEIGHTS: {token_108386_output}")
                 else:
                     logger.error(f"[PREFILL] ❌ Could not find output layer")
+
+                # DEBUG: Check model configuration
+                if hasattr(model, 'config'):
+                    config = model.config
+                    logger.info(f"[PREFILL] 🔧 DEBUG: Model config - vocab_size={getattr(config, 'vocab_size', 'N/A')}")
+                    logger.info(f"[PREFILL] 🔧 DEBUG: Model config - hidden_size={getattr(config, 'hidden_size', 'N/A')}")
+                    logger.info(f"[PREFILL] 🔧 DEBUG: Model config - num_layers={getattr(config, 'num_hidden_layers', 'N/A')}")
+                    logger.info(f"[PREFILL] 🔧 DEBUG: Model config - model_type={getattr(config, 'model_type', 'N/A')}")
+
+                # DEBUG: Check if model is in training mode (should be eval)
+                logger.info(f"[PREFILL] 🔧 DEBUG: Model training mode = {model.training}")
+
+                # DEBUG: Check model device
+                first_param = next(model.parameters())
+                logger.info(f"[PREFILL] 🔧 DEBUG: Model device = {first_param.device}")
+                logger.info(f"[PREFILL] 🔧 DEBUG: Model dtype = {first_param.dtype}")
             except Exception as e:
                 logger.error(f"[PREFILL] ❌ Failed to check weight sharing: {e}")
 
