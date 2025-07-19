@@ -266,16 +266,60 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 if embed_weight is not None:
                     embed_checksum = torch.sum(embed_weight.data).item()
                     embed_ptr = embed_weight.data_ptr()
+                    embed_mean = torch.mean(embed_weight.data).item()
+                    embed_std = torch.std(embed_weight.data).item()
+                    embed_min = torch.min(embed_weight.data).item()
+                    embed_max = torch.max(embed_weight.data).item()
+
                     logger.info(f"[PREFILL] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
+                    logger.info(f"[PREFILL] 🚨 EMBEDDING STATS: mean={embed_mean:.6f}, std={embed_std:.6f}, min={embed_min:.6f}, max={embed_max:.6f}")
+
+                    # Check if weights are all zeros or random
+                    zero_count = torch.sum(embed_weight.data == 0).item()
+                    total_count = embed_weight.numel()
+                    zero_ratio = zero_count / total_count
+                    logger.info(f"[PREFILL] 🚨 ZERO RATIO: {zero_ratio:.6f} ({zero_count}/{total_count})")
 
                     # Check specific token embeddings
                     if embed_weight.shape[0] > 16:
                         token_15_embedding = embed_weight[15, :5].tolist()
                         token_16_embedding = embed_weight[16, :5].tolist()
+                        token_108386_embedding = embed_weight[108386, :5].tolist() if embed_weight.shape[0] > 108386 else "N/A"
                         logger.info(f"[PREFILL] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
                         logger.info(f"[PREFILL] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+                        logger.info(f"[PREFILL] 🚨 TOKEN 108386 EMBEDDING: {token_108386_embedding}")
+
+                # Also check output layer (lm_head) weights
+                lm_head_weight = None
+                if hasattr(model, 'lm_head'):
+                    lm_head_weight = model.lm_head.weight
+                    logger.info(f"[PREFILL] 🔧 Using lm_head")
+                elif hasattr(model, 'output'):
+                    lm_head_weight = model.output.weight
+                    logger.info(f"[PREFILL] 🔧 Using output")
                 else:
-                    logger.error(f"[PREFILL] ❌ Could not find embedding layer")
+                    # Find output layer by searching parameters
+                    for name, param in model.named_parameters():
+                        if 'lm_head' in name.lower() or 'output' in name.lower():
+                            if param.dim() == 2 and param.shape[0] > 100000:  # Vocab size check
+                                lm_head_weight = param
+                                logger.info(f"[PREFILL] 🔧 Found output layer: {name}")
+                                break
+
+                if lm_head_weight is not None:
+                    lm_head_checksum = torch.sum(lm_head_weight.data).item()
+                    lm_head_mean = torch.mean(lm_head_weight.data).item()
+                    lm_head_std = torch.std(lm_head_weight.data).item()
+                    logger.info(f"[PREFILL] 🚨 LM_HEAD: checksum={lm_head_checksum:.6f}, mean={lm_head_mean:.6f}, std={lm_head_std:.6f}")
+
+                    # Check specific output weights for tokens that should generate different logits
+                    if lm_head_weight.shape[0] > 108386:
+                        token_15_output = lm_head_weight[15, :5].tolist()
+                        token_108386_output = lm_head_weight[108386, :5].tolist()
+                        logger.info(f"[PREFILL] 🚨 TOKEN 15 OUTPUT WEIGHTS: {token_15_output}")
+                        logger.info(f"[PREFILL] 🚨 TOKEN 108386 OUTPUT WEIGHTS: {token_108386_output}")
+                else:
+                    logger.error(f"[PREFILL] ❌ Could not find output layer")
             except Exception as e:
                 logger.error(f"[PREFILL] ❌ Failed to check weight sharing: {e}")
 
