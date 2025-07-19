@@ -524,6 +524,20 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 req.grammar.accept_token(next_token_id)
                 req.grammar.finished = req.finished()
 
+        # TEMPORARY PATCH: Free KV cache for each generated token to fix memory leak
+        # This is the critical fix mentioned in the KV Cache Bug Guide!
+        logger.info(f"[DECODE] 🔧 TEMPORARY PATCH: Freeing KV cache for {len(batch.reqs)} generated tokens")
+        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
+            # Free the KV cache allocated for the generated tokens
+            for i in range(len(batch.reqs)):
+                if not batch.reqs[i].is_retracted:
+                    # Free one token worth of KV cache per request
+                    start_idx = i
+                    end_idx = i + 1
+                    if start_idx < len(batch.out_cache_loc):
+                        self.token_to_kv_pool_allocator.free(batch.out_cache_loc[start_idx:end_idx])
+                        logger.info(f"[DECODE] 🔧 TEMPORARY PATCH: Freed KV cache for req {i}, cache_loc={batch.out_cache_loc[start_idx:end_idx]}")
+
         if batch.next_batch_sampling_info:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
