@@ -622,6 +622,24 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     logger.error(f"[DECODE] ❌ Could not find embedding layer")
             else:
                 logger.error(f"[DECODE] ❌ Could not find model")
+                # DEBUG: List all available attributes to find the model
+                logger.info(f"[DECODE] 🔧 DEBUG: tp_worker type = {type(self.tp_worker)}")
+                logger.info(f"[DECODE] 🔧 DEBUG: tp_worker attributes = {[attr for attr in dir(self.tp_worker) if not attr.startswith('_')]}")
+
+                # Try to access model through different paths
+                if hasattr(self.tp_worker, 'worker'):
+                    logger.info(f"[DECODE] 🔧 DEBUG: Found tp_worker.worker")
+                    if hasattr(self.tp_worker.worker, 'model_runner'):
+                        logger.info(f"[DECODE] 🔧 DEBUG: Found tp_worker.worker.model_runner")
+                        if hasattr(self.tp_worker.worker.model_runner, 'model'):
+                            model = self.tp_worker.worker.model_runner.model
+                            logger.info(f"[DECODE] 🔧 DEBUG: Found model via tp_worker.worker.model_runner.model")
+
+                # If still no model, this is a critical Semi-PD architecture issue
+                if model is None:
+                    logger.error(f"[DECODE] 🚨 CRITICAL: Semi-PD Decode instance has NO ACCESS to model weights!")
+                    logger.error(f"[DECODE] 🚨 This explains why H20 generates wrong tokens - Decode uses wrong weights!")
+                    return  # Skip weight verification since we can't access the model
         except Exception as e:
             logger.error(f"[DECODE] ❌ Failed to check weight sharing: {e}")
 
