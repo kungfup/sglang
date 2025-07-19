@@ -3,18 +3,34 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List
 
+import torch
+import zmq
+
+# Try to import semi_pd_ipc, but handle failure gracefully
 try:
     import semi_pd_ipc
     SEMI_PD_IPC_AVAILABLE = True
-    print("✅ Semi-PD IPC extension loaded successfully")
+    print("✅ [V0.4.8] Semi-PD IPC extension loaded successfully")
 except ImportError as e:
-    print(f"⚠️  Semi-PD IPC extension not available: {e}")
-    print("🔄 Falling back to FALLBACK mode")
-    semi_pd_ipc = None
     SEMI_PD_IPC_AVAILABLE = False
+    print(f"❌ [V0.4.8] Semi-PD IPC extension not available: {e}")
+    print("🔧 [V0.4.8] Semi-PD will not work without proper CUDA IPC support")
 
-import torch
-import zmq
+    # Create a placeholder that will raise meaningful errors
+    class SemiPdIpcNotAvailable:
+        @staticmethod
+        def get_ipc_handle(tensor):
+            raise RuntimeError("semi_pd_ipc extension not available - cannot create IPC handles")
+
+        @staticmethod
+        def convert_ipc_handle_to_tensor(ipc_handle, size, dtype_str, device):
+            raise RuntimeError("semi_pd_ipc extension not available - cannot convert IPC handles")
+
+        @staticmethod
+        def get_device_sm_count(device_id):
+            raise RuntimeError("semi_pd_ipc extension not available - cannot get SM count")
+
+    semi_pd_ipc = SemiPdIpcNotAvailable()
 
 PREFILL_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_PREFILL_SM_PERCENTILE", 80))
 DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_DECODE_SM_PERCENTILE", 100))
@@ -74,30 +90,15 @@ DTYPE_TO_ATEN = {
 
 def get_ipc_handle(tensor: torch.Tensor):
     # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
-    # PyTorch compatibility: handle both 4-tuple and 5-tuple returns
-    shared = tensor.storage()._share_cuda_()
-    if len(shared) >= 4:
-        (
-            device,
-            handle,
-            storage_size_bytes,  # size(in bytes) of the storage
-            storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
-        ) = shared[:4]
-    else:
-        raise RuntimeError(f"Unexpected _share_cuda_() return format: {len(shared)} elements")
+    (
+        device,
+        handle,
+        storage_size_bytes,  # size(in bytes) of the storage
+        storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
+    ) = tensor.storage()._share_cuda_()[:4]
     assert storage_size_bytes == tensor.numel() * tensor.element_size()
 
-    # Try to use semi_pd_ipc extension with fallback
-    try:
-        ipc_handle = semi_pd_ipc.get_ipc_handle(tensor)
-        return ipc_handle, storage_offset_bytes
-    except (ImportError, AttributeError, RuntimeError) as e:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.warning(f"semi_pd_ipc not available: {e}")
-        logger.warning("Falling back to standard tensor sharing mode")
-        # Return None to indicate fallback mode
-        return None, 0
+    return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
 
 
 def convert_ipc_handle_to_tensor(ipc_handle, size, dtype, device):

@@ -12,6 +12,7 @@ import setproctitle
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -26,6 +27,93 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+# Global storage for weight verification
+_weight_checksums = {}
+
+def _verify_weight_sharing(scheduler, instance_role):
+    """Verify that Prefill and Decode instances are using the same weights"""
+    try:
+        role_str = str(instance_role).split('.')[-1]  # Get DECODE or PREFILL
+
+        # Try to access model through different paths
+        model = None
+        if hasattr(scheduler, 'tp_worker'):
+            if hasattr(scheduler.tp_worker, 'model_runner'):
+                model = scheduler.tp_worker.model_runner.model
+                logger.info(f"🔍 [{role_str}] Accessed model via tp_worker.model_runner.model")
+            elif hasattr(scheduler.tp_worker, 'model'):
+                model = scheduler.tp_worker.model
+                logger.info(f"🔍 [{role_str}] Accessed model via tp_worker.model")
+            else:
+                logger.warning(f"🔍 [{role_str}] tp_worker type: {type(scheduler.tp_worker)}")
+                logger.warning(f"🔍 [{role_str}] tp_worker attributes: {dir(scheduler.tp_worker)}")
+
+        if model is None:
+            logger.warning(f"🔍 [{role_str}] Could not access model for weight verification")
+            return
+
+        # Calculate checksums for key model parameters
+        checksums = {}
+        param_count = 0
+        for name, param in model.named_parameters():
+            if param_count >= 3:  # Only check first 3 parameters for performance
+                break
+            if param.numel() > 0:  # Skip empty parameters
+                # Calculate checksum of parameter data
+                checksum = torch.sum(param.data).item()
+                data_ptr = param.data.data_ptr()
+                checksums[name] = {'checksum': checksum, 'data_ptr': data_ptr}
+                param_count += 1
+
+        _weight_checksums[role_str] = checksums
+
+        logger.info(f"🔍 [{role_str}] Weight checksums calculated for {len(checksums)} parameters")
+        for name, info in list(checksums.items())[:3]:  # Show first 3
+            logger.info(f"🔍 [{role_str}] {name}: checksum={info['checksum']:.6f}, ptr=0x{info['data_ptr']:x}")
+
+        # If we have both instances, compare them
+        if len(_weight_checksums) == 2:
+            decode_checksums = _weight_checksums.get('DECODE', {})
+            prefill_checksums = _weight_checksums.get('PREFILL', {})
+
+            if decode_checksums and prefill_checksums:
+                matches = 0
+                ptr_matches = 0
+                total = 0
+                for name in decode_checksums:
+                    if name in prefill_checksums:
+                        total += 1
+                        decode_info = decode_checksums[name]
+                        prefill_info = prefill_checksums[name]
+
+                        # Check checksum match
+                        if abs(decode_info['checksum'] - prefill_info['checksum']) < 1e-6:
+                            matches += 1
+                        else:
+                            logger.warning(f"❌ Weight checksum mismatch for {name}: DECODE={decode_info['checksum']:.6f}, PREFILL={prefill_info['checksum']:.6f}")
+
+                        # Check pointer match (true IPC sharing)
+                        if decode_info['data_ptr'] == prefill_info['data_ptr']:
+                            ptr_matches += 1
+                            logger.info(f"✅ Memory pointer match for {name}: 0x{decode_info['data_ptr']:x}")
+                        else:
+                            logger.warning(f"❌ Memory pointer mismatch for {name}: DECODE=0x{decode_info['data_ptr']:x}, PREFILL=0x{prefill_info['data_ptr']:x}")
+
+                if matches == total and total > 0:
+                    logger.info(f"✅ WEIGHT CHECKSUMS MATCH: All {matches}/{total} parameters have same values!")
+                else:
+                    logger.error(f"❌ WEIGHT CHECKSUMS MISMATCH: Only {matches}/{total} parameters match!")
+
+                if ptr_matches == total and total > 0:
+                    logger.info(f"✅ TRUE IPC SHARING VERIFIED: All {ptr_matches}/{total} parameters share same memory!")
+                else:
+                    logger.warning(f"⚠️  LIMITED IPC SHARING: Only {ptr_matches}/{total} parameters share same memory (may be using fallback mode)")
+
+    except Exception as e:
+        logger.error(f"❌ Weight verification failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 class SemiPDScheduler(Scheduler):
@@ -370,8 +458,8 @@ def run_scheduler_process(
         logger.info(f"🔥 Receiving IPC handles from Decode instance... (tp_rank={tp_rank}, queue={ipc_info_queue})")
         try:
             logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
-            logger.info(f"🔍 About to call ipc_info_queue.get() with 60s timeout...")
-            ipc_info = ipc_info_queue.get(timeout=60)  # 60 second timeout
+            logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
+            ipc_info = ipc_info_queue.get(timeout=300)  # 300 second timeout (5 minutes) for large models
             logger.info(f"✅ Successfully received IPC handles from Decode instance! (type={type(ipc_info)})")
         except Exception as e:
             logger.error(f"❌ Failed to receive IPC handles: {e}")
@@ -441,6 +529,9 @@ def run_scheduler_process(
         if bypass_load_weight:
             scheduler.share_params_from_ipc(ipc_info)
             logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
+
+        # 🔍 VERIFY WEIGHT SHARING: Check if weights are actually shared (for both instances)
+        _verify_weight_sharing(scheduler, instance_role)
 
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:

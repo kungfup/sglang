@@ -430,154 +430,95 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        """Semi-PD decode scheduler processes decode results with EOS token detection.
+        """Semi-PD decode scheduler processes decode results.
 
-        This is a simplified version based on standard SGLang but adapted for Semi-PD.
+        Based on original Semi-PD implementation - keep it simple and clean.
         """
-        try:
-            # Handle overlap mode first (like standard SGLang)
-            if self.enable_overlap:
-                logits_output, next_token_ids, can_run_cuda_graph = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-            else:
-                # Get next token IDs from result
-                next_token_ids = result.next_token_ids
-                if not isinstance(next_token_ids, list):
-                    next_token_ids = next_token_ids.tolist()
+        # Handle overlap mode (like original Semi-PD)
+        if self.enable_overlap:
+            logits_output, next_token_ids, can_run_cuda_graph = self.tp_worker.resolve_last_batch_result(None)
+            next_token_logprobs = logits_output.next_token_logprobs
+        elif batch.spec_algorithm.is_none():
+            # spec decoding handles output logprobs inside verify process.
+            next_token_ids = result.next_token_ids.tolist()
+            can_run_cuda_graph = True  # Default for non-overlap mode
+            if batch.return_logprob:
+                next_token_logprobs = result.logits_output.next_token_logprobs.tolist()
+        else:
+            can_run_cuda_graph = True  # Default fallback
 
-            # Enhanced logging for first few tokens (after next_token_ids is defined)
-            if len(batch.reqs) > 0 and (len(batch.reqs[0].output_ids) <= 5 or len(batch.reqs[0].output_ids) % 50 == 0):
-                with open('/tmp/semi_pd_debug.log', 'a') as f:
-                    f.write(f"[DECODE] Processing {len(batch.reqs)} requests, current_tokens: {len(batch.reqs[0].output_ids)}\n")
-                    if len(batch.reqs[0].output_ids) <= 5:
-                        f.write(f"[DECODE] EARLY_STAGE: next_token_ids={next_token_ids[:5] if isinstance(next_token_ids, list) else 'NOT_LIST'}\n")
+        self.token_to_kv_pool_allocator.free_group_begin()
 
-            # Update requests with new tokens and check completion conditions (like original SGLang)
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted or i >= len(next_token_ids):
-                    continue
+        # Check finish condition (like original Semi-PD)
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.is_retracted:
+                continue
 
-                # Add the new token to the request (like original SGLang)
-                next_token_id = next_token_ids[i]
+            if self.enable_overlap and req.finished():
+                # Free the one extra delayed token
+                if self.page_size == 1:
+                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                else:
+                    # Only free when the extra token is in a new page
+                    if (
+                        len(req.origin_input_ids) + len(req.output_ids) - 1
+                    ) % self.page_size == 0:
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[i : i + 1]
+                        )
+                continue
 
-                # Semi-PD: Only detect true infinite loops (5+ same tokens in a row)
-                if len(req.output_ids) >= 5:
-                    # Check for infinite loops (same token repeated many times)
-                    recent_tokens = req.output_ids[-5:]
-                    if len(set(recent_tokens)) == 1 and recent_tokens[0] == next_token_id:
-                        # True infinite loop detected! Log it but don't force fix
-                        with open('/tmp/semi_pd_debug.log', 'a') as f:
-                            f.write(f"[{req.rid[:8]}] TRUE_LOOP_DETECTED: token {next_token_id} repeated {len(recent_tokens)+1} times\n")
-                            f.write(f"[{req.rid[:8]}] This indicates a real Semi-PD issue that needs investigation\n")
-
-                # Semi-PD: Detailed debug for cross-platform issues
-                if len(req.output_ids) <= 5:  # Only log first few tokens
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
-                        f.write(f"[{req.rid[:8]}] DECODE_DEBUG token_{len(req.output_ids)+1}: next_token_id={next_token_id}\n")
-                        f.write(f"[{req.rid[:8]}] DECODE_STATE: overlap={self.enable_overlap} batch_size={len(batch.reqs)} req_index={i}\n")
-                        f.write(f"[{req.rid[:8]}] CURRENT_OUTPUT: {req.output_ids[-10:] if len(req.output_ids) >= 10 else req.output_ids}\n")
-
-                        # Check if this is the problematic first decode token
-                        if len(req.output_ids) == 1:  # This will be the second token (first decode token)
-                            f.write(f"[{req.rid[:8]}] CRITICAL_FIRST_DECODE_TOKEN: {next_token_id} -> {repr(req.tokenizer.decode([next_token_id]) if req.tokenizer else 'NO_TOKENIZER')}\n")
-                            f.write(f"[{req.rid[:8]}] EXPECTED_CHINESE_TOKENS: Should be around 6313(!) or 104139(有什么) etc\n")
-
-                            # H20 Fix: Check if this is a problematic token for Chinese input
-                            last_prefill_token = req.output_ids[0] if req.output_ids else None
-                            if last_prefill_token == 108386:  # "你好" token
-                                if next_token_id not in [6313, 104139, 112169, 111728]:  # Expected Chinese tokens
-                                    f.write(f"[{req.rid[:8]}] H20_ISSUE_DETECTED: Chinese input but got wrong token {next_token_id}\n")
-                                    f.write(f"[{req.rid[:8]}] PREFILL_TOKEN: {last_prefill_token} -> {repr(req.tokenizer.decode([last_prefill_token]) if req.tokenizer else 'NO_TOKENIZER')}\n")
-
-                                    # Force correct Chinese token for H20
-                                    next_token_id = 6313  # '！' token
-                                    f.write(f"[{req.rid[:8]}] H20_FIX_APPLIED: forced token 6313 -> '！'\n")
-
-                # Semi-PD: Validate token ID is in valid range
-                vocab_size = getattr(req.tokenizer, 'vocab_size', 50000) if req.tokenizer else 50000
-                if not (0 <= next_token_id < vocab_size):
-                    logger.warning(f"[DECODE] Invalid token ID {next_token_id} (vocab_size={vocab_size}), forcing EOS")
-                    # Force EOS by using a valid token that will trigger stopping
-                    next_token_id = min(vocab_size - 1, 151643)  # Use a safe token
-
+            if batch.spec_algorithm.is_none():
+                # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
-                # Critical debug: Log token details for cross-platform debugging
-                if len(req.output_ids) <= 5 or len(req.output_ids) % 25 == 0:
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
-                        token_text = req.tokenizer.decode([next_token_id]) if req.tokenizer else f"TOKEN_{next_token_id}"
-                        f.write(f"[{req.rid[:8]}] token_{len(req.output_ids)}: {next_token_id} -> {repr(token_text)}\n")
+            req.check_finished()
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
 
-                # Semi-PD: Ensure EOS detection fields are set correctly before check_finished
-                # Use a comprehensive approach to handle Qwen's special tokens
-                eos_token_ids = []
+            if req.return_logprob and batch.spec_algorithm.is_none():
+                # speculative worker handles logprob in speculative decoding
+                req.output_token_logprobs_val.append(next_token_logprobs[i])
+                req.output_token_logprobs_idx.append(next_token_id)
+                if req.top_logprobs_num > 0:
+                    req.output_top_logprobs_val.append(
+                        result.logits_output.next_token_top_logprobs_val[i]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        result.logits_output.next_token_top_logprobs_idx[i]
+                    )
+                if req.token_ids_logprob is not None:
+                    req.output_token_ids_logprobs_val.append(
+                        result.logits_output.next_token_token_ids_logprobs_val[i]
+                    )
+                    req.output_token_ids_logprobs_idx.append(
+                        result.logits_output.next_token_token_ids_logprobs_idx[i]
+                    )
 
-                if req.tokenizer:
-                    vocab_size = getattr(req.tokenizer, 'vocab_size', 50000)
+            if req.return_hidden_states and result.logits_output.hidden_states is not None:
+                req.hidden_states.append(
+                    result.logits_output.hidden_states[i].cpu().clone().tolist()
+                )
 
-                    # For Qwen models, use <|endoftext|> as the primary EOS token
-                    # This is token 151643 which is within vocab range
-                    endoftext_token = vocab_size - 1  # Usually <|endoftext|>
-                    eos_token_ids.append(endoftext_token)
+            if req.grammar is not None and batch.spec_algorithm.is_none():
+                req.grammar.accept_token(next_token_id)
+                req.grammar.finished = req.finished()
 
-                    # Also check for other potential EOS tokens in valid range
-                    tokenizer_eos = getattr(req.tokenizer, 'eos_token_id', None)
-                    if tokenizer_eos is not None and 0 <= tokenizer_eos < vocab_size:
-                        if tokenizer_eos not in eos_token_ids:
-                            eos_token_ids.append(tokenizer_eos)
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
-                    # Add any other special tokens that are in valid range
-                    for attr in ['bos_token_id', 'pad_token_id', 'unk_token_id']:
-                        token_id = getattr(req.tokenizer, attr, None)
-                        if token_id is not None and 0 <= token_id < vocab_size:
-                            if token_id not in eos_token_ids:
-                                eos_token_ids.append(token_id)
+        self.stream_output(batch.reqs, batch.return_logprob)
 
-                # Fallback: use correct Qwen EOS token if no valid EOS tokens found
-                if not eos_token_ids:
-                    eos_token_ids = [151645]  # Correct Qwen EOS token ID
+        self.token_to_kv_pool_allocator.free_group_end()
 
-                # Set EOS token IDs for the request
-                if req.eos_token_ids is None or len(req.eos_token_ids) == 0:
-                    req.eos_token_ids = set(eos_token_ids)
-                if req.sampling_params.stop_token_ids is None:
-                    req.sampling_params.stop_token_ids = eos_token_ids.copy()
-                else:
-                    for eos_id in eos_token_ids:
-                        if eos_id not in req.sampling_params.stop_token_ids:
-                            req.sampling_params.stop_token_ids.append(eos_id)
-
-                # Debug: Log token info every 50 tokens
-                if len(req.output_ids) % 50 == 0:
-                    logger.info(f"[DECODE] 📊 Request {req.rid}: {len(req.output_ids)} tokens, last_token={next_token_id}")
-
-                # Check completion conditions using req.check_finished() (like original SGLang)
-                req.check_finished()
-
-                # Semi-PD: Add safety net for very long generations (match max_new_tokens)
-                if not req.finished() and len(req.output_ids) >= 800:  # Allow more space for natural EOS
-                    logger.info(f"[DECODE] ⚠️ Force stopping request {req.rid} after {len(req.output_ids)} tokens (safety net)")
-                    from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
-
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
-                    req.time_stats.completion_time = time.time()
-                    logger.info(f"[DECODE] 🔥 Request {req.rid} finished: {req.finished_reason}")
-                else:
-                    self.tree_cache.cache_unfinished_req(req)
-
-            # Stream output to detokenizer
-            skip_stream_req = []
-            self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
-
-            # Completed - reduced logging
-
-        except Exception as e:
-            logger.error(f"[DECODE] ❌ Error in process_batch_result_decode: {e}")
-            # Don't re-raise to avoid crashing the server
-            pass
+        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        if (
+            self.attn_tp_rank == 0
+            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
+        ):
+            self.log_decode_stats(can_run_cuda_graph)
 
     def process_batch_result_prefill(
         self,
@@ -642,14 +583,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     continue
 
                 if req.is_chunked <= 0:
-                    # req output_ids are set here
+                    # req output_ids are set here (like original Semi-PD)
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
 
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    # Semi-PD: Don't check finished in Prefill stage - let Decode stage handle it
+                    # This ensures requests continue to Decode stage for further token generation
+
+                    # Always cache as unfinished since this is Prefill stage
+                    if not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -706,7 +647,3 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
         logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed for Semi-PD")
-
-
-
-

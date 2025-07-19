@@ -295,15 +295,13 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 if req.is_chunked <= 0:
                     # CRITICAL: Add token to output_ids - this was missing!
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
+                    # Semi-PD: DON'T check finished in Prefill stage - let Decode stage handle it
                     logger.info(f"[PREFILL] 🔥 Added token {next_token_id} to req {req.rid}, output_ids={req.output_ids}")
 
                     # NOTE: In Semi-PD Prefill instance, we don't manage KV Cache
                     # so we skip cache operations that would fail with NoneType errors
-                    if req.finished():
-                        logger.info(f"[PREFILL] 🔥 Request {req.rid} finished (skipping cache operations)")
-                    else:
-                        logger.info(f"[PREFILL] 🔥 Request {req.rid} continuing (skipping cache operations)")
+                    # Always continue to Decode stage
+                    logger.info(f"[PREFILL] 🔥 Request {req.rid} continuing (skipping cache operations)")
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
