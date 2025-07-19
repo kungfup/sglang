@@ -548,6 +548,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         """
         logger.info(f"[DECODE] 🔥 process_batch_result_prefill called for Semi-PD Decode instance")
 
+        # CRITICAL FIX: Add missing free_group_begin() call for KV Cache management
+        # This is the key fix mentioned in the KV Cache Bug Guide!
+        self.token_to_kv_pool_allocator.free_group_begin()
+        logger.info(f"[DECODE] 🔧 CRITICAL FIX: Called free_group_begin() for KV Cache management")
+
         skip_stream_req = None
 
         if self.is_generation:
@@ -660,5 +665,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # Stream output to detokenizer - this is the key missing piece!
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+        # CRITICAL FIX: Add missing free_group_end() call to complete KV Cache management
+        # This pairs with the free_group_begin() call above
+        self.token_to_kv_pool_allocator.free_group_end()
+        logger.info(f"[DECODE] 🔧 CRITICAL FIX: Called free_group_end() to complete KV Cache management")
 
         logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed for Semi-PD")
