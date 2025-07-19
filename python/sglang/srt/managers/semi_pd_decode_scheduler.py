@@ -569,17 +569,22 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # CRITICAL: Check weight sharing in Decode instance
         logger.info(f"[DECODE] 🚨 CRITICAL: Checking weight sharing in Decode instance...")
-        embed_weight = self.model.embed_tokens.weight
-        embed_checksum = torch.sum(embed_weight.data).item()
-        embed_ptr = embed_weight.data_ptr()
-        logger.info(f"[DECODE] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
+        try:
+            # Access model through tp_worker
+            model = self.tp_worker.model_runner.model
+            embed_weight = model.embed_tokens.weight
+            embed_checksum = torch.sum(embed_weight.data).item()
+            embed_ptr = embed_weight.data_ptr()
+            logger.info(f"[DECODE] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
 
-        # Check specific token embeddings
-        if embed_weight.shape[0] > 16:
-            token_15_embedding = embed_weight[15, :5].tolist()
-            token_16_embedding = embed_weight[16, :5].tolist()
-            logger.info(f"[DECODE] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
-            logger.info(f"[DECODE] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+            # Check specific token embeddings
+            if embed_weight.shape[0] > 16:
+                token_15_embedding = embed_weight[15, :5].tolist()
+                token_16_embedding = embed_weight[16, :5].tolist()
+                logger.info(f"[DECODE] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
+                logger.info(f"[DECODE] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
+        except Exception as e:
+            logger.error(f"[DECODE] ❌ Failed to check weight sharing: {e}")
 
         # CRITICAL FIX: Add missing free_group_begin() call for KV Cache management
         # This is the key fix mentioned in the KV Cache Bug Guide!
