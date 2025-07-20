@@ -1056,7 +1056,7 @@ def _launch_semi_pd_subprocesses(
 
     # Add timeout and debugging for pipe communication
     import time
-    timeout_seconds = 30
+    timeout_seconds = 600  # Increased from 30 to 600 seconds for Semi-PD startup
     start_time = time.time()
 
     try:
