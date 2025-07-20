@@ -1369,12 +1369,23 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        return self.model.forward(
+
+        # CRITICAL VL FIX: Handle VL model forward output
+        forward_output = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+
+        # VL models may return tuple (embeddings, vision_features, ...) when get_embedding=True
+        # We need to extract only the text embeddings for Semi-PD compatibility
+        if not self.is_generation and isinstance(forward_output, tuple):
+            # For VL models with get_embedding=True, take the first element (text embeddings)
+            logger.info(f"[MODEL_RUNNER] 🔧 VL Model: Extracting text embeddings from tuple output")
+            return forward_output[0]
+
+        return forward_output
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

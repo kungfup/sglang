@@ -283,7 +283,17 @@ class TpModelWorker:
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output, _ = self.model_runner.forward(forward_batch)
+        forward_result, _ = self.model_runner.forward(forward_batch)
+
+        # CRITICAL VL FIX: Handle VL model embedding output
+        if isinstance(forward_result, tuple):
+            # VL models may return (embeddings, vision_features, ...)
+            # Extract the embeddings (first element)
+            logger.info(f"[TP_WORKER] 🔧 VL Model: Extracting embeddings from tuple output")
+            logits_output = forward_result[0]
+        else:
+            logits_output = forward_result
+
         embeddings = logits_output.embeddings
         return embeddings
 

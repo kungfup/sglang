@@ -374,9 +374,44 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.top_ps = {batch.sampling_info.top_ps}")
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.is_all_greedy = {batch.sampling_info.is_all_greedy}")
 
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.forward_batch_generation(model_worker_batch)
-            )
+            # CRITICAL FIX: Force greedy sampling in Prefill stage to avoid softmax logits
+            # This ensures logits remain as raw values for proper processing in Decode stage
+            # This is necessary because sampler.py applies softmax when is_all_greedy=False,
+            # which breaks the Semi-PD architecture that requires raw logits
+            original_is_all_greedy = batch.sampling_info.is_all_greedy
+            if not original_is_all_greedy:
+                batch.sampling_info.is_all_greedy = True
+                logger.info(f"[PREFILL] 🔧 CRITICAL FIX: Forced is_all_greedy=True (was {original_is_all_greedy}) to preserve raw logits for Semi-PD")
+            else:
+                logger.info(f"[PREFILL] 🔧 DEBUG: is_all_greedy already True, no forcing needed")
+
+            # CRITICAL FIX: Handle both text-only and vision-language models
+            try:
+                forward_result = self.tp_worker.forward_batch_generation(model_worker_batch)
+
+                # Check if result is tuple (VL model) or direct values (text model)
+                if isinstance(forward_result, tuple) and len(forward_result) >= 3:
+                    logits_output, next_token_ids, can_run_cuda_graph = forward_result[:3]
+                    logger.info(f"[PREFILL] 🔧 VL Model: Extracted text components from tuple result")
+                else:
+                    logits_output, next_token_ids, can_run_cuda_graph = forward_result
+                    logger.info(f"[PREFILL] 🔧 Text Model: Using direct result")
+
+            except Exception as e:
+                logger.error(f"[PREFILL] ❌ Forward batch generation failed: {e}")
+                # Fallback: try to handle as VL model
+                try:
+                    result = self.tp_worker.forward_batch_generation(model_worker_batch)
+                    if isinstance(result, tuple):
+                        logits_output = result[0] if len(result) > 0 else None
+                        next_token_ids = result[1] if len(result) > 1 else None
+                        can_run_cuda_graph = result[2] if len(result) > 2 else True
+                        logger.info(f"[PREFILL] 🔧 VL Model Fallback: Extracted components manually")
+                    else:
+                        raise e
+                except Exception as e2:
+                    logger.error(f"[PREFILL] ❌ VL Model fallback also failed: {e2}")
+                    raise e2
 
             # DEBUG: Log logits and token generation details
             if logits_output and logits_output.next_token_logits is not None:

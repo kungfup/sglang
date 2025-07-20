@@ -506,12 +506,29 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         )
                 continue
 
+            # === 记录本轮 alloc 的 KV loc ===
+            alloc_loc = batch.out_cache_loc[i : i + 1] if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None else None
+
             if batch.spec_algorithm.is_none():
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
-            # NOTE: KV cache will be freed after the entire batch processing
-            # Individual token processing should not free cache here
+            # CRITICAL FIX: Free KV cache according to page_size and request status
+            if alloc_loc is not None:
+                # 1) 运行时 page_size==1 直接释放
+                if self.page_size == 1:
+                    self.token_to_kv_pool_allocator.free(alloc_loc)
+                    logger.debug(f"[DECODE] ✅ Freed KV cache (page_size=1), cache_loc={alloc_loc}")
+                # 2) page_size>1：尾页 token 暂存，整页满了再 free
+                else:
+                    total_tokens = len(req.origin_input_ids) + len(req.output_ids)
+                    if total_tokens % self.page_size == 0:
+                        self.token_to_kv_pool_allocator.free(alloc_loc)
+                        logger.debug(f"[DECODE] ✅ Freed KV cache (full page), cache_loc={alloc_loc}")
+                    # 请求结束时释放尾页剩余 token
+                    elif req.finished():
+                        self.token_to_kv_pool_allocator.free(alloc_loc)
+                        logger.debug(f"[DECODE] ✅ Freed KV cache (request finished), cache_loc={alloc_loc}")
 
             req.check_finished()
             if req.finished():
@@ -555,12 +572,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         self.stream_output(batch.reqs, batch.return_logprob)
 
-        # CRITICAL FIX: Free KV cache for generated tokens (based on original Semi-PD logic)
-        # This should happen once per batch, not per token
-        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
-            # Free KV cache for all generated tokens in this batch
-            self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
-            logger.debug(f"[DECODE] ✅ Freed KV cache for batch, cache_loc={batch.out_cache_loc}")
+        # NOTE: KV cache is now freed per-token in the loop above, not per-batch
+        # This follows the original Semi-PD logic with proper page_size handling
 
         self.token_to_kv_pool_allocator.free_group_end()
 
