@@ -353,10 +353,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     break
 
             if found_req:
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids = {found_req.input_ids}")
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids length = {len(found_req.input_ids)}")
-                if len(found_req.input_ids) > 0:
-                    last_token = found_req.input_ids[-1]
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} origin_input_ids = {found_req.origin_input_ids}")
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} origin_input_ids length = {len(found_req.origin_input_ids)}")
+                if len(found_req.origin_input_ids) > 0:
+                    last_token = found_req.origin_input_ids[-1]
                     logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} last token = {last_token}")
             else:
                 logger.warning(f"[DECODE] ⚠️ Request {rid} not found in waiting_queue")
