@@ -345,15 +345,21 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # DEBUG: Check request data in Decode scheduler
         for rid in recv_req.rids:
-            if rid in self.rid_to_req:
-                req = self.rid_to_req[rid]
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids = {req.input_ids}")
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids length = {len(req.input_ids)}")
-                if len(req.input_ids) > 0:
-                    last_token = req.input_ids[-1]
+            # Find request in waiting_queue
+            found_req = None
+            for req in self.waiting_queue:
+                if req.rid == rid:
+                    found_req = req
+                    break
+
+            if found_req:
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids = {found_req.input_ids}")
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids length = {len(found_req.input_ids)}")
+                if len(found_req.input_ids) > 0:
+                    last_token = found_req.input_ids[-1]
                     logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} last token = {last_token}")
             else:
-                logger.warning(f"[DECODE] ⚠️ Request {rid} not found in rid_to_req")
+                logger.warning(f"[DECODE] ⚠️ Request {rid} not found in waiting_queue")
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
