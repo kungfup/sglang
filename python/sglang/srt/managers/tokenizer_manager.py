@@ -593,17 +593,13 @@ class TokenizerManager:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        logger.info(f"[TOKENIZER] 🔧 Original obj.sampling_params: {obj.sampling_params}")
-        logger.info(f"[TOKENIZER] 🔧 Final sampling_kwargs: {sampling_kwargs}")
+        logger.debug(f"[TOKENIZER] Sampling params: temperature={sampling_kwargs.get('temperature', 'N/A')}")
         sampling_params = SamplingParams(**sampling_kwargs)
-        logger.info(f"[TOKENIZER] 🔧 Created SamplingParams: temperature={sampling_params.temperature}, top_k={sampling_params.top_k}, top_p={sampling_params.top_p}")
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
-        # Debug tokenization
-        logger.info(f"[TOKENIZER] 🔧 Input text: {repr(input_text)}")
-        logger.info(f"[TOKENIZER] 🔧 Input IDs: {input_ids}")
-        logger.info(f"[TOKENIZER] 🔧 Input IDs length: {len(input_ids) if input_ids else 0}")
+        # Debug tokenization (minimal logging)
+        logger.debug(f"[TOKENIZER] Input IDs length: {len(input_ids) if input_ids else 0}")
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -690,18 +686,14 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        logger.info(f"[TOKENIZER] _send_one_request called, rid={obj.rid}, type={type(tokenized_obj)}")
+        logger.debug(f"[TOKENIZER] _send_one_request called, rid={obj.rid}, type={type(tokenized_obj)}")
 
-        # DEBUG: Check tokenized data before sending
+        # Check tokenized data before sending (minimal logging)
         if hasattr(tokenized_obj, 'input_ids'):
-            logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending input_ids = {tokenized_obj.input_ids}")
-            logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending input_ids length = {len(tokenized_obj.input_ids)}")
-            if len(tokenized_obj.input_ids) > 0:
-                last_token = tokenized_obj.input_ids[-1]
-                logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending last token = {last_token}")
+            logger.debug(f"[TOKENIZER] Sending {len(tokenized_obj.input_ids)} tokens")
 
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        logger.info(f"[TOKENIZER] Request sent to scheduler, rid={obj.rid}")
+        logger.debug(f"[TOKENIZER] Request sent to scheduler, rid={obj.rid}")
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         return state

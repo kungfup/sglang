@@ -63,25 +63,32 @@ def _verify_weight_sharing(scheduler, instance_role):
             if param_count >= 5:  # Check more parameters for debugging
                 break
             if param.numel() > 0:  # Skip empty parameters
+                # Check if parameter is on meta device (not yet loaded via IPC)
+                if param.device.type == 'meta':
+                    logger.info(f"🔧 DEBUG [{role_str}] Parameter {name} is on meta device, skipping checksum calculation")
+                    continue
+
                 # Calculate checksum of parameter data
-                checksum = torch.sum(param.data).item()
-                data_ptr = param.data.data_ptr()
-                checksums[name] = {'checksum': checksum, 'data_ptr': data_ptr}
-                param_count += 1
+                try:
+                    checksum = torch.sum(param.data).item()
+                    data_ptr = param.data.data_ptr()
+                    checksums[name] = {'checksum': checksum, 'data_ptr': data_ptr}
+                    param_count += 1
 
-                # Special attention to embedding layer (critical for token generation)
-                if "embed_tokens" in name and not embedding_found:
-                    embedding_found = True
-                    logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING LAYER {name}: checksum={checksum:.6f}, ptr=0x{data_ptr:x}")
-                    # Log a few embedding values for debugging
-                    if param.data.numel() >= 5:
-                        embed_sample = param.data.flatten()[:5].tolist()
-                        logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING SAMPLE: {embed_sample}")
-
-                        # Check specific token embeddings that might be problematic
-                        if param.data.shape[0] > 16:  # Make sure token 16 exists
-                            token_16_embedding = param.data[16, :5].tolist()
-                            logger.info(f"🔧 DEBUG [{role_str}] TOKEN 16 EMBEDDING: {token_16_embedding}")
+                    # Special attention to embedding layer (critical for token generation)
+                    if "embed_tokens" in name and not embedding_found:
+                        embedding_found = True
+                        logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING LAYER {name}: checksum={checksum:.6f}, ptr=0x{data_ptr:x}")
+                        # Log a few embedding values for debugging
+                        if param.data.numel() >= 5:
+                            embed_sample = param.data.flatten()[:5].tolist()
+                            logger.info(f"🔧 DEBUG [{role_str}] EMBEDDING SAMPLE: {embed_sample}")
+                except RuntimeError as e:
+                    if "meta tensors" in str(e):
+                        logger.info(f"🔧 DEBUG [{role_str}] Parameter {name} is meta tensor, skipping checksum calculation")
+                        continue
+                    else:
+                        raise
 
         _weight_checksums[role_str] = checksums
 

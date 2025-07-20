@@ -551,12 +551,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        # DEBUG: VL model forward processing
-        logger.info(f"[VL_MODEL] 🔧 Forward called - get_embedding: {get_embedding}")
-        logger.info(f"[VL_MODEL] 🔧 Input IDs shape: {input_ids.shape}")
-        logger.info(f"[VL_MODEL] 🔧 Forward batch mode: {forward_batch.forward_mode}")
-        logger.info(f"[VL_MODEL] 🔧 Contains image inputs: {forward_batch.contains_image_inputs()}")
-
+        # VL model forward processing
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -564,9 +559,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             image_data_embedding_func=self.get_image_feature,
             positions=positions,
         )
-
-        logger.info(f"[VL_MODEL] 🔧 Hidden states shape: {hidden_states.shape}")
-        logger.info(f"[VL_MODEL] 🔧 Hidden states dtype: {hidden_states.dtype}")
 
         if not get_embedding:
             return self.logits_processor(

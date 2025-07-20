@@ -466,33 +466,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        # DEBUG: Check logits output for VL debugging
-        if logits is not None and logits.numel() > 0:
-            try:
-                # Check logits statistics
-                logits_mean = torch.mean(logits).item()
-                logits_std = torch.std(logits).item()
-                logits_min = torch.min(logits).item()
-                logits_max = torch.max(logits).item()
-                logger.info(f"[LOGITS_PROCESSOR] 🔧 Logits stats: mean={logits_mean:.6f}, std={logits_std:.6f}, min={logits_min:.6f}, max={logits_max:.6f}")
-
-                # Check top-5 logits for first batch item
-                if logits.dim() >= 2:
-                    top_logits, top_indices = torch.topk(logits[0], k=5)
-                    logger.info(f"[LOGITS_PROCESSOR] 🔧 Top-5 logits = {top_logits.tolist()}")
-                    logger.info(f"[LOGITS_PROCESSOR] 🔧 Top-5 indices = {top_indices.tolist()}")
-
-                    # Check specific important tokens
-                    vocab_size = logits.shape[-1]
-                    if vocab_size > 151645:  # <|im_end|> token
-                        im_end_logit = logits[0, 151645].item()
-                        logger.info(f"[LOGITS_PROCESSOR] 🔧 <|im_end|> (151645) logit = {im_end_logit:.6f}")
-                    if vocab_size > 198:  # newline token
-                        newline_logit = logits[0, 198].item()
-                        logger.info(f"[LOGITS_PROCESSOR] 🔧 Newline (198) logit = {newline_logit:.6f}")
-
-            except Exception as e:
-                logger.error(f"[LOGITS_PROCESSOR] ❌ Failed to analyze logits: {e}")
+        # DEBUG: VL logits analysis removed to avoid CUDA Graph capture conflicts
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:

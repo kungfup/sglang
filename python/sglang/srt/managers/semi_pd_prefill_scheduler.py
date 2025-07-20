@@ -238,9 +238,8 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             # Semi-PD Prefill: Always generate logits and token IDs (bypass pipeline parallel logic)
             logger.info(f"[PREFILL] 🔥 Semi-PD Prefill: Generating logits (no pipeline parallel)")
 
-            # DEBUG: Check input tokens before forward pass
-            logger.info(f"[PREFILL] 🔧 DEBUG: Input token IDs = {batch.input_ids}")
-            logger.info(f"[PREFILL] 🔧 DEBUG: Input shape = {batch.input_ids.shape}")
+            # Check input tokens before forward pass (minimal logging)
+            logger.debug(f"[PREFILL] Input shape = {batch.input_ids.shape}")
 
             # DEBUG: Check embedding output for the last token (which should be 108386 for "你好")
             try:
@@ -268,7 +267,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 logger.error(f"[PREFILL] ❌ Failed to check embedding output: {e}")
 
             # CRITICAL: Check weight sharing before generation
-            logger.info(f"[PREFILL] 🚨 CRITICAL: Checking weight sharing before generation...")
+            logger.debug(f"[PREFILL] Checking weight sharing before generation...")
             try:
                 # Access model through tp_worker
                 model = self.tp_worker.model_runner.model
@@ -374,16 +373,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.top_ps = {batch.sampling_info.top_ps}")
             logger.info(f"[PREFILL] 🔧 DEBUG: batch.sampling_info.is_all_greedy = {batch.sampling_info.is_all_greedy}")
 
-            # CRITICAL FIX: Force greedy sampling in Prefill stage to avoid softmax logits
-            # This ensures logits remain as raw values for proper processing in Decode stage
-            # This is necessary because sampler.py applies softmax when is_all_greedy=False,
-            # which breaks the Semi-PD architecture that requires raw logits
+            # CRITICAL FIX: Handle sampling properly for Semi-PD
+            # We need to preserve the original sampling behavior while ensuring proper token generation
             original_is_all_greedy = batch.sampling_info.is_all_greedy
-            if not original_is_all_greedy:
-                batch.sampling_info.is_all_greedy = True
-                logger.info(f"[PREFILL] 🔧 CRITICAL FIX: Forced is_all_greedy=True (was {original_is_all_greedy}) to preserve raw logits for Semi-PD")
-            else:
-                logger.info(f"[PREFILL] 🔧 DEBUG: is_all_greedy already True, no forcing needed")
+            logger.info(f"[PREFILL] 🔧 DEBUG: Original is_all_greedy={original_is_all_greedy}, temperature={batch.sampling_info.temperatures[0].item()}")
 
             # CRITICAL FIX: Handle both text-only and vision-language models
             try:

@@ -583,12 +583,9 @@ def general_mm_embed_routine(
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
 
-    # DEBUG: VL processing decision
+    # VL processing decision
     is_decode = forward_batch.forward_mode.is_decode()
     has_mm_inputs = forward_batch.contains_mm_inputs()
-    logger.info(f"[VL_DEBUG] 🔧 Forward mode: {forward_batch.forward_mode}, is_decode: {is_decode}")
-    logger.info(f"[VL_DEBUG] 🔧 Contains MM inputs: {has_mm_inputs}")
-    logger.info(f"[VL_DEBUG] 🔧 MM inputs: {forward_batch.mm_inputs}")
 
     if (
         not is_decode
