@@ -544,8 +544,42 @@ def run_scheduler_process(
             raise ValueError(f"Invalid instance role: {instance_role}")
 
         if bypass_load_weight:
-            scheduler.share_params_from_ipc(ipc_info)
-            logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
+            logger.info(f"🔧 DEBUG: About to call share_params_from_ipc with ipc_info type: {type(ipc_info)}")
+            logger.info(f"🔧 DEBUG: IPC info content: {ipc_info}")
+
+            try:
+                scheduler.share_params_from_ipc(ipc_info)
+                logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
+
+                # Verify weight sharing immediately after IPC
+                logger.info("🔧 DEBUG: Verifying weight sharing immediately after IPC...")
+                try:
+                    model = scheduler.tp_worker.model_runner.model
+                    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                        embed_weight = model.model.embed_tokens.weight
+                        embed_checksum = torch.sum(embed_weight.data).item()
+                        embed_ptr = embed_weight.data_ptr()
+                        logger.info(f"🔧 DEBUG: POST-IPC EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
+
+                        # Check if weights are reasonable
+                        embed_mean = torch.mean(embed_weight.data).item()
+                        embed_std = torch.std(embed_weight.data).item()
+                        logger.info(f"🔧 DEBUG: POST-IPC EMBEDDING STATS: mean={embed_mean:.6f}, std={embed_std:.6f}")
+
+                        if abs(embed_mean) < 1e-6 and embed_std < 1e-6:
+                            logger.error("🚨 CRITICAL: Weights appear to be all zeros after IPC!")
+                        elif embed_std > 1.0:
+                            logger.error("🚨 CRITICAL: Weights appear to be random/corrupted after IPC!")
+                        else:
+                            logger.info("✅ Weights appear reasonable after IPC")
+                except Exception as e:
+                    logger.error(f"❌ Failed to verify weights after IPC: {e}")
+
+            except Exception as e:
+                logger.error(f"❌ CRITICAL: share_params_from_ipc failed: {e}")
+                import traceback
+                logger.error(f"❌ Traceback: {traceback.format_exc()}")
+                raise
 
         # 🔍 VERIFY WEIGHT SHARING: Check if weights are actually shared (for both instances)
         _verify_weight_sharing(scheduler, instance_role)
