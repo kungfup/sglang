@@ -343,6 +343,18 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
     def get_next_prefill_batch(self, recv_req: GetNextPrefillBatchInput):
         logger.info(f"[DECODE] 🔥 get_next_prefill_batch called with rids: {recv_req.rids}")
 
+        # DEBUG: Check request data in Decode scheduler
+        for rid in recv_req.rids:
+            if rid in self.rid_to_req:
+                req = self.rid_to_req[rid]
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids = {req.input_ids}")
+                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} input_ids length = {len(req.input_ids)}")
+                if len(req.input_ids) > 0:
+                    last_token = req.input_ids[-1]
+                    logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} last token = {last_token}")
+            else:
+                logger.warning(f"[DECODE] ⚠️ Request {rid} not found in rid_to_req")
+
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)

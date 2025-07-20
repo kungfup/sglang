@@ -691,6 +691,15 @@ class TokenizerManager:
         created_time: Optional[float] = None,
     ):
         logger.info(f"[TOKENIZER] _send_one_request called, rid={obj.rid}, type={type(tokenized_obj)}")
+
+        # DEBUG: Check tokenized data before sending
+        if hasattr(tokenized_obj, 'input_ids'):
+            logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending input_ids = {tokenized_obj.input_ids}")
+            logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending input_ids length = {len(tokenized_obj.input_ids)}")
+            if len(tokenized_obj.input_ids) > 0:
+                last_token = tokenized_obj.input_ids[-1]
+                logger.info(f"[TOKENIZER] 🔧 DEBUG: Sending last token = {last_token}")
+
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         logger.info(f"[TOKENIZER] Request sent to scheduler, rid={obj.rid}")
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
