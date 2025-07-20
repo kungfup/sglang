@@ -510,6 +510,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
+            # CRITICAL FIX: Free KV cache for each generated token (based on original Semi-PD logic)
+            # This is the missing logic that caused memory leaks in the analysis report
+            if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
+                if i < len(batch.out_cache_loc):
+                    # Free KV cache for this token - this is the key missing logic!
+                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    logger.debug(f"[DECODE] ✅ Freed KV cache for token {i}, cache_loc={batch.out_cache_loc[i : i + 1]}")
+
             req.check_finished()
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
