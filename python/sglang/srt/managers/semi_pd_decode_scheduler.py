@@ -510,13 +510,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
-            # CRITICAL FIX: Free KV cache for each generated token (based on original Semi-PD logic)
-            # This is the missing logic that caused memory leaks in the analysis report
-            if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
-                if i < len(batch.out_cache_loc):
-                    # Free KV cache for this token - this is the key missing logic!
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                    logger.debug(f"[DECODE] ✅ Freed KV cache for token {i}, cache_loc={batch.out_cache_loc[i : i + 1]}")
+            # NOTE: KV cache will be freed after the entire batch processing
+            # Individual token processing should not free cache here
 
             req.check_finished()
             if req.finished():
@@ -559,6 +554,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             batch.next_batch_sampling_info.sampling_info_done.set()
 
         self.stream_output(batch.reqs, batch.return_logprob)
+
+        # CRITICAL FIX: Free KV cache for generated tokens (based on original Semi-PD logic)
+        # This should happen once per batch, not per token
+        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
+            # Free KV cache for all generated tokens in this batch
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            logger.debug(f"[DECODE] ✅ Freed KV cache for batch, cache_loc={batch.out_cache_loc}")
 
         self.token_to_kv_pool_allocator.free_group_end()
 
