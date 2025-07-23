@@ -71,10 +71,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         server_args.disable_overlap_schedule = original_disable_overlap
         logger.info(f"[PREFILL] 🔥 Semi-PD Prefill scheduler initialized with enable_overlap={self.enable_overlap}")
 
-        # CRITICAL: Verify weight sharing after initialization
-        logger.info(f"[PREFILL] 🔧 CRITICAL: Verifying weight sharing after initialization...")
-        from sglang.srt.managers.semi_pd_scheduler import _verify_weight_sharing
-        _verify_weight_sharing(self, InstanceRole.PREFILL)
+
 
         self.chunked_rid = None
 

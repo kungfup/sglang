@@ -93,10 +93,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # For requests that has been sent to the prefill scheduler but not yet finished.
         self.scheduled_prefill_batches: List[ScheduleBatch] = []
 
-        # CRITICAL: Verify weight sharing after initialization
-        logger.info(f"[DECODE] 🔧 CRITICAL: Verifying weight sharing after initialization...")
-        from sglang.srt.managers.semi_pd_scheduler import _verify_weight_sharing
-        _verify_weight_sharing(self, InstanceRole.DECODE)
+
 
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
@@ -180,9 +177,23 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Only log when there are requests to process (avoid infinite empty batch logs)
         if not self.running_batch.is_empty():
+            logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: Processing running batch with {len(self.running_batch.reqs)} requests")
+            # Log request details only for first few requests to avoid spam
+            for i, req in enumerate(self.running_batch.reqs[:2]):  # Only first 2 requests
+                logger.info(f"[DECODE] 🔄 Request {i}: rid={req.rid}, finished={req.finished()}, output_len={len(req.output_ids)}, last_token={req.output_ids[-1] if req.output_ids else 'None'}")
+
+            logger.info(f"[DECODE] 🔄 Calling update_running_batch for DECODE self-loop...")
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
+
+            if ret is not None:
+                logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: Returning batch with {len(ret.reqs)} active requests for token generation")
+                # Log the forward mode to understand what's happening
+                logger.info(f"[DECODE] 🔄 Batch forward_mode: {ret.forward_mode}")
+            else:
+                logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: All requests completed, running_batch is now empty")
         else:
             ret = None
 
@@ -453,12 +464,37 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         logger.info(f"[DECODE] 🔥 Filtering batch...")
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
 
+
+
         logger.info(f"[DECODE] 🔥 Merging batch to running_batch...")
         if not batch.is_empty():
             if self.running_batch.is_empty():
+                logger.info(f"[DECODE] 🔥 Running batch is empty, setting it to the new batch with {len(batch.reqs)} requests")
                 self.running_batch = batch
             else:
+                logger.info(f"[DECODE] 🔥 Merging new batch ({len(batch.reqs)} requests) with existing running batch ({len(self.running_batch.reqs)} requests)")
                 self.running_batch.merge_batch(batch)
+            logger.info(f"[DECODE] 🔥 After merge: running_batch has {len(self.running_batch.reqs)} requests")
+        else:
+            logger.info(f"[DECODE] 🔥 Batch is empty after filtering, not merging")
+
+        # 🔧 DEBUG: Verify weight sharing integrity after processing prefill result
+        try:
+            if hasattr(self, 'tp_worker') and hasattr(self.tp_worker, 'model_runner'):
+                model = self.tp_worker.model_runner.model
+                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                    embed_weight = model.model.embed_tokens.weight
+                    embed_checksum = torch.sum(embed_weight.data).item()
+                    embed_mean = torch.mean(embed_weight.data).item()
+                    embed_std = torch.std(embed_weight.data).item()
+                    logger.info(f"[DECODE] 🔧 WEIGHT CHECK: embed checksum={embed_checksum:.6f}, mean={embed_mean:.6f}, std={embed_std:.6f}")
+
+                    if abs(embed_mean) < 1e-6 and embed_std < 1e-6:
+                        logger.error(f"[DECODE] 🚨 CRITICAL: Embedding weights appear to be all zeros!")
+                    elif embed_std > 1.0:
+                        logger.error(f"[DECODE] 🚨 CRITICAL: Embedding weights appear to be random/corrupted!")
+        except Exception as e:
+            logger.warning(f"[DECODE] ⚠️ Could not verify weights: {e}")
 
         logger.info(f"[DECODE] 🔥 process_prefill_result completed successfully!")
 
@@ -468,26 +504,34 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        """Semi-PD decode scheduler processes decode results.
+        """Semi-PD DECODE scheduler processes decode results for self-loop.
 
-        Based on original Semi-PD implementation - keep it simple and clean.
+        This method handles the DECODE self-loop results and is critical for
+        Semi-PD's continuous token generation.
         """
-        # Handle overlap mode (like original Semi-PD)
+        logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: process_batch_result_decode called for {len(batch.reqs)} requests")
+
+        logits_output, next_token_ids, can_run_cuda_graph = (
+            result.logits_output,
+            result.next_token_ids,
+            result.can_run_cuda_graph,
+        )
+        self.num_generated_tokens += len(batch.reqs)
+
         if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = self.tp_worker.resolve_last_batch_result(None)
+            logits_output, next_token_ids, can_run_cuda_graph = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.
-            next_token_ids = result.next_token_ids.tolist()
-            can_run_cuda_graph = True  # Default for non-overlap mode
+            next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
-                next_token_logprobs = result.logits_output.next_token_logprobs.tolist()
-        else:
-            can_run_cuda_graph = True  # Default fallback
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Check finish condition (like original Semi-PD)
+        # Check finish condition - this is where EOS detection happens!
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
@@ -506,33 +550,19 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         )
                 continue
 
-            # === 记录本轮 alloc 的 KV loc ===
-            alloc_loc = batch.out_cache_loc[i : i + 1] if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None else None
-
             if batch.spec_algorithm.is_none():
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+                logger.info(f"[DECODE] 🔄 Request {req.rid}: added token {next_token_id} (temp={req.sampling_params.temperature}, top_k={req.sampling_params.top_k}), total_tokens={len(req.output_ids)}")
 
-            # CRITICAL FIX: Free KV cache according to page_size and request status
-            if alloc_loc is not None:
-                # 1) 运行时 page_size==1 直接释放
-                if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(alloc_loc)
-                    logger.debug(f"[DECODE] ✅ Freed KV cache (page_size=1), cache_loc={alloc_loc}")
-                # 2) page_size>1：尾页 token 暂存，整页满了再 free
-                else:
-                    total_tokens = len(req.origin_input_ids) + len(req.output_ids)
-                    if total_tokens % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(alloc_loc)
-                        logger.debug(f"[DECODE] ✅ Freed KV cache (full page), cache_loc={alloc_loc}")
-                    # 请求结束时释放尾页剩余 token
-                    elif req.finished():
-                        self.token_to_kv_pool_allocator.free(alloc_loc)
-                        logger.debug(f"[DECODE] ✅ Freed KV cache (request finished), cache_loc={alloc_loc}")
-
+            # CRITICAL: Check if request is finished (EOS detection)
             req.check_finished()
             if req.finished():
+                logger.info(f"[DECODE] 🔄 Request {req.rid}: FINISHED! Total tokens generated: {len(req.output_ids)}")
+                # Use original Semi-PD approach: only call tree_cache.cache_finished_req
+                # KV cache will be freed by the group operation
                 self.tree_cache.cache_finished_req(req)
+                req.time_stats.completion_time = time.time()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -540,41 +570,35 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs_val.append(
-                        result.logits_output.next_token_top_logprobs_val[i]
+                        logits_output.next_token_top_logprobs_val[i]
                     )
                     req.output_top_logprobs_idx.append(
-                        result.logits_output.next_token_top_logprobs_idx[i]
+                        logits_output.next_token_top_logprobs_idx[i]
                     )
                 if req.token_ids_logprob is not None:
                     req.output_token_ids_logprobs_val.append(
-                        result.logits_output.next_token_token_ids_logprobs_val[i]
+                        logits_output.next_token_token_ids_logprobs_val[i]
                     )
                     req.output_token_ids_logprobs_idx.append(
-                        result.logits_output.next_token_token_ids_logprobs_idx[i]
+                        logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
-            if req.return_hidden_states and result.logits_output.hidden_states is not None:
+            if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
-                    result.logits_output.hidden_states[i].cpu().clone().tolist()
+                    logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 req.grammar.accept_token(next_token_id)
                 req.grammar.finished = req.finished()
 
-        # REMOVED TEMPORARY PATCH: The previous patch caused double-free issues
-        # Will implement proper KV cache management based on original Semi-PD logic
+            # CRITICAL FIX: Free KV cache for each token (following original Semi-PD)
+            # This is the missing piece that was causing memory leaks!
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+            logger.debug(f"[DECODE] 🔄 Freed KV cache for token {next_token_id} of req {req.rid}")
 
-        if batch.next_batch_sampling_info:
-            batch.next_batch_sampling_info.update_regex_vocab_mask()
-            self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
-
+        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
-
-        # NOTE: KV cache is now freed per-token in the loop above, not per-batch
-        # This follows the original Semi-PD logic with proper page_size handling
-
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -582,224 +606,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.attn_tp_rank == 0
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats(can_run_cuda_graph)
+            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
-    def process_batch_result_prefill(
-        self,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
-    ):
-        """Override the base method to handle Semi-PD specific prefill result processing.
+        logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: process_batch_result_decode completed successfully!")
 
-        This method is based on SGLang v0.4.8's scheduler_output_processor_mixin.py
-        but adapted for Semi-PD Decode instance.
-        """
-        logger.info(f"[DECODE] 🔥 process_batch_result_prefill called for Semi-PD Decode instance")
 
-        # CRITICAL: Check weight sharing in Decode instance
-        logger.info(f"[DECODE] 🚨 CRITICAL: Checking weight sharing in Decode instance...")
-        try:
-            # For Decode instance, access model differently since tp_worker might be a client
-            model = None
-            if hasattr(self.tp_worker, 'model_runner') and hasattr(self.tp_worker.model_runner, 'model'):
-                model = self.tp_worker.model_runner.model
-                logger.info(f"[DECODE] 🔧 Using tp_worker.model_runner.model")
-            elif hasattr(self, 'model'):
-                model = self.model
-                logger.info(f"[DECODE] 🔧 Using self.model")
-            else:
-                # Try to get model from worker attributes
-                for attr_name in dir(self.tp_worker):
-                    attr = getattr(self.tp_worker, attr_name)
-                    if hasattr(attr, 'model'):
-                        model = attr.model
-                        logger.info(f"[DECODE] 🔧 Found model in {attr_name}")
-                        break
-
-            if model is not None:
-                # Try different embedding layer names for different model types
-                embed_weight = None
-                if hasattr(model, 'embed_tokens'):
-                    embed_weight = model.embed_tokens.weight
-                    logger.info(f"[DECODE] 🔧 Using embed_tokens")
-                elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-                    embed_weight = model.model.embed_tokens.weight
-                    logger.info(f"[DECODE] 🔧 Using model.embed_tokens")
-                elif hasattr(model, 'transformer') and hasattr(model.transformer, 'wte'):
-                    embed_weight = model.transformer.wte.weight
-                    logger.info(f"[DECODE] 🔧 Using transformer.wte")
-                else:
-                    # Find embedding layer by searching all parameters
-                    for name, param in model.named_parameters():
-                        if 'embed' in name.lower() and param.dim() == 2:
-                            embed_weight = param
-                            logger.info(f"[DECODE] 🔧 Found embedding layer: {name}")
-                            break
-
-                if embed_weight is not None:
-                    embed_checksum = torch.sum(embed_weight.data).item()
-                    embed_ptr = embed_weight.data_ptr()
-                    logger.info(f"[DECODE] 🚨 EMBEDDING: checksum={embed_checksum:.6f}, ptr=0x{embed_ptr:x}")
-
-                    # Check specific token embeddings
-                    if embed_weight.shape[0] > 16:
-                        token_15_embedding = embed_weight[15, :5].tolist()
-                        token_16_embedding = embed_weight[16, :5].tolist()
-                        logger.info(f"[DECODE] 🚨 TOKEN 15 EMBEDDING: {token_15_embedding}")
-                        logger.info(f"[DECODE] 🚨 TOKEN 16 EMBEDDING: {token_16_embedding}")
-                else:
-                    logger.error(f"[DECODE] ❌ Could not find embedding layer")
-            else:
-                logger.error(f"[DECODE] ❌ Could not find model")
-                # DEBUG: List all available attributes to find the model
-                logger.info(f"[DECODE] 🔧 DEBUG: tp_worker type = {type(self.tp_worker)}")
-                logger.info(f"[DECODE] 🔧 DEBUG: tp_worker attributes = {[attr for attr in dir(self.tp_worker) if not attr.startswith('_')]}")
-
-                # Try to access model through different paths
-                if hasattr(self.tp_worker, 'worker'):
-                    logger.info(f"[DECODE] 🔧 DEBUG: Found tp_worker.worker")
-                    if hasattr(self.tp_worker.worker, 'model_runner'):
-                        logger.info(f"[DECODE] 🔧 DEBUG: Found tp_worker.worker.model_runner")
-                        if hasattr(self.tp_worker.worker.model_runner, 'model'):
-                            model = self.tp_worker.worker.model_runner.model
-                            logger.info(f"[DECODE] 🔧 DEBUG: Found model via tp_worker.worker.model_runner.model")
-
-                # If still no model, this is a critical Semi-PD architecture issue
-                if model is None:
-                    logger.error(f"[DECODE] 🚨 CRITICAL: Semi-PD Decode instance has NO ACCESS to model weights!")
-                    logger.error(f"[DECODE] 🚨 This explains why H20 generates wrong tokens - Decode uses wrong weights!")
-                    return  # Skip weight verification since we can't access the model
-        except Exception as e:
-            logger.error(f"[DECODE] ❌ Failed to check weight sharing: {e}")
-
-        # CRITICAL FIX: Add missing free_group_begin() call for KV Cache management
-        # This is the key fix mentioned in the KV Cache Bug Guide!
-        self.token_to_kv_pool_allocator.free_group_begin()
-        logger.info(f"[DECODE] 🔧 CRITICAL FIX: Called free_group_begin() for KV Cache management")
-
-        # DEBUG: Check if Decode instance also has KV cache to manage
-        if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
-            logger.info(f"[DECODE] 🔧 DEBUG: Decode batch.out_cache_loc exists: {batch.out_cache_loc}")
-        else:
-            logger.info(f"[DECODE] 🔧 DEBUG: Decode batch.out_cache_loc is None")
-
-        skip_stream_req = None
-
-        if self.is_generation:
-            (
-                logits_output,
-                next_token_ids,
-                extend_input_len_per_req,
-                extend_logprob_start_len_per_req,
-            ) = (
-                result.logits_output,
-                result.next_token_ids,
-                result.extend_input_len_per_req,
-                result.extend_logprob_start_len_per_req,
-            )
-
-            # Semi-PD: Handle overlap mode differently
-            if self.enable_overlap and not self.server_args.enable_semi_pd:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-            else:
-                # Move next_token_ids and logprobs to cpu
-                # Semi-PD: Only convert to list if not already a list
-                if not isinstance(next_token_ids, list):
-                    next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    if logits_output.next_token_logprobs is not None:
-                        logits_output.next_token_logprobs = (
-                            logits_output.next_token_logprobs.tolist()
-                        )
-                    if logits_output.input_token_logprobs is not None:
-                        logits_output.input_token_logprobs = tuple(
-                            logits_output.input_token_logprobs.tolist()
-                        )
-
-            hidden_state_offset = 0
-
-            # Check finish conditions
-            logprob_pt = 0
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.is_retracted:
-                    continue
-
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
-                    continue
-
-                if req.is_chunked <= 0:
-                    # req output_ids are set here (like original Semi-PD)
-                    req.output_ids.append(next_token_id)
-
-                    # Semi-PD: Don't check finished in Prefill stage - let Decode stage handle it
-                    # This ensures requests continue to Decode stage for further token generation
-
-                    # Always cache as unfinished since this is Prefill stage
-                    if not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
-
-                # Handle logprobs if needed
-                if batch.return_logprob and req.is_chunked <= 0:
-                    # Process logprobs similar to original implementation
-                    if logits_output.input_token_logprobs is not None:
-                        self.process_input_logprobs(
-                            i, req, req.fill_ids, logits_output, req.is_chunked == 0
-                        )
-
-                    if logits_output.next_token_logprobs is not None:
-                        req.output_token_logprobs.append(
-                            logits_output.next_token_logprobs[i]
-                        )
-
-                    logprob_pt += len(req.fill_ids)
-
-                # Handle hidden states if needed
-                if result.logits_output and result.logits_output.hidden_states is not None:
-                    if req.return_hidden_states:
-                        req.hidden_states = result.logits_output.hidden_states[
-                            hidden_state_offset : hidden_state_offset + len(req.fill_ids)
-                        ].tolist()
-                    hidden_state_offset += len(req.fill_ids)
-
-        else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
-
-            # Check finish conditions
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
-                    continue
-
-                req.embedding = embeddings[i]
-                if req.is_chunked <= 0:
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.check_finished()
-
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    else:
-                        self.tree_cache.cache_unfinished_req(req)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
-
-        # Stream output to detokenizer - this is the key missing piece!
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
-
-        # CRITICAL FIX: Add missing free_group_end() call to complete KV Cache management
-        # This pairs with the free_group_begin() call above
-        self.token_to_kv_pool_allocator.free_group_end()
-        logger.info(f"[DECODE] 🔧 CRITICAL FIX: Called free_group_end() to complete KV Cache management")
-
-        logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed for Semi-PD")

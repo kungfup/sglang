@@ -952,7 +952,8 @@ def _launch_semi_pd_subprocesses(
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
 
-        # Step 1: Launch ALL Decode and Prefill Schedulers simultaneously (NCCL requirement)
+        # 🔥 [SEMI-PD] PHASE 1: Starting all DECODE schedulers first...
+        logger.info("🔥 [SEMI-PD] PHASE 1: Starting all DECODE schedulers first...")
         for tp_rank in tp_rank_range:
             queue_idx = tp_rank % tp_size_per_node
             p_ipc_info_queue = p_ipc_info_queues[queue_idx]  # Decode will put IPC info here
@@ -987,7 +988,31 @@ def _launch_semi_pd_subprocesses(
             scheduler_procs.append(d_proc)
             d_scheduler_pipe_readers.append(d_reader)
 
-            # Launch Prefill instance immediately after (for NCCL synchronization)
+        # ⏳ [SEMI-PD] Waiting for all DECODE schedulers to be ready...
+        logger.info("⏳ [SEMI-PD] Waiting for all DECODE schedulers to be ready...")
+        for i, d_reader in enumerate(d_scheduler_pipe_readers):
+            logger.info(f"⏳ [SEMI-PD] Waiting for D instance {i} to be ready...")
+            d_data = d_reader.recv()
+            if d_data["status"] == "ready":
+                logger.info(f"✅ [SEMI-PD] Decode scheduler {i} is ready and IPC info is in queue")
+                scheduler_infos.append(d_data)
+            else:
+                logger.error(f"❌ [SEMI-PD] Decode scheduler {i} failed to start: {d_data}")
+                raise RuntimeError(f"Decode scheduler {i} failed to start: {d_data}")
+
+        logger.info("🎉 [SEMI-PD] All DECODE schedulers are ready! IPC info is available in queues.")
+
+        # 🔥 [SEMI-PD] PHASE 2: Starting all PREFILL schedulers (IPC sharing mode)...
+        logger.info("🔥 [SEMI-PD] PHASE 2: Starting all PREFILL schedulers (IPC sharing mode)...")
+        for tp_rank in tp_rank_range:
+            queue_idx = tp_rank % tp_size_per_node
+            p_ipc_info_queue = p_ipc_info_queues[queue_idx]  # Prefill gets IPC info from Decode
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+
+            # Launch Prefill instance (after Decode is ready)
             os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = "80"
             logger.info(
                 f"🚀 Launch P instance TP {tp_rank} with 80% SMs (MPS enabled)"
@@ -1013,25 +1038,22 @@ def _launch_semi_pd_subprocesses(
             scheduler_procs.append(p_proc)
             p_scheduler_pipe_readers.append(p_reader)
 
-        # Step 2: Wait for ALL schedulers to be ready (after all are started)
-        logger.info("Waiting for all Decode schedulers to be ready...")
-        for i, d_reader in enumerate(d_scheduler_pipe_readers):
-            d_data = d_reader.recv()
-            if d_data["status"] == "ready":
-                logger.info(f"✅ Decode scheduler {i} is ready")
-                scheduler_infos.append(d_data)
-            else:
-                logger.error(f"❌ Decode scheduler {i} failed to start: {d_data}")
-                raise RuntimeError(f"Decode scheduler {i} failed to start: {d_data}")
-
-        logger.info("Waiting for all Prefill schedulers to be ready...")
+        # ⏳ [SEMI-PD] Waiting for all PREFILL schedulers to complete IPC sharing...
+        logger.info("⏳ [SEMI-PD] Waiting for all PREFILL schedulers to complete IPC sharing...")
         for i, p_reader in enumerate(p_scheduler_pipe_readers):
+            logger.info(f"⏳ [SEMI-PD] Waiting for P instance {i} to be ready...")
             p_data = p_reader.recv()
             if p_data["status"] == "ready":
-                logger.info(f"✅ Prefill scheduler {i} is ready")
+                logger.info(f"✅ [SEMI-PD] Prefill scheduler {i} is ready (IPC sharing completed)")
+                # Note: We don't add prefill scheduler info to scheduler_infos
+                # because the main scheduler info comes from decode schedulers
             else:
-                logger.error(f"❌ Prefill scheduler {i} failed to start: {p_data}")
+                logger.error(f"❌ [SEMI-PD] Prefill scheduler {i} failed to start: {p_data}")
                 raise RuntimeError(f"Prefill scheduler {i} failed to start: {p_data}")
+
+        logger.info("🎉 [SEMI-PD] All schedulers are ready! Semi-PD initialization completed successfully.")
+
+
 
 
 
