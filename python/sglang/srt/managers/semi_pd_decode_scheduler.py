@@ -14,11 +14,10 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
-import os
 import threading
 import time
 from types import SimpleNamespace
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -34,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.utils import broadcast_pyobj, get_bool_env_var, get_zmq_socket
@@ -61,27 +60,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             port_args,
             gpu_id,
             tp_rank,
-            0,  # pp_rank
             dp_rank,
             False,
             InstanceRole.DECODE,
         )
-
-        # Log environment info for cross-platform debugging
-        import platform
-        import torch
-        with open('/tmp/semi_pd_debug.log', 'w') as f:  # Clear previous log
-            f.write(f"=== Semi-PD Debug Log ===\n")
-            f.write(f"Platform: {platform.platform()}\n")
-            f.write(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'NO_CUDA'}\n")
-            f.write(f"CUDA Version: {torch.version.cuda if torch.cuda.is_available() else 'NO_CUDA'}\n")
-            f.write(f"Model Path: {server_args.model_path}\n")
-            f.write(f"Instance Role: DECODE\n")
-            f.write(f"Enable Overlap: {getattr(server_args, 'enable_overlap', 'Unknown')}\n")
-            f.write(f"CUDA Graph: {not getattr(server_args, 'disable_cuda_graph', True)}\n")
-            f.write(f"TP Size: {getattr(server_args, 'tp_size', 'Unknown')}\n")
-            f.write(f"GPU ID: {gpu_id}\n")
-            f.write(f"=========================\n")
 
         self._request_dispatcher._mapping.extend(
             [
@@ -125,24 +107,29 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             batch.batch_is_full = False
             return batch
 
-        # Check if decode out of memory
+        # 🔧 CRITICAL: D-Scheduler作为KV Cache唯一管理者，执行动态OOM管理
+        # 这是Semi-PD调度机制中最精巧的部分，完全由D-Scheduler主导
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
             TEST_RETRACT and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
 
+            # D-Scheduler决定撤回哪些请求
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "Decode out of memory happened. "
+                f"[DECODE] 🧠 D-Scheduler: OOM detected, executing request retraction. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
 
-            # Semi-PD
+            # 🔧 MIGRATION: 原版Semi-PD的请求撤回逻辑
+            # 注意：原版Semi-PD在撤回时不需要手动释放资源，retract_decode已经处理了
             for req in retracted_reqs:
                 req: Req
+
+                # 重新打包请求并发送给P-Scheduler
                 message = TokenizedGenerateReqInput(
                     rid=req.rid,
                     input_text=req.origin_input_text + req.decoded_text,
@@ -163,6 +150,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 self.waiting_queue.insert(0, req)
                 self.send_to_p_instance.send_pyobj(message)
+                logger.info(f"[DECODE] 🧠 D-Scheduler: Sent retracted request {req.rid} back to P-Scheduler")
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -352,62 +340,63 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         return new_batch
 
     def get_next_prefill_batch(self, recv_req: GetNextPrefillBatchInput):
-        logger.info(f"[DECODE] 🔥 get_next_prefill_batch called with rids: {recv_req.rids}")
+        """
+        Semi-PD D-Scheduler: 系统的大脑和指挥中心
 
-        # DEBUG: Check request data in Decode scheduler
-        for rid in recv_req.rids:
-            # Find request in waiting_queue
-            found_req = None
-            for req in self.waiting_queue:
-                if req.rid == rid:
-                    found_req = req
-                    break
+        核心职责：
+        1. 作为KV Cache的唯一管理者，检查资源可用性
+        2. 批准哪些请求可以进入Prefill阶段
+        3. 预分配所有必要的KV Cache资源
+        4. 将资源信息传递给P-Scheduler
 
-            if found_req:
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} origin_input_ids = {found_req.origin_input_ids}")
-                logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} origin_input_ids length = {len(found_req.origin_input_ids)}")
-                if len(found_req.origin_input_ids) > 0:
-                    last_token = found_req.origin_input_ids[-1]
-                    logger.info(f"[DECODE] 🔧 DEBUG: Request {rid} last token = {last_token}")
-            else:
-                logger.warning(f"[DECODE] ⚠️ Request {rid} not found in waiting_queue")
+        重要：D-Scheduler拥有最终决策权
+        """
+        logger.debug(f"[DECODE] D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler")
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
 
-        logger.info(f"[DECODE] Calling get_new_batch_prefill with rids: {recv_req.rids}")
+        # 🔧 CRITICAL: D-Scheduler作为KV Cache唯一管理者进行资源检查和分配
         batch = self.get_new_batch_prefill(recv_req.rids)
-        logger.info(f"[DECODE] get_new_batch_prefill returned: {batch is not None}")
 
         if batch is None:
-            response = GetNextPrefillBatchOutput(
-                rids=[],
-                chunked_rid=None,
-                req_pool_indices=[],
-                prefix_lens=[],
-                extend_input_lens=[],
+            logger.debug(f"[DECODE] D-Scheduler rejected all requests due to resource constraints")
+            self.bridge_socket.send_pyobj(
+                GetNextPrefillBatchOutput(
+                    rids=[],
+                    chunked_rid=None,
+                    req_pool_indices=[],
+                    prefix_lens=[],
+                    extend_input_lens=[],
+                )
             )
-            logger.debug(f"[DECODE] Send empty response to P worker: {response}")
-            self.bridge_socket.send_pyobj(response)
         else:
-            # Serialize the essential information of the batch
-            response = GetNextPrefillBatchOutput(
-                rids=[r.rid for r in batch.reqs],
-                chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
-                req_pool_indices=[r.req_pool_idx for r in batch.reqs],
-                prefix_lens=[len(r.prefix_indices) for r in batch.reqs],
-                extend_input_lens=[r.extend_input_len for r in batch.reqs],
+            # 🔧 CRITICAL: D-Scheduler预分配KV Cache资源并传递给P-Scheduler
+            approved_rids = [r.rid for r in batch.reqs]
+            logger.info(f"[DECODE] 🧠 D-Scheduler approved {len(approved_rids)} requests: {approved_rids}")
+
+            # 确保所有资源信息都正确传递
+            req_pool_indices = [r.req_pool_idx for r in batch.reqs]
+            prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
+            extend_input_lens = [r.extend_input_len for r in batch.reqs]
+
+            logger.debug(f"[DECODE] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
+
+            self.bridge_socket.send_pyobj(
+                GetNextPrefillBatchOutput(
+                    rids=[r.rid for r in batch.reqs],
+                    chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                    req_pool_indices=[r.req_pool_idx for r in batch.reqs],
+                    prefix_lens=[len(r.prefix_indices) for r in batch.reqs],
+                    extend_input_lens=[r.extend_input_len for r in batch.reqs],
+                )
             )
-            logger.info(f"[DECODE] Send response to P worker: {response}")
-            self.bridge_socket.send_pyobj(response)
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        logger.info(f"[DECODE] 🔥 process_prefill_result started, next_token_ids={recv_req.next_token_ids}")
         batch = self.scheduled_prefill_batches.pop(0)
-        logger.info(f"[DECODE] 🔥 Got batch with {len(batch.reqs)} requests")
         assert len(batch.reqs) == len(recv_req.next_token_ids)
 
         logits_processor_output = None
@@ -420,16 +409,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             )
 
         # TODO: return logprobs is not supported in Semi-PD mode
-        # Provide proper extend_input_len_per_req and extend_logprob_start_len_per_req
-        extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-        extend_logprob_start_len_per_req = [0 for _ in batch.reqs]  # Start from beginning
-
         result = GenerationBatchResult(
+            next_token_ids=recv_req.next_token_ids,
             logits_output=logits_processor_output,
             pp_hidden_states_proxy_tensors=None,  # v0.4.8 requires this parameter
-            next_token_ids=recv_req.next_token_ids,
-            extend_input_len_per_req=extend_input_len_per_req,
-            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
             bid=-1,  # doesn't matter
             can_run_cuda_graph=False,  # v0.4.8 requires this parameter
         )
@@ -437,177 +422,24 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if self.attn_tp_size > 1:
             dist.barrier(group=self.attn_tp_cpu_group)
 
-        logger.info(f"[DECODE] 🔥 Setting batch.output_ids...")
+        # Semi-PD: Critical batch.output_ids setting (matches original Semi-PD logic)
         batch.output_ids = torch.from_numpy(
             np.array(result.next_token_ids, dtype=np.int64)
         ).to(self.device, dtype=torch.int64, non_blocking=True)
 
-        # DEBUG: Check KV cache allocation status BEFORE processing
-        avail_size_before = self.token_to_kv_pool_allocator.available_size()
-        expected_size = self.token_to_kv_pool_allocator.size
-        logger.info(f"[DECODE] 🔧 KV Cache Status BEFORE process_batch_result_prefill: avail={avail_size_before}, expected={expected_size}, diff={avail_size_before - expected_size}")
+        # Debug: Log the critical batch.output_ids setting
+        logger.info(f"[SEMI-PD-DECODE] 🔧 Setting batch.output_ids: {batch.output_ids}")
+        logger.info(f"[SEMI-PD-DECODE] 🔧 result.next_token_ids: {result.next_token_ids}")
 
-        logger.info(f"[DECODE] 🔥 Calling process_batch_result_prefill...")
         self.process_batch_result_prefill(batch, result)
 
-        # DEBUG: Check KV cache allocation status AFTER processing
-        avail_size_after = self.token_to_kv_pool_allocator.available_size()
-        logger.info(f"[DECODE] 🔧 KV Cache Status AFTER process_batch_result_prefill: avail={avail_size_after}, expected={expected_size}, diff={avail_size_after - expected_size}")
-
-        if avail_size_after != avail_size_before:
-            logger.info(f"[DECODE] 🔧 KV Cache changed by: {avail_size_after - avail_size_before} tokens")
-        else:
-            logger.warning(f"[DECODE] ⚠️ KV Cache unchanged - potential memory leak!")
-
-        logger.info(f"[DECODE] 🔥 process_batch_result_prefill completed!")
-
-        logger.info(f"[DECODE] 🔥 Filtering batch...")
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
 
-
-
-        logger.info(f"[DECODE] 🔥 Merging batch to running_batch...")
         if not batch.is_empty():
             if self.running_batch.is_empty():
-                logger.info(f"[DECODE] 🔥 Running batch is empty, setting it to the new batch with {len(batch.reqs)} requests")
                 self.running_batch = batch
             else:
-                logger.info(f"[DECODE] 🔥 Merging new batch ({len(batch.reqs)} requests) with existing running batch ({len(self.running_batch.reqs)} requests)")
                 self.running_batch.merge_batch(batch)
-            logger.info(f"[DECODE] 🔥 After merge: running_batch has {len(self.running_batch.reqs)} requests")
-        else:
-            logger.info(f"[DECODE] 🔥 Batch is empty after filtering, not merging")
 
-        # 🔧 DEBUG: Verify weight sharing integrity after processing prefill result
-        try:
-            if hasattr(self, 'tp_worker') and hasattr(self.tp_worker, 'model_runner'):
-                model = self.tp_worker.model_runner.model
-                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-                    embed_weight = model.model.embed_tokens.weight
-                    embed_checksum = torch.sum(embed_weight.data).item()
-                    embed_mean = torch.mean(embed_weight.data).item()
-                    embed_std = torch.std(embed_weight.data).item()
-                    logger.info(f"[DECODE] 🔧 WEIGHT CHECK: embed checksum={embed_checksum:.6f}, mean={embed_mean:.6f}, std={embed_std:.6f}")
-
-                    if abs(embed_mean) < 1e-6 and embed_std < 1e-6:
-                        logger.error(f"[DECODE] 🚨 CRITICAL: Embedding weights appear to be all zeros!")
-                    elif embed_std > 1.0:
-                        logger.error(f"[DECODE] 🚨 CRITICAL: Embedding weights appear to be random/corrupted!")
-        except Exception as e:
-            logger.warning(f"[DECODE] ⚠️ Could not verify weights: {e}")
-
-        logger.info(f"[DECODE] 🔥 process_prefill_result completed successfully!")
-
-    def process_batch_result_decode(
-        self,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
-    ):
-        """Semi-PD DECODE scheduler processes decode results for self-loop.
-
-        This method handles the DECODE self-loop results and is critical for
-        Semi-PD's continuous token generation.
-        """
-        logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: process_batch_result_decode called for {len(batch.reqs)} requests")
-
-        logits_output, next_token_ids, can_run_cuda_graph = (
-            result.logits_output,
-            result.next_token_ids,
-            result.can_run_cuda_graph,
-        )
-        self.num_generated_tokens += len(batch.reqs)
-
-        if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-            next_token_logprobs = logits_output.next_token_logprobs
-        elif batch.spec_algorithm.is_none():
-            # spec decoding handles output logprobs inside verify process.
-            next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-
-        self.token_to_kv_pool_allocator.free_group_begin()
-
-        # Check finish condition - this is where EOS detection happens!
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            if req.is_retracted:
-                continue
-
-            if self.enable_overlap and req.finished():
-                # Free the one extra delayed token
-                if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                else:
-                    # Only free when the extra token is in a new page
-                    if (
-                        len(req.origin_input_ids) + len(req.output_ids) - 1
-                    ) % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
-                continue
-
-            if batch.spec_algorithm.is_none():
-                # speculative worker will solve the output_ids in speculative decoding
-                req.output_ids.append(next_token_id)
-                logger.info(f"[DECODE] 🔄 Request {req.rid}: added token {next_token_id} (temp={req.sampling_params.temperature}, top_k={req.sampling_params.top_k}), total_tokens={len(req.output_ids)}")
-
-            # CRITICAL: Check if request is finished (EOS detection)
-            req.check_finished()
-            if req.finished():
-                logger.info(f"[DECODE] 🔄 Request {req.rid}: FINISHED! Total tokens generated: {len(req.output_ids)}")
-                # Use original Semi-PD approach: only call tree_cache.cache_finished_req
-                # KV cache will be freed by the group operation
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
-
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
-
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
-
-            if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
-                req.grammar.finished = req.finished()
-
-            # CRITICAL FIX: Free KV cache for each token (following original Semi-PD)
-            # This is the missing piece that was causing memory leaks!
-            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-            logger.debug(f"[DECODE] 🔄 Freed KV cache for token {next_token_id} of req {req.rid}")
-
-        self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
-
-        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        if (
-            self.attn_tp_rank == 0
-            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
-        ):
-            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-
-        logger.info(f"[DECODE] 🔄 DECODE SELF-LOOP: process_batch_result_decode completed successfully!")
 
 

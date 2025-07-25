@@ -48,90 +48,19 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
-# Module-level wrapper function for multiprocessing spawn compatibility
-def test_detokenizer_wrapper_module_level(server_args, port_args, pipe_writer):
-    """Module-level wrapper function to test multiprocessing spawn mode"""
-    # Write to a file immediately to confirm function is called
-    try:
-        with open("/tmp/detokenizer_wrapper_module_debug.log", "w") as f:
-            f.write("🔧 [MODULE WRAPPER] Function called - starting initialization\n")
-            f.flush()
-    except Exception as e:
-        pass
-
-    # Add immediate debug output to stdout
-    print("🔧 [MODULE WRAPPER] Function called - starting initialization", flush=True)
-
-    # Now call the actual function
-    return run_detokenizer_process(server_args, port_args, pipe_writer)
-
-# Safe wrapper for detokenizer process
+# Simplified wrapper for detokenizer process
 def safe_run_detokenizer_process(server_args, port_args, pipe_writer):
-    """Safe wrapper for detokenizer process with error handling"""
+    """Simplified wrapper for detokenizer process with basic error handling"""
     try:
-        # Write debug info immediately
-        with open("/tmp/detokenizer_safe_wrapper_debug.log", "w") as f:
-            f.write("🔧 [SAFE WRAPPER] Function called - starting initialization\n")
-            f.flush()
-
-        print("🔧 [SAFE WRAPPER] Function called - starting initialization", flush=True)
-
-        # Import here to avoid import issues in multiprocessing
-        import sys
-        import os
-
-        # Add the path to ensure imports work
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
-        print("🔧 [SAFE WRAPPER] About to call run_detokenizer_process", flush=True)
-
-        # Write more debug info
-        with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
-            f.write("🔧 [SAFE WRAPPER] About to call run_detokenizer_process\n")
-            f.write(f"🔧 [SAFE WRAPPER] server_args type: {type(server_args)}\n")
-            f.write(f"🔧 [SAFE WRAPPER] port_args type: {type(port_args)}\n")
-            f.write(f"🔧 [SAFE WRAPPER] pipe_writer type: {type(pipe_writer)}\n")
-            f.flush()
-
-        # Test if the function can be imported and check its signature
-        try:
-            from sglang.srt.managers.detokenizer_manager import run_detokenizer_process as test_import
-            import inspect
-            sig = inspect.signature(test_import)
-            with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
-                f.write("🔧 [SAFE WRAPPER] Import test successful\n")
-                f.write(f"🔧 [SAFE WRAPPER] Function signature: {sig}\n")
-                f.write(f"🔧 [SAFE WRAPPER] Function file: {test_import.__code__.co_filename}\n")
-                f.flush()
-        except Exception as import_error:
-            with open("/tmp/detokenizer_safe_wrapper_debug.log", "a") as f:
-                f.write(f"🔧 [SAFE WRAPPER] Import test failed: {import_error}\n")
-                f.flush()
-            raise import_error
-
-        # Call the actual function
-        return test_import(server_args, port_args, pipe_writer)
-
+        logger.info("[SEMI-PD-ENGINE] Starting detokenizer process...")
+        return run_detokenizer_process(server_args, port_args, pipe_writer)
     except Exception as e:
-        # Log the error
-        try:
-            with open("/tmp/detokenizer_safe_wrapper_error.log", "w") as f:
-                import traceback
-                f.write(f"🔧 [SAFE WRAPPER] Error: {str(e)}\n")
-                f.write(f"🔧 [SAFE WRAPPER] Traceback: {traceback.format_exc()}\n")
-                f.flush()
-        except:
-            pass
-
-        print(f"🔧 [SAFE WRAPPER] Error: {str(e)}", flush=True)
-
-        # Send error signal if pipe is available
+        logger.error(f"[SEMI-PD-ENGINE] Detokenizer process failed: {e}")
         if pipe_writer is not None:
             try:
                 pipe_writer.send({"status": "error", "error": str(e)})
             except:
                 pass
-
         raise
 
 from sglang.srt.managers.io_struct import (

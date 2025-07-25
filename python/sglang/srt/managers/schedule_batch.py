@@ -736,9 +736,20 @@ class Req:
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+            # 🔧 SEMI-PD DEBUG: Add detailed logging and error handling
+            tail_tokens = self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+            try:
+                tail_str = self.tokenizer.decode(tail_tokens)
+            except (OverflowError, ValueError) as e:
+                # Log detailed information for debugging
+                logger.error(f"[SEMI-PD DEBUG] Token decode failed for request {self.rid}")
+                logger.error(f"[SEMI-PD DEBUG] tail_tokens: {tail_tokens}")
+                logger.error(f"[SEMI-PD DEBUG] tail_tokens types: {[type(t) for t in tail_tokens]}")
+                logger.error(f"[SEMI-PD DEBUG] output_ids: {self.output_ids}")
+                logger.error(f"[SEMI-PD DEBUG] vocab_size: {getattr(self.tokenizer, 'vocab_size', 'unknown')}")
+                logger.error(f"[SEMI-PD DEBUG] Error: {e}")
+                # Use empty string to prevent crash, but continue processing
+                tail_str = ""
 
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
@@ -1276,18 +1287,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 out_cache_loc = []
                 for req, req_pool_idx in zip(self.reqs, req_pool_indices):
                     pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-                    # Handle Semi-PD Prefill instance where req_to_token_pool might be None or invalid
-                    if (self.req_to_token_pool is None or
-                        not hasattr(self.req_to_token_pool, 'req_to_token') or
-                        self.req_to_token_pool.req_to_token is None):
-                        # For Semi-PD Prefill instance, create dummy cache locations on correct device
-                        out_cache_loc.append(torch.arange(seq_len - pre_len, dtype=torch.int32, device=self.device))
-                    else:
-                        out_cache_loc.append(
-                            self.req_to_token_pool.req_to_token[
-                                req_pool_idx, pre_len:seq_len
-                            ]
-                        )
+                    out_cache_loc.append(
+                        self.req_to_token_pool.req_to_token[
+                            req_pool_idx, pre_len:seq_len
+                        ]
+                    )
                 out_cache_loc = torch.cat(out_cache_loc).to(
                     self.device, dtype=torch.int32, non_blocking=True
                 )
@@ -1327,30 +1331,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        # Write to req_to_token_pool (skip for Semi-PD Prefill instance)
-        if (self.req_to_token_pool is not None and
-            hasattr(self.req_to_token_pool, 'req_to_token') and
-            self.req_to_token_pool.req_to_token is not None):
-            if support_triton(global_server_args_dict.get("attention_backend")):
-                # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
+        # Write to req_to_token_pool
+        if support_triton(global_server_args_dict.get("attention_backend")):
+            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
-                write_req_to_token_pool_triton[(bs,)](
-                    self.req_to_token_pool.req_to_token,
-                    req_pool_indices_tensor,
-                    prefix_lens_tensor,
-                    seq_lens_tensor,
-                    extend_lens_tensor,
-                    out_cache_loc,
-                    self.req_to_token_pool.req_to_token.shape[1],
+            write_req_to_token_pool_triton[(bs,)](
+                self.req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                extend_lens_tensor,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+        else:
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write(
+                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                    out_cache_loc[pt : pt + extend_lens[i]],
                 )
-            else:
-                pt = 0
-                for i in range(bs):
-                    self.req_to_token_pool.write(
-                        (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                        out_cache_loc[pt : pt + extend_lens[i]],
-                    )
-                    pt += extend_lens[i]
+                pt += extend_lens[i]
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)

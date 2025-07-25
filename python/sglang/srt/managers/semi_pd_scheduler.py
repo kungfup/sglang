@@ -12,8 +12,41 @@ import setproctitle
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+
+# Compatibility layer for ImageInputs (v0.4.8 uses MultimodalInputs)
+try:
+    from sglang.srt.managers.schedule_batch import ImageInputs
+except ImportError:
+    # Create a compatibility class for v0.4.8
+    import dataclasses
+    from typing import List, Optional, Union
+    import torch
+    import numpy as np
+
+    @dataclasses.dataclass
+    class ImageInputs:
+        """Compatibility class for ImageInputs in v0.4.8"""
+        pixel_values: Union[torch.Tensor, np.array]
+        image_hashes: Optional[list] = None
+        image_sizes: Optional[list] = None
+        image_offsets: Optional[list] = None
+        image_pad_len: Optional[list] = None
+        pad_values: Optional[list] = None
+        modalities: Optional[list] = None
+        num_image_tokens: Optional[int] = None
+
+        @staticmethod
+        def from_dict(obj: dict):
+            """Create ImageInputs from dictionary for compatibility"""
+            ret = ImageInputs(
+                pixel_values=obj["pixel_values"],
+                image_hashes=obj.get("image_hashes"),
+            )
+            # Use image hash as fake token_ids for prefix matching
+            if ret.image_hashes:
+                ret.pad_values = [x % (1 << 30) for x in ret.image_hashes]
+            return ret
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import validate_input_length
@@ -29,9 +62,6 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-
-
-
 class SemiPDScheduler(Scheduler):
     def __init__(
         self,
@@ -39,28 +69,27 @@ class SemiPDScheduler(Scheduler):
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
-        pp_rank: int,
         dp_rank: Optional[int],
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # Store Semi-PD specific parameters
-        self.bypass_load_weight = bypass_load_weight
-        self.instance_role = instance_role
-
-        # Call parent with v0.4.8 signature including instance_role
+        # 🔧 MIGRATION: 适配v0.4.8的API，添加pp_rank参数
         super().__init__(
             server_args,
             port_args,
             gpu_id,
             tp_rank,
-            pp_rank,
+            0,  # pp_rank - Semi-PD doesn't use pipeline parallel
             dp_rank,
             bypass_load_weight,
             instance_role,
         )
 
     def add_to_waiting_queue(self, req: Req):
+        """
+        原版Semi-PD的请求队列管理逻辑
+        撤回的请求具有高优先级，插入队列头部
+        """
         if req.is_retracted:
             self.waiting_queue.insert(0, req)
         else:
@@ -71,12 +100,13 @@ class SemiPDScheduler(Scheduler):
         recv_req: TokenizedGenerateReqInput,
     ):
         """
-        SemiPD changes:
-          - disable grammar
-          - handle retracted requests
+        原版Semi-PD的请求处理逻辑
+        主要变化：
+          - 禁用grammar功能
+          - 处理撤回的请求
+          - 使用add_to_waiting_queue管理队列
         """
         logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
-        logger.info(f"[SEMI_PD] 🔧 Received sampling_params: temperature={recv_req.sampling_params.temperature}, top_k={recv_req.sampling_params.top_k}, top_p={recv_req.sampling_params.top_p}")
 
         # Create a new request
         if (
@@ -127,7 +157,7 @@ class SemiPDScheduler(Scheduler):
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
-                # SemiPD
+                # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
                 return
         else:
@@ -135,21 +165,22 @@ class SemiPDScheduler(Scheduler):
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
-                # SemiPD
+                # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
                 return
 
         # Handle multimodal inputs
-        # TODO: Update for v0.4.8 multimodal handling
+        # 🔧 v0.4.8 COMPATIBILITY: image_inputs -> mm_inputs
         if recv_req.mm_inputs is not None:
-            # For now, skip image processing in Semi-PD
-            # This will be updated when we add full multimodal support
-            pass
+            # 🔧 v0.4.8: For now, skip complex multimodal processing in Semi-PD
+            # This maintains compatibility while avoiding complex multimodal logic
+            logger.warning("Multimodal inputs detected but skipped in Semi-PD mode for v0.4.8 compatibility")
 
+            # Basic validation to prevent oversized inputs
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 error_msg = (
-                    "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    "Multimodal prompt is too long. "
+                    f"Input length {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
@@ -158,7 +189,7 @@ class SemiPDScheduler(Scheduler):
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                # SemiPD
+                # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
                 return
 
@@ -171,7 +202,7 @@ class SemiPDScheduler(Scheduler):
         if error_msg:
             req.origin_input_ids = [0]
             req.sampling_params.max_new_tokens = 0
-            # SemiPD
+            # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
             self.add_to_waiting_queue(req)
             return
 
@@ -191,7 +222,8 @@ class SemiPDScheduler(Scheduler):
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
-        # Init grammar cache for this request
+        # 🔧 MIGRATION: 原版Semi-PD禁用grammar功能以避免复杂性
+        # 注释掉grammar相关逻辑，直接添加到等待队列
         add_to_grammar_queue = False
         if (
             req.sampling_params.json_schema is not None
@@ -225,6 +257,7 @@ class SemiPDScheduler(Scheduler):
         return self.tp_worker.get_ipc_info()
 
 
+
 class SemiPDStandaloneScheduler:
     def __init__(
         self,
@@ -253,8 +286,13 @@ class SemiPDStandaloneScheduler:
     def get_ipc_info(self):
         return self.tp_worker.get_ipc_info()
 
-    # Remove the custom event_loop method - let it use the inherited one from Scheduler
-    # The base Scheduler class already has proper event_loop_normal and event_loop_overlap implementations
+    def event_loop(self):
+        """
+        保持存活 (event_loop): 进入一个无限 time.sleep(1) 循环，
+        它的唯一目的就是"占着"GPU 显存，确保模型权重不被释放，始终可供其他进程使用。
+        """
+        while True:
+            time.sleep(1)
 
 
 class MemoryCachingContext:
@@ -375,7 +413,7 @@ def run_scheduler_process(
         try:
             logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
             logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
-            ipc_info = ipc_info_queue.get(timeout=300)  # 300 second timeout (5 minutes) for large models
+            ipc_info = ipc_info_queue.get()  # 300 second timeout (5 minutes) for large models
             logger.info(f"✅ Successfully received IPC handles from Decode instance! (type={type(ipc_info)})")
         except Exception as e:
             logger.error(f"❌ Failed to receive IPC handles: {e}")
@@ -419,12 +457,8 @@ def run_scheduler_process(
                 bypass_load_weight,
             )
 
-            if not bypass_load_weight:
-                logger.info(f"🔥 Creating IPC handles for weight and KV cache sharing... (tp_rank={tp_rank}, queue={ipc_info_queue})")
-                ipc_info = scheduler.get_ipc_info()
-                logger.info(f"🔍 Generated IPC info: {type(ipc_info)}")
-                ipc_info_queue.put(ipc_info)
-                logger.info(f"✅ IPC handles created and shared successfully! Queue size after put: {ipc_info_queue.qsize()}")
+            ipc_info = scheduler.get_ipc_info()
+            ipc_info_queue.put(ipc_info)
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
@@ -435,7 +469,6 @@ def run_scheduler_process(
                 port_args,
                 gpu_id,
                 tp_rank,
-                0,  # pp_rank=0 (Semi-PD doesn't use pipeline parallel)
                 dp_rank,
                 bypass_load_weight,
             )
@@ -466,10 +499,10 @@ def run_scheduler_process(
         logger.info(f"Instance role: {instance_role}")
 
         if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
-            logger.info("Scheduler running in overlap mode")
+            logger.debug("Scheduler running in overlap mode")
             scheduler.event_loop_overlap()
         else:
-            logger.info("Scheduler running in normal mode")
+            logger.debug("Scheduler running in normal mode")
             scheduler.event_loop_normal()
 
     except Exception:

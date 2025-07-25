@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
+DEFAULT_FORCE_STREAM_INTERVAL = 50
+
 
 class SchedulerOutputProcessorMixin:
     """
@@ -191,7 +193,7 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
-        self: Scheduler,
+        self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
@@ -244,7 +246,6 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -531,8 +532,10 @@ class SchedulerOutputProcessorMixin:
                     )
                     should_output = len(req.output_ids) % stream_interval == 0
                 else:
-                    # Semi-PD: Always output for non-streaming to ensure proper offset updates
-                    should_output = True
+                    should_output = (
+                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                        and not self.model_config.is_multimodal_gen
+                    )
 
             if should_output:
                 send_token_offset = req.send_token_offset
@@ -546,24 +549,12 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
-                # Semi-PD: Critical debug info for cross-platform issues
-                if len(decode_ids) % 20 == 0:  # Log every 20 tokens to reduce spam
-                    with open('/tmp/semi_pd_debug.log', 'a') as f:
-                        f.write(f"[{req.rid[:8]}] offset:{req.send_decode_id_offset} len:{len(decode_ids)} "
-                               f"multimodal:{self.model_config.is_multimodal_gen} "
-                               f"tokens:{decode_ids[-5:] if len(decode_ids) >= 5 else decode_ids}\n")
+
 
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
                 else:
-                    incremental_ids = decode_ids[req.send_decode_id_offset :]
-                    decode_ids_list.append(incremental_ids)
-
-                    # Log critical token info for debugging cross-platform issues
-                    if len(incremental_ids) > 0:
-                        with open('/tmp/semi_pd_debug.log', 'a') as f:
-                            f.write(f"[{req.rid[:8]}] SEND incremental_tokens:{incremental_ids} "
-                                   f"text_preview:{repr(req.tokenizer.decode(incremental_ids) if req.tokenizer else 'NO_TOKENIZER')}\n")
+                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)

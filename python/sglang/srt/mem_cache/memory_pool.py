@@ -27,7 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import nullcontext
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -35,8 +35,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
 
 logger = logging.getLogger(__name__)
 
@@ -69,14 +71,12 @@ class ReqToTokenPool:
                     (size, max_context_len), dtype=torch.int32, device=device
                 )
         else:
-            # Semi-PD: Skip buffer creation for Prefill instances
+            logger.info("Bypass creating req_to_token")
             self.req_to_token = None
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
-        if self.req_to_token is not None:
-            self.req_to_token[indices] = values
-        # else: Semi-PD bypass mode, skip writing
+        self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -148,7 +148,7 @@ class KVCache(abc.ABC):
     @abc.abstractmethod
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -224,15 +224,12 @@ class MHATokenToKVPool(KVCache):
             logger.info(
                 f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
             )
+        else:
+            logger.info("Bypass creating k_buffer and v_buffer")
 
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
-        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -278,10 +275,8 @@ class MHATokenToKVPool(KVCache):
         del self.v_buffer
 
     def get_kv_size_bytes(self):
-        # Handle bypass_create_buffers case for Semi-PD
-        if not hasattr(self, "k_buffer") or not hasattr(self, "v_buffer"):
-            return 0, 0
-
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
         k_size_bytes = 0
         for k_cache in self.k_buffer:
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
@@ -403,7 +398,7 @@ class MHATokenToKVPool(KVCache):
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -555,28 +550,31 @@ class MLATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.custom_mem_pool
-                else nullcontext()
-            ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+        if not bypass_create_buffers:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.custom_mem_pool
+                    else nullcontext()
+                ):
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
+            kv_size_bytes = self.get_kv_size_bytes()
+            logger.info(
+                f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size_bytes / GB:.2f} GB"
+            )
+        else:
+            logger.info("Bypass creating kv_buffer")
 
         self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -621,7 +619,7 @@ class MLATokenToKVPool(KVCache):
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -638,7 +636,7 @@ class MLATokenToKVPool(KVCache):
 
     def set_mla_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
@@ -765,7 +763,7 @@ class DoubleSparseTokenToKVPool(KVCache):
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
