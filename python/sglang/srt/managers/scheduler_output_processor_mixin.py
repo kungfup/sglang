@@ -20,21 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Semi-PD: Use adaptive interval based on sequence length
-def get_adaptive_stream_interval(output_length):
-    """
-    Adaptive interval to balance performance and memory usage:
-    - Short sequences: larger interval (less frequent calls)
-    - Long sequences: smaller interval (prevent memory buildup)
-    """
-    if output_length < 100:
-        return 200  # Less frequent for short sequences
-    elif output_length < 500:
-        return 100  # Moderate frequency
-    else:
-        return 50   # More frequent for long sequences to prevent memory buildup
-
-DEFAULT_FORCE_STREAM_INTERVAL = 200  # Conservative default
+DEFAULT_FORCE_STREAM_INTERVAL = 1000
 
 
 class SchedulerOutputProcessorMixin:
@@ -544,10 +530,8 @@ class SchedulerOutputProcessorMixin:
                     )
                     should_output = len(req.output_ids) % stream_interval == 0
                 else:
-                    # Semi-PD: Use adaptive interval to prevent memory buildup in long sequences
-                    adaptive_interval = get_adaptive_stream_interval(len(req.output_ids))
                     should_output = (
-                        len(req.output_ids) % adaptive_interval == 0
+                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
                         and not self.model_config.is_multimodal_gen
                     )
 
