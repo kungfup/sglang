@@ -14,6 +14,7 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
+import json
 import logging
 import os
 import signal
@@ -28,11 +29,10 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalDecodeReq,
-    BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     get_zmq_socket,
@@ -61,8 +61,6 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
-    # Offset that's sent to tokenizer for incremental update.
-    sent_offset: int = 0
 
 
 class DetokenizerManager:
@@ -129,7 +127,9 @@ class DetokenizerManager:
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
-            assert len(output) > 0
+            # Semi-PD: Handle empty output gracefully
+            if len(output) == 0:
+                return output
             return output[:-1]
         return output
 
@@ -154,7 +154,7 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids.extend(recv_obj.decode_ids[i])
+                s.decode_ids = recv_obj.decode_ids[i]
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -202,15 +202,13 @@ class DetokenizerManager:
                 else:
                     new_text = find_printable_text(new_text)
 
-            output_str = self.trim_matched_stop(
-                s.decoded_text + new_text,
-                recv_obj.finished_reasons[i],
-                recv_obj.no_stop_trim[i],
+            output_strs.append(
+                self.trim_matched_stop(
+                    s.decoded_text + new_text,
+                    recv_obj.finished_reasons[i],
+                    recv_obj.no_stop_trim[i],
+                )
             )
-            # Incrementally send text.
-            incremental_output = output_str[s.sent_offset :]
-            s.sent_offset = len(output_str)
-            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,
@@ -237,15 +235,7 @@ class DetokenizerManager:
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        outputs = self.tokenizer.detokenize(recv_obj)
-        return BatchMultimodalOut(
-            rids=recv_obj.rids,
-            finished_reasons=recv_obj.finished_reasons,
-            outputs=outputs,
-            prompt_tokens=recv_obj.prompt_tokens,
-            completion_tokens=recv_obj.completion_tokens,
-            cached_tokens=recv_obj.cached_tokens,
-        )
+        raise NotImplementedError()
 
 
 class LimitedCapacityDict(OrderedDict):
@@ -263,7 +253,8 @@ class LimitedCapacityDict(OrderedDict):
 
 def run_detokenizer_process(
     server_args: ServerArgs,
-    port_args: PortArgs,
+    port_args: Union[PortArgs, SemiPDPortArgs],
+    pipe_writer=None,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
@@ -271,9 +262,27 @@ def run_detokenizer_process(
     parent_process = psutil.Process().parent()
 
     try:
+        logger.info("🔧 [DETOKENIZER] Starting DetokenizerManager initialization...")
         manager = DetokenizerManager(server_args, port_args)
+        logger.info("🔧 [DETOKENIZER] DetokenizerManager initialization completed!")
+
+        # Send ready signal to parent process if pipe_writer is provided
+        if pipe_writer:
+            try:
+                logger.info("🔧 [DETOKENIZER] Sending ready signal to parent process...")
+                pipe_writer.send({"status": "ready"})
+                logger.info("🔧 [DETOKENIZER] Ready signal sent successfully!")
+            except Exception as e:
+                logger.error(f"Error sending ready signal: {e}")
+
+        logger.info("🔧 [DETOKENIZER] Starting event loop...")
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        if pipe_writer:
+            try:
+                pipe_writer.send({"status": "error", "error": str(traceback)})
+            except Exception:
+                pass
         parent_process.send_signal(signal.SIGQUIT)

@@ -53,6 +53,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        bypass_create_buffers: bool = False,
     ):
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -62,14 +63,28 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
-            )
+        if not bypass_create_buffers:
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.req_to_token = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+        else:
+            logger.info("Bypass creating req_to_token")
+            self.req_to_token = None
         self.free_slots = list(range(size))
 
-    def write(self, indices, values):
-        self.req_to_token[indices] = values
+    def write(self, req_pool_idx, token_indices=None, values=None):
+        # Semi-PD: Support both old tuple format and new separate parameters
+        if isinstance(req_pool_idx, tuple) and token_indices is not None and values is None:
+            # Old format: write((req_pool_idx, token_indices), values)
+            indices, vals = req_pool_idx, token_indices
+            self.req_to_token[indices] = vals
+        elif token_indices is not None and values is not None:
+            # New format: write(req_pool_idx, token_indices, values)
+            self.req_to_token[req_pool_idx, token_indices] = values
+        else:
+            # Fallback to original format
+            self.req_to_token[req_pool_idx] = token_indices
 
     def available_size(self):
         return len(self.free_slots)
@@ -178,6 +193,7 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        bypass_create_buffers: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -208,16 +224,18 @@ class MHATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        self._create_buffers()
+        if not bypass_create_buffers:
+            self._create_buffers()
+            k_size, v_size = self.get_kv_size_bytes()
+            logger.info(
+                f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+            )
+        else:
+            logger.info("Bypass creating k_buffer and v_buffer")
 
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
-        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -508,6 +526,7 @@ class MLATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        bypass_create_buffers: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -538,28 +557,33 @@ class MLATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.custom_mem_pool
-                else nullcontext()
-            ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+        if not bypass_create_buffers:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.custom_mem_pool
+                    else nullcontext()
+                ):
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
+            kv_size_bytes = 0
+            for kv_cache in self.kv_buffer:
+                kv_size_bytes += np.prod(kv_cache.shape) * kv_cache.dtype.itemsize
+            logger.info(
+                f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size_bytes / GB:.2f} GB"
+            )
+        else:
+            logger.info("Bypass creating kv_buffer")
 
         self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")

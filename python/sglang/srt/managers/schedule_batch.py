@@ -1130,12 +1130,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(
+        self, pre_allocated_req_pool_indices: Optional[List[int]] = None
+    ):
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        # Allocate req slots
+        if pre_allocated_req_pool_indices is None:
+            req_pool_indices = self.alloc_req_slots(bs)
+        else:
+            assert bs == len(pre_allocated_req_pool_indices)
+            req_pool_indices = pre_allocated_req_pool_indices
 
         # Init tensors
         reqs = self.reqs
@@ -1181,7 +1188,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             if pre_len > 0:
                 self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                    req.req_pool_idx, slice(0, pre_len), req.prefix_indices
                 )
 
             # If input_embeds are available, store them
@@ -1313,7 +1320,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt = 0
             for i in range(bs):
                 self.req_to_token_pool.write(
-                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                    req_pool_indices[i],
+                    slice(prefix_lens[i], seq_lens[i]),
                     out_cache_loc[pt : pt + extend_lens[i]],
                 )
                 pt += extend_lens[i]
@@ -1515,7 +1523,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # `forward_batch_speculative_generation` after running draft models.
             return
 
-        if self.sampling_info.penalizer_orchestrator.is_required:
+        # Semi-PD: Prefill process doesn't have sampling_info
+        if self.sampling_info is not None and self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = torch.tensor(
@@ -1568,7 +1577,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
+            self.req_pool_indices, locs, self.out_cache_loc.to(torch.int32)
         )
 
     def filter_batch(
@@ -1624,7 +1633,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # Semi-PD: Prefill process doesn't have sampling_info
+        if self.sampling_info is not None:
+            self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
             self.spec_info.filter_batch(keep_indices_device)
 
@@ -1632,7 +1643,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
+        # Semi-PD: Add null check for sampling_info
+        if self.sampling_info is not None:
+            self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:

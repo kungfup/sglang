@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.semi_pd.utils import InstanceRole, IPCInfo
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -59,6 +60,8 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -89,6 +92,8 @@ class TpModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -149,6 +154,18 @@ class TpModelWorker:
         self.worker = self
 
         self.hicache_layer_transfer_counter = None
+
+    def init_attention_backend(self):
+        self.model_runner.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        self.model_runner.init_cuda_graphs()
+
+    def get_ipc_info(self):
+        return self.model_runner.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        self.model_runner.share_params_from_ipc(ipc_info)
 
     def register_hicache_layer_transfer_counter(self, counter):
         self.hicache_layer_transfer_counter = counter

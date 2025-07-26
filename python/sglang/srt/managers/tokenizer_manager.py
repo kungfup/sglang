@@ -49,6 +49,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.semi_pd.utils import AggregatedSocket
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -113,7 +114,7 @@ from sglang.srt.managers.multimodal_processor import (
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
@@ -168,7 +169,7 @@ class TokenizerManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: Union[PortArgs, SemiPDPortArgs],
     ):
         # Parse args
         self.server_args = server_args
@@ -186,9 +187,22 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+
+        if server_args.enable_semi_pd and server_args.dp_size == 1:
+            assert isinstance(port_args, SemiPDPortArgs)
+            self.send_to_p_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
+            )
+            self.send_to_d_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
+            )
+            self.send_to_scheduler = AggregatedSocket(
+                [self.send_to_d_scheduler, self.send_to_p_scheduler]
+            )
+        else:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -274,42 +288,47 @@ class TokenizerManager:
             )
 
         # Communicators
+        # Semi-PD: Calculate correct fan_out for P and D instances
+        fan_out = server_args.dp_size
+        if server_args.enable_semi_pd:
+            fan_out = 2 * server_args.dp_size  # P and D
+
         self.init_weights_update_group_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.update_weights_from_distributed_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.update_weights_from_tensor_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.get_weights_by_name_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.slow_down_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.flush_cache_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.profile_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
         self.expert_distribution_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, fan_out
         )
 
         self._result_dispatcher = TypeBasedDispatcher(
@@ -854,10 +873,25 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def _execute_profile(self, req: ProfileReq):
-        result = (await self.profile_communicator(req))[0]
-        if not result.success:
-            raise RuntimeError(result.message)
-        return result
+        """
+        Semi-PD:
+        - aggregate the responses from P and D instances
+        - check all results for failures
+        """
+        results = await self.profile_communicator(req)
+
+        # Semi-PD: Check all results for failures
+        message = None
+        for result in results:
+            if not result.success:
+                message = result.message
+                break
+
+        if message is not None:
+            raise RuntimeError(message)
+
+        # Return the first successful result
+        return results[0]
 
     async def start_expert_distribution_record(self):
         self.auto_create_handle_loop()

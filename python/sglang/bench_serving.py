@@ -227,7 +227,6 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
-
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
@@ -526,6 +525,12 @@ def get_dataset(args, tokenizer):
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
+        )
+    elif args.dataset_name == "math_500":
+        input_requests = sample_math_500_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -870,6 +875,23 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def sample_math_500_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int, None]]:
+    filtered_dataset: List[Tuple[str, int, int]] = []
+    with open(dataset_path, encoding='utf-8') as f:
+        for line in f.readlines():
+            data = json.loads(line)
+            problem = tokenizer.encode(data["problem"])
+            solution = tokenizer(data["solution"]).input_ids
+            filtered_dataset.append((data["problem"], len(problem), len(solution)))
+    sampled_requests = filtered_dataset[0:num_requests]
+
+    return sampled_requests
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1186,6 +1208,8 @@ async def benchmark(
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
+    benchmark_name: str = "",
+    iter: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1673,7 +1697,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "math_500"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(

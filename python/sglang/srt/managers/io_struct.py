@@ -22,6 +22,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import numpy as np
+from numpy import typing as npt
+
 from sglang.srt.mm_utils import has_valid_data
 
 # handle serialization of Image for pydantic
@@ -468,6 +471,8 @@ class TokenizedGenerateReqInput:
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    is_retracted: bool = False
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
@@ -994,3 +999,28 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class GetNextPrefillBatchInput:
+    rids: List[str]
+
+
+@dataclass
+class GetNextPrefillBatchOutput:
+    rids: List[str]
+    chunked_rid: Optional[str]
+    req_pool_indices: List[int]
+    prefix_lens: List[int]
+    extend_input_lens: List[int]
+
+
+@dataclass
+class BatchRetractReqInput:
+    rids: List[str]
+
+
+@dataclass
+class BatchProcessPrefillResultReq:
+    next_token_ids: List[int]
+    next_token_logits: npt.NDArray[np.float32]

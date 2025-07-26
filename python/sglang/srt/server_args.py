@@ -235,6 +235,11 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
+    # For Semi-PD (Semi-Prefill-Decode) disaggregation
+    enable_semi_pd: bool = False
+    semi_pd_prefill_sm_percentage: int = 80   # Prefill uses 80% SM (consistent with original Semi-PD)
+    semi_pd_decode_sm_percentage: int = 100   # Decode uses 100% SM (consistent with original Semi-PD)
+
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
@@ -313,6 +318,13 @@ class ServerArgs:
                 self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
             else:
                 self.mem_fraction_static = 0.88
+
+        # Semi-PD: a little bit more static memory since the activation cost is doubled.
+        if self.enable_semi_pd:
+            self.mem_fraction_static = self.mem_fraction_static * 0.9
+        logger.info(
+            f"Set mem_fraction_static to {self.mem_fraction_static} according to your configuration."
+        )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -538,6 +550,42 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+
+        # Semi-PD disaggregation validation
+        if self.enable_semi_pd:
+            # Conflict check with official disaggregation
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "Semi-PD and official disaggregation cannot be enabled simultaneously. "
+                    f"Current disaggregation_mode: {self.disaggregation_mode}"
+                )
+
+            # Semi-PD specific configurations
+            if not self.disable_radix_cache:
+                self.disable_radix_cache = True
+                logger.warning(
+                    "Semi-PD is enabled. Radix cache is disabled to avoid memory inconsistency between P and D instances."
+                )
+
+            # Validate SM percentages
+            if not (1 <= self.semi_pd_prefill_sm_percentage <= 100):
+                raise ValueError(f"semi_pd_prefill_sm_percentage must be between 1-100, got {self.semi_pd_prefill_sm_percentage}")
+
+            if not (1 <= self.semi_pd_decode_sm_percentage <= 100):
+                raise ValueError(f"semi_pd_decode_sm_percentage must be between 1-100, got {self.semi_pd_decode_sm_percentage}")
+
+            # Disable custom all reduce for Semi-PD
+            if not self.disable_custom_all_reduce:
+                logger.warning(
+                    "Semi-PD is enabled. Disable custom all reduce to prevent hanging."
+                )
+                self.disable_custom_all_reduce = True
+
+            # Semi-PD doesn't support DP attention yet
+            if self.enable_dp_attention:
+                raise ValueError("Semi-PD and DP attention cannot be enabled at the same time yet.")
+
+            logger.info(f"Semi-PD enabled with Prefill SM: {self.semi_pd_prefill_sm_percentage}%, Decode SM: {self.semi_pd_decode_sm_percentage}%")
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1593,6 +1641,26 @@ class ServerArgs:
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
+
+        # Semi-PD disaggregation
+        parser.add_argument(
+            "--enable-semi-pd",
+            action="store_true",
+            help="Enable Semi-PD (Semi-Prefill-Decode) disaggregation. This runs Prefill and Decode in separate processes on the same GPU using CUDA MPS for resource isolation.",
+        )
+        parser.add_argument(
+            "--semi-pd-prefill-sm-percentage",
+            type=int,
+            default=ServerArgs.semi_pd_prefill_sm_percentage,
+            help="Percentage of GPU SMs allocated to Prefill instance in Semi-PD mode. Default is 80%%.",
+        )
+        parser.add_argument(
+            "--semi-pd-decode-sm-percentage",
+            type=int,
+            default=ServerArgs.semi_pd_decode_sm_percentage,
+            help="Percentage of GPU SMs allocated to Decode instance in Semi-PD mode. Default is 100%%.",
+        )
+
         parser.add_argument(
             "--custom-weight-loader",
             type=str,
@@ -1675,6 +1743,95 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+
+
+@dataclasses.dataclass
+class SemiPDPortArgs:
+    """Port arguments for Semi-PD (Semi-Prefill-Decode) disaggregation"""
+    tokenizer_ipc_name: str
+    # For standalone scheduler
+    s_scheduler_input_ipc_name: str
+    # For prefill scheduler
+    p_scheduler_input_ipc_name: str
+    # For decode scheduler
+    d_scheduler_input_ipc_name: str
+    detokenizer_ipc_name: str
+
+    bridge_ipc_name: str
+    rpc_ipc_name: str  # Add missing rpc_ipc_name for Semi-PD
+
+    s_nccl_port: int
+    p_nccl_port: int
+    d_nccl_port: int
+
+    @staticmethod
+    def get_nccl_port(server_args: ServerArgs) -> int:
+        # Use higher port range to avoid conflicts
+        port = 40000 + random.randint(1000, 9000)
+        while True:
+            if is_port_available(port):
+                break
+            if port < 50000:
+                port += 42
+            else:
+                port = 40000 + random.randint(1000, 9000)
+        return port
+
+    @staticmethod
+    def init_new(server_args, dp_rank: Optional[int] = None) -> "SemiPDPortArgs":
+        s_port = SemiPDPortArgs.get_nccl_port(server_args)
+        p_port = SemiPDPortArgs.get_nccl_port(server_args)
+        d_port = SemiPDPortArgs.get_nccl_port(server_args)
+
+        if not server_args.enable_dp_attention:
+            # Create unified IPC addresses - all processes use the same addresses
+            # Generate unique prefix based on server port to avoid conflicts
+            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
+
+            return SemiPDPortArgs(
+                tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
+                s_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_s_scheduler",
+                p_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_p_scheduler",
+                d_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_d_scheduler",
+                detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
+                bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
+                rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
+                s_nccl_port=s_port,
+                p_nccl_port=p_port,
+                d_nccl_port=d_port,
+            )
+        else:
+            if server_args.nnodes > 1:
+                raise NotImplementedError("Multi-node SemiPD is not supported yet")
+
+            if server_args.dist_init_addr is None:
+                dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            else:
+                dist_init_addr = server_args.dist_init_addr.split(":")
+
+            dist_init_host = dist_init_addr[0]
+            port_base = int(dist_init_addr[1])
+
+            if dp_rank is None:
+                scheduler_input_port = (
+                    port_base + 2 + 1
+                )  # TokenizerManager to DataParallelController
+            else:
+                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = port_base + 2 + 1 + (dp_rank + 1) * 4
+
+            return SemiPDPortArgs(
+                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                s_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                p_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 1}",
+                d_scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 2}",
+                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                bridge_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 3}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port + 4}",
+                s_nccl_port=s_port,
+                p_nccl_port=p_port,
+                d_nccl_port=d_port,
+            )
 
 
 @dataclasses.dataclass

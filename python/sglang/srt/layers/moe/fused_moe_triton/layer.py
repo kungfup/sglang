@@ -372,7 +372,8 @@ class FusedMoE(torch.nn.Module):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
-        self.correction_bias = correction_bias
+        # Semi-PD: For sharing correction_bias between P & D instances
+        self.register_buffer("correction_bias", correction_bias, persistent=False)
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.use_presharded_weights = use_presharded_weights

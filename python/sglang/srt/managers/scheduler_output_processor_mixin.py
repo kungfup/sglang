@@ -20,13 +20,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FORCE_STREAM_INTERVAL = 50
+# Semi-PD: Use adaptive interval based on sequence length
+def get_adaptive_stream_interval(output_length):
+    """
+    Adaptive interval to balance performance and memory usage:
+    - Short sequences: larger interval (less frequent calls)
+    - Long sequences: smaller interval (prevent memory buildup)
+    """
+    if output_length < 100:
+        return 200  # Less frequent for short sequences
+    elif output_length < 500:
+        return 100  # Moderate frequency
+    else:
+        return 50   # More frequent for long sequences to prevent memory buildup
+
+DEFAULT_FORCE_STREAM_INTERVAL = 200  # Conservative default
 
 
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
+
+    Semi-PD changes:
+    - Disable prefill overlap mode.
+    - Do next_token_ids.tolist() only when necessary.
     """
 
     def process_batch_result_prefill(
@@ -50,13 +68,16 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            if self.enable_overlap:
+            # Semi-PD
+            if self.enable_overlap and not self.server_args.enable_semi_pd:
                 logits_output, next_token_ids, _ = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
+                # Semi-PD
+                if not isinstance(next_token_ids, list):
+                    next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
                         logits_output.next_token_logprobs = (
@@ -523,12 +544,15 @@ class SchedulerOutputProcessorMixin:
                     )
                     should_output = len(req.output_ids) % stream_interval == 0
                 else:
+                    # Semi-PD: Use adaptive interval to prevent memory buildup in long sequences
+                    adaptive_interval = get_adaptive_stream_interval(len(req.output_ids))
                     should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
+                        len(req.output_ids) % adaptive_interval == 0
                         and not self.model_config.is_multimodal_gen
                     )
 
             if should_output:
+
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset

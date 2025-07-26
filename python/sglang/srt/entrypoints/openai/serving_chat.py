@@ -314,18 +314,27 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
 
+        # Set default max_tokens if not provided to prevent infinite generation
+        max_tokens = request.max_tokens or request.max_completion_tokens
+        if max_tokens is None:
+            max_tokens = 512
+
+        # Use original request parameters
+        repetition_penalty = request.repetition_penalty
+        top_p = request.top_p
+
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
+            "max_new_tokens": max_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
-            "top_p": request.top_p,
+            "top_p": top_p,  # Use processed value
             "top_k": request.top_k,
             "min_p": request.min_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
+            "repetition_penalty": repetition_penalty,  # Use processed value
             "regex": request.regex,
             "ebnf": request.ebnf,
             "n": request.n,

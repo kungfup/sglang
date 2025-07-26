@@ -21,11 +21,19 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from functools import reduce
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch import nn
 
+from sglang.semi_pd.utils import (
+    InstanceRole,
+    IPCInfo,
+    convert_ipc_handle_to_tensor,
+    get_ipc_handle,
+)
 from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -156,6 +164,8 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Parse args
         self.model_config = model_config
@@ -185,6 +195,8 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.bypass_load_weight = bypass_load_weight
+        self.instance_role = instance_role
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -225,6 +237,11 @@ class ModelRunner:
         )
 
     def initialize(self, min_per_gpu_memory: float):
+        """
+        Semi-PD:
+        - skip attn and cuda graph init for standalone instances
+        - delay attn and cuda graph init for P & D instances
+        """
         server_args = self.server_args
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -294,12 +311,15 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+
+        self.cuda_graph_runner = None
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
-            self.init_cuda_graphs()
+            if not self.server_args.enable_semi_pd:
+                # Semi-PD
+                self.init_attention_backend()
+                self.init_cuda_graphs()
         else:
-            self.cuda_graph_runner = None
             self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
@@ -522,11 +542,279 @@ class ModelRunner:
         )
         return min_per_gpu_memory
 
-    def load_model(self):
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+    def get_ipc_info(self) -> IPCInfo:
+        def check_duplicate_handle(handle_to_name_, handle_, name_):
+            hashed = tuple(handle_[0]), handle_[1]
+            if handle_to_name_.get(hashed, None) is not None and handle_ != "BYPASS":
+                logger.warning(
+                    f"Duplicate handle found, {handle_to_name_[hashed]} and {name_}"
+                )
+            handle_to_name_[hashed] = name_
+
+        assert not self.bypass_load_weight
+
+        handle_to_name = {}
+        tensor_info = {}
+        weight_handles = {}
+        register_buffer_handles = {}
+
+        # Get Parameter Handles
+        source_params = dict(self.model.named_parameters())
+        for name, _ in self.model.named_parameters():
+            # Get the path to the parameter
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+            # Create a parameter that shares storage with source parameter
+            source_param = source_params[name]
+            param_tensor = source_param.view_as(source_param)
+
+            # Bypass empty parameter
+            if param_tensor.numel() == 0:
+                ipc_handle = "BYPASS"
+            else:
+                ipc_handle = get_ipc_handle(param_tensor)
+            check_duplicate_handle(handle_to_name, ipc_handle, name)
+
+            weight_handles[name] = ipc_handle
+            tensor_info[name] = (
+                param_tensor.shape,
+                param_tensor.dtype,
+                param_tensor.device,
+            )
+
+        # Get Non-Parameter Buffers, eg. cos_sin_cache
+        source_buffers = dict(self.model.named_buffers())
+        for name, _ in self.model.named_buffers():
+            # Get the path to the parameter
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+
+            # Create a parameter that shares storage with source parameter
+            source_buffer = source_buffers[name]
+            if source_buffer.numel() == 0:
+                tensor_info[name] = (None, None, None)
+                continue
+            buffer_tensor = source_buffer.view_as(source_buffer)
+
+            # Bypass empty parameter
+            if buffer_tensor.numel() == 0:
+                ipc_handle = "BYPASS"
+            else:
+                ipc_handle = get_ipc_handle(buffer_tensor)
+            check_duplicate_handle(handle_to_name, ipc_handle, name)
+
+            register_buffer_handles[name] = ipc_handle
+            tensor_info[name] = (
+                buffer_tensor.shape,
+                buffer_tensor.dtype,
+                buffer_tensor.device,
+            )
+
+        # Get KV Cache Handles
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        if isinstance(self.token_to_kv_pool, MHATokenToKVPool):
+            k_caches = self.token_to_kv_pool.k_buffer
+            v_caches = self.token_to_kv_pool.v_buffer
+            k_cache_handles = [get_ipc_handle(k_cache) for k_cache in k_caches]
+            v_cache_handles = [get_ipc_handle(v_cache) for v_cache in v_caches]
+
+            for i, (k_cache_handle, v_cache_handle) in enumerate(
+                zip(k_cache_handles, v_cache_handles)
+            ):
+                check_duplicate_handle(handle_to_name, k_cache_handle, f"k_cache_{i}")
+                check_duplicate_handle(handle_to_name, v_cache_handle, f"v_cache_{i}")
+
+            kvcache_info = {
+                "cache_shape": k_caches[0].shape,
+                "cache_dtype": k_caches[0].dtype,
+                "cache_device": k_caches[0].device,
+            }
+            kv_cache_handles = [k_cache_handles, v_cache_handles]
+        elif isinstance(self.token_to_kv_pool, MLATokenToKVPool):
+            kv_caches = self.token_to_kv_pool.kv_buffer
+            kv_cache_handles = [get_ipc_handle(kv_cache) for kv_cache in kv_caches]
+            for i, kv_cache_handle in enumerate(kv_cache_handles):
+                check_duplicate_handle(handle_to_name, kv_cache_handle, f"kv_cache_{i}")
+            kvcache_info = {
+                "cache_shape": kv_caches[0].shape,
+                "cache_dtype": kv_caches[0].dtype,
+                "cache_device": kv_caches[0].device,
+            }
+        else:
+            raise ValueError(
+                f"Unsupported token to kv pool type: {type(self.token_to_kv_pool)}"
+            )
+
+        # Get ReqToToken Handles
+        req_to_token_tensor = self.req_to_token_pool.req_to_token
+        req_to_token_handles = [get_ipc_handle(req_to_token_tensor)]
+        req_to_token_info = {
+            "req_to_token_shape": req_to_token_tensor.shape,
+            "req_to_token_dtype": req_to_token_tensor.dtype,
+            "req_to_token_device": req_to_token_tensor.device,
+        }
+
+        return IPCInfo(
+            params_info=tensor_info,
+            weight_handles=weight_handles,
+            register_buffer_handles=register_buffer_handles,
+            kv_cache_handles=kv_cache_handles,
+            kvcache_info=kvcache_info,
+            req_to_token_handle=req_to_token_handles,
+            req_to_token_info=req_to_token_info,
         )
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        # Reconstruct parameters from IPC handles
+        logger.info("🔍 [ORIGINAL SEMI-PD] Starting parameter sharing from IPC...")
+
+        for name, _ in self.model.named_parameters():
+            # Get the path to the parameter
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+
+            # Get the parameter name (last part of the path)
+            param_name = path[-1]
+
+            share_param_handle = ipc_info.weight_handles.get(name, None)
+            shape, dtype, device = ipc_info.params_info[name]
+            size = reduce(lambda x, y: x * y, shape)
+
+            assert (
+                share_param_handle is not None
+            ), f"Parameter {name} not found in meta_info"
+
+            try:
+                if shape == torch.Size([0]):
+                    share_param_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    share_param_tensor = convert_ipc_handle_to_tensor(
+                        share_param_handle, size, dtype, device
+                    ).view(shape)
+            except Exception as e:
+                raise NotImplementedError(f"Parameter {name, size, dtype, device} is not supported in Semi-PD")
+
+            new_param = nn.Parameter(share_param_tensor, requires_grad=False)
+            setattr(module, param_name, new_param)
+
+        # Reconstruct registered buffers from IPC handles
+        for name, _ in self.model.named_buffers():
+            # Get the path to the parameter
+            path = name.split(".")
+
+            # Navigate to the parent module
+            module = self.model
+            for p in path[:-1]:
+                if p.isdigit():
+                    module = module[int(p)]
+                else:
+                    module = getattr(module, p)
+
+            # Get the parameter name (last part of the path)
+            buffer_name = path[-1]
+
+            share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
+            shape, dtype, device = ipc_info.params_info[name]
+
+            if shape is None:
+                continue
+            assert (
+                share_buffer_handle is not None
+            ), f"Buffer {name} not found in meta_info"
+
+            size = reduce(lambda x, y: x * y, shape)
+            if shape == torch.Size([0]):
+                share_buffer_tensor = torch.empty(0, dtype=dtype, device=device)
+            else:
+                share_buffer_tensor = convert_ipc_handle_to_tensor(
+                    share_buffer_handle, size, dtype, device
+                ).view(shape)
+
+            module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+
+        # Reconstruct KV Cache from IPC handles
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        if isinstance(self.token_to_kv_pool, MHATokenToKVPool):
+            k_cache_handles, v_cache_handles = ipc_info.kv_cache_handles
+            cache_shape = ipc_info.kvcache_info["cache_shape"]
+            cache_dtype = ipc_info.kvcache_info["cache_dtype"]
+            cache_device = ipc_info.kvcache_info["cache_device"]
+
+            k_caches = []
+            v_caches = []
+            for k_cache_handle, v_cache_handle in zip(k_cache_handles, v_cache_handles):
+                size = reduce(lambda x, y: x * y, cache_shape)
+                k_cache = convert_ipc_handle_to_tensor(
+                    k_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                v_cache = convert_ipc_handle_to_tensor(
+                    v_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                k_caches.append(k_cache)
+                v_caches.append(v_cache)
+
+            self.token_to_kv_pool.k_buffer = k_caches
+            self.token_to_kv_pool.v_buffer = v_caches
+        elif isinstance(self.token_to_kv_pool, MLATokenToKVPool):
+            kv_cache_handles = ipc_info.kv_cache_handles
+            cache_shape = ipc_info.kvcache_info["cache_shape"]
+            cache_dtype = ipc_info.kvcache_info["cache_dtype"]
+            cache_device = ipc_info.kvcache_info["cache_device"]
+
+            kv_caches = []
+            for kv_cache_handle in kv_cache_handles:
+                size = reduce(lambda x, y: x * y, cache_shape)
+                kv_cache = convert_ipc_handle_to_tensor(
+                    kv_cache_handle, size, cache_dtype, cache_device
+                ).view(cache_shape)
+                kv_caches.append(kv_cache)
+
+            self.token_to_kv_pool.kv_buffer = kv_caches
+
+        # Reconstruct ReqToToken from IPC handles
+        req_to_token_handle = ipc_info.req_to_token_handle[0]
+        req_to_token_shape = ipc_info.req_to_token_info["req_to_token_shape"]
+        req_to_token_dtype = ipc_info.req_to_token_info["req_to_token_dtype"]
+        req_to_token_device = ipc_info.req_to_token_info["req_to_token_device"]
+
+        size = reduce(lambda x, y: x * y, req_to_token_shape)
+        req_to_token_tensor = convert_ipc_handle_to_tensor(
+            req_to_token_handle, size, req_to_token_dtype, req_to_token_device
+        ).view(req_to_token_shape)
+
+        self.req_to_token_pool.req_to_token = req_to_token_tensor
+
+        logger.info("🔍 [ORIGINAL SEMI-PD] Parameter sharing from IPC completed")
+
+    def load_model(self):
+        if not self.bypass_load_weight:
+            before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            )
+        else:
+            logger.info("Bypass loading model weights")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
@@ -557,11 +845,24 @@ class ModelRunner:
         monkey_patch_isinstance_for_vllm_base_layer()
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+            device_config = (
+                DeviceConfig(self.device)
+                if not self.bypass_load_weight
+                else DeviceConfig("meta")
+            )
+
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=device_config,
+                bypass_load_weight=self.bypass_load_weight,
             )
+
+            # Debug: Confirm model was created
+            if hasattr(self, 'model') and self.model is not None:
+                logger.info(f"Model created successfully: {type(self.model).__name__}")
+            else:
+                logger.error("Model creation failed!")
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -596,14 +897,15 @@ class ModelRunner:
         )
         self.dtype = self.model_config.dtype
 
-        after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Load weight end. "
-            f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
-            f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
-        )
+        if not self.bypass_load_weight:
+            after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Load weight end. "
+                f"type={type(self.model).__name__}, "
+                f"dtype={self.dtype}, "
+                f"avail mem={after_avail_memory:.2f} GB, "
+                f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
+            )
 
         # Handle the case where some ranks do not finish loading.
         try:

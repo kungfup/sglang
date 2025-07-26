@@ -10,7 +10,11 @@ class DeviceConfig:
     device: Optional[torch.device]
 
     def __init__(self, device: str = "cuda") -> None:
-        if device in ["cuda", "xpu", "hpu", "cpu", "npu"]:
+        """
+        Semi-PD:
+        - Allow meta device for P & D instances.
+        """
+        if device in ["cuda", "xpu", "hpu", "cpu", "npu", "meta"]:
             self.device_type = device
         else:
             raise RuntimeError(f"Not supported device type: {device}")

@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 import psutil
 import torch
 
+from sglang.semi_pd.utils import InstanceRole, IPCInfo
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -59,10 +60,19 @@ class TpModelWorkerClient:
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -89,6 +99,18 @@ class TpModelWorkerClient:
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
         self.hicache_layer_transfer_counter = None
+
+    def init_attention_backend(self):
+        self.worker.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        self.worker.init_cuda_graphs()
+
+    def get_ipc_info(self):
+        return self.worker.get_ipc_info()
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        self.worker.share_params_from_ipc(ipc_info)
 
     def register_hicache_layer_transfer_counter(self, counter):
         self.hicache_layer_transfer_counter = counter

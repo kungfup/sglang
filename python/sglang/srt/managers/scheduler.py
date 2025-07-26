@@ -34,6 +34,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.semi_pd.utils import InstanceRole, IPCInfo
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
@@ -70,6 +71,7 @@ from sglang.srt.managers.expert_distribution import (
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchProcessPrefillResultReq,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -77,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetNextPrefillBatchInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     HealthCheckOutput,
@@ -132,7 +135,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
@@ -213,11 +216,13 @@ class Scheduler(
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: Union[PortArgs, SemiPDPortArgs],
         gpu_id: int,
         tp_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        bypass_load_weight: bool = False,
+        instance_role: InstanceRole = InstanceRole.OTHER,
     ):
         # Parse args
         self.server_args = server_args
@@ -255,9 +260,29 @@ class Scheduler(
         self.idle_sleeper = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
+            if self.server_args.enable_semi_pd:
+                assert isinstance(port_args, SemiPDPortArgs)
+                if instance_role == InstanceRole.PREFILL:
+                    logger.debug(
+                        f"bind to p_scheduler_input_ipc_name: {port_args.p_scheduler_input_ipc_name}"
+                    )
+                    self.recv_from_tokenizer = get_zmq_socket(
+                        context, zmq.PULL, port_args.p_scheduler_input_ipc_name, True
+                    )
+                elif instance_role == InstanceRole.DECODE:
+                    logger.debug(
+                        f"bind to d_scheduler_input_ipc_name: {port_args.d_scheduler_input_ipc_name}"
+                    )
+                    self.recv_from_tokenizer = get_zmq_socket(
+                        context, zmq.PULL, port_args.d_scheduler_input_ipc_name, True
+                    )
+                else:
+                    raise ValueError(f"Invalid instance role: {instance_role}")
+            else:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -307,10 +332,27 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
-            TpWorkerClass = TpModelWorkerClient
+        if self.server_args.enable_semi_pd:
+            if self.enable_overlap and instance_role == InstanceRole.DECODE:
+                TpWorkerClass = TpModelWorkerClient
+            else:
+                TpWorkerClass = TpModelWorker
         else:
-            TpWorkerClass = TpModelWorker
+            TpWorkerClass = (
+                TpModelWorkerClient if self.enable_overlap else TpModelWorker
+            )
+
+        # NCCL port
+        if self.server_args.enable_semi_pd:
+            assert isinstance(port_args, SemiPDPortArgs)
+            if instance_role == InstanceRole.PREFILL:
+                nccl_port = port_args.p_nccl_port
+            elif instance_role == InstanceRole.DECODE:
+                nccl_port = port_args.d_nccl_port
+            else:
+                raise ValueError(f"Invalid instance role: {instance_role}")
+        else:
+            nccl_port = port_args.nccl_port
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
@@ -318,11 +360,17 @@ class Scheduler(
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
+            nccl_port=nccl_port,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
+            assert (
+                not server_args.enable_semi_pd
+            ), "EAGLE is not supported in semi-PD mode"
+
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
@@ -718,6 +766,15 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+    def init_attention_backend(self):
+        self.tp_worker.init_attention_backend()
+
+    def init_cuda_graphs(self):
+        self.tp_worker.init_cuda_graphs()
+
+    def share_params_from_ipc(self, ipc_info: IPCInfo):
+        self.tp_worker.share_params_from_ipc(ipc_info)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -958,14 +1015,26 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            GetNextPrefillBatchInput,
+                            BatchProcessPrefillResultReq,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            GetNextPrefillBatchInput,
+                            BatchProcessPrefillResultReq,
+                        ),
                     )
                 ]
             else:
@@ -1355,6 +1424,10 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
+        # Semi-PD: Skip memory leak detection in Semi-PD mode
+        if self.server_args.enable_semi_pd:
+            return
+
         available_size = (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
@@ -1686,6 +1759,31 @@ class Scheduler(
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+
+                    # DEBUG: Check logits output for Semi-PD debugging
+                    if hasattr(self, 'instance_role') and logits_output is not None:
+                        try:
+                            import torch
+                            logits = logits_output.next_token_logits
+                            if logits is not None and logits.numel() > 0:
+                                # Check logits statistics
+                                logits_mean = torch.mean(logits).item()
+                                logits_std = torch.std(logits).item()
+                                logits_min = torch.min(logits).item()
+                                logits_max = torch.max(logits).item()
+                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: logits stats: mean={logits_mean:.6f}, std={logits_std:.6f}, min={logits_min:.6f}, max={logits_max:.6f}")
+
+                                # Check top-5 logits
+                                top_logits, top_indices = torch.topk(logits[0], k=5)
+                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 logits = {top_logits.tolist()}")
+                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 indices = {top_indices.tolist()}")
+
+                                # Check specific token logits
+                                if logits.shape[1] > 562:
+                                    token_562_logit = logits[0, 562].item()
+                                    logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: token 562 logit value = {token_562_logit}")
+                        except Exception as e:
+                            logger.error(f"[ORIGINAL_SEMI_PD] ❌ Failed to check logits: {e}")
                 else:
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
