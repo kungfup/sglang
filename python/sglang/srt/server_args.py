@@ -337,6 +337,14 @@ class ServerArgs:
                     self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 4096
+
+        # Semi-PD: reduce chunked prefill size for dual-instance architecture
+        if self.enable_semi_pd:
+            self.chunked_prefill_size = min(self.chunked_prefill_size, 2048)
+            logger.info(
+                f"Semi-PD: Reduced chunked_prefill_size to {self.chunked_prefill_size} for dual-instance memory management."
+            )
+
         assert self.chunked_prefill_size % self.page_size == 0
 
         # Set cuda graph max batch size

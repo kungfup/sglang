@@ -276,8 +276,8 @@ class SemiPDStandaloneScheduler:
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
-            bypass_load_weight=False,
-            instance_role=InstanceRole.OTHER,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
         )
 
         self.max_total_num_tokens = self.tp_worker.max_total_num_tokens

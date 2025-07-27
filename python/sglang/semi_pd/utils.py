@@ -95,7 +95,7 @@ def get_ipc_handle(tensor: torch.Tensor):
         handle,
         storage_size_bytes,  # size(in bytes) of the storage
         storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
-    ) = tensor.storage()._share_cuda_()[:4]
+    ) = tensor.untyped_storage()._share_cuda_()[:4]
     assert storage_size_bytes == tensor.numel() * tensor.element_size()
 
     return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
