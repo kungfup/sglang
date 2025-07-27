@@ -1276,14 +1276,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 out_cache_loc = []
                 for req, req_pool_idx in zip(self.reqs, req_pool_indices):
                     pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-                    logger.info(f"🔍 [PREFILL] req {req.rid}: pre_len={pre_len}, seq_len={seq_len}, fill_ids_len={len(req.fill_ids)}, origin_input_ids_len={len(req.origin_input_ids)}, output_ids_len={len(req.output_ids)}")
-                    logger.info(f"🔍 [PREFILL] req {req.rid}: req_pool_idx={req_pool_idx}, slice=[{pre_len}:{seq_len}]")
                     out_cache_loc.append(
                         self.req_to_token_pool.req_to_token[
                             req_pool_idx, pre_len:seq_len
                         ]
                     )
-                logger.info(f"🔍 [PREFILL] Total out_cache_loc length: {sum(len(loc) for loc in out_cache_loc)}")
                 out_cache_loc = torch.cat(out_cache_loc).to(
                     self.device, dtype=torch.int32, non_blocking=True
                 )
