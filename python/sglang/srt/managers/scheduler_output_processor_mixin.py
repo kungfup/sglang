@@ -548,6 +548,8 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
+
+
                 if self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
                 else:
@@ -652,8 +654,11 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
-            if self.model_config.is_multimodal_gen:
-                return
+            # CRITICAL FIX: Don't skip detokenizer for multimodal models
+            # The original code skipped detokenizer for VL models, causing content=None
+            # We need detokenizer to convert tokens to text for proper responses
+            # if self.model_config.is_multimodal_gen:
+            #     return
 
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(

@@ -156,15 +156,19 @@ class TpModelWorker:
         self.hicache_layer_transfer_counter = None
 
     def init_attention_backend(self):
+        """Initialize attention backend for Semi-PD delayed initialization."""
         self.model_runner.init_attention_backend()
 
     def init_cuda_graphs(self):
+        """Initialize CUDA graphs for Semi-PD delayed initialization."""
         self.model_runner.init_cuda_graphs()
 
     def get_ipc_info(self):
+        """Get IPC info for Semi-PD parameter sharing."""
         return self.model_runner.get_ipc_info()
 
     def share_params_from_ipc(self, ipc_info: IPCInfo):
+        """Share parameters from IPC for Semi-PD."""
         self.model_runner.share_params_from_ipc(ipc_info)
 
     def register_hicache_layer_transfer_counter(self, counter):
