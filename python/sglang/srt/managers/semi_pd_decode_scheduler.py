@@ -360,7 +360,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         else:
             # 🔧 CRITICAL: D-Scheduler预分配KV Cache资源并传递给P-Scheduler
             approved_rids = [r.rid for r in batch.reqs]
-            logger.info(f"[DECODE] 🧠 D-Scheduler approved {len(approved_rids)} requests: {approved_rids}")
 
             # 确保所有资源信息都正确传递
             req_pool_indices = [r.req_pool_idx for r in batch.reqs]
