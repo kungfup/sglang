@@ -6,31 +6,9 @@ from typing import List
 import torch
 import zmq
 
-# Try to import semi_pd_ipc, but handle failure gracefully
-try:
-    import semi_pd_ipc
-    SEMI_PD_IPC_AVAILABLE = True
-    print("✅ [V0.4.8] Semi-PD IPC extension loaded successfully")
-except ImportError as e:
-    SEMI_PD_IPC_AVAILABLE = False
-    print(f"❌ [V0.4.8] Semi-PD IPC extension not available: {e}")
-    print("🔧 [V0.4.8] Semi-PD will not work without proper CUDA IPC support")
-
-    # Create a placeholder that will raise meaningful errors
-    class SemiPdIpcNotAvailable:
-        @staticmethod
-        def get_ipc_handle(tensor):
-            raise RuntimeError("semi_pd_ipc extension not available - cannot create IPC handles")
-
-        @staticmethod
-        def convert_ipc_handle_to_tensor(ipc_handle, size, dtype_str, device):
-            raise RuntimeError("semi_pd_ipc extension not available - cannot convert IPC handles")
-
-        @staticmethod
-        def get_device_sm_count(device_id):
-            raise RuntimeError("semi_pd_ipc extension not available - cannot get SM count")
-
-    semi_pd_ipc = SemiPdIpcNotAvailable()
+# Import semi_pd_ipc - REQUIRED for Semi-PD functionality
+import semi_pd_ipc
+print("✅ [V0.4.8] Semi-PD IPC extension loaded successfully")
 
 PREFILL_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_PREFILL_SM_PERCENTILE", 80))
 DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("SEMI_PD_DECODE_SM_PERCENTILE", 100))

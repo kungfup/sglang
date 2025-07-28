@@ -1024,3 +1024,6 @@ class BatchRetractReqInput:
 class BatchProcessPrefillResultReq:
     next_token_ids: List[int]
     next_token_logits: npt.NDArray[np.float32]
+    # Semi-PD: Add multimodal data support for Prefill->Decode communication
+    mm_data: Optional[dict] = None  # Multimodal data (embeddings, features, etc.)
+    mm_info: Optional[dict] = None  # Multimodal metadata (sizes, offsets, etc.)

@@ -14,6 +14,9 @@ from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
+# Semi-PD: Multimodal support with compatibility layer
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+
 # Compatibility layer for ImageInputs (v0.4.8 uses MultimodalInputs)
 try:
     from sglang.srt.managers.schedule_batch import ImageInputs
@@ -108,6 +111,17 @@ class SemiPDScheduler(Scheduler):
         """
         logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
 
+        # Semi-PD: Debug multimodal inputs
+        has_mm_inputs = hasattr(recv_req, 'mm_inputs') and recv_req.mm_inputs is not None
+        has_image_inputs = hasattr(recv_req, 'image_inputs') and recv_req.image_inputs is not None
+        logger.info(f"Semi-PD: Request {recv_req.rid} - mm_inputs: {has_mm_inputs}, image_inputs: {has_image_inputs}")
+
+        # Semi-PD: CRITICAL FIX - Process multimodal inputs BEFORE creating request
+        # This matches the standard scheduler logic at line 1156
+        if recv_req.mm_inputs is not None:
+            logger.info(f"Semi-PD: Pre-processing multimodal inputs for request {recv_req.rid}")
+            # We'll process this after creating the request, but we need to preserve the data
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -169,29 +183,64 @@ class SemiPDScheduler(Scheduler):
                 self.add_to_waiting_queue(req)
                 return
 
-        # Handle multimodal inputs
-        # 🔧 v0.4.8 COMPATIBILITY: image_inputs -> mm_inputs
+        # Semi-PD: CRITICAL FIX - Handle multimodal inputs immediately after request creation
+        # This matches the standard scheduler logic and ensures mm_inputs are processed
         if recv_req.mm_inputs is not None:
-            # 🔧 v0.4.8: For now, skip complex multimodal processing in Semi-PD
-            # This maintains compatibility while avoiding complex multimodal logic
-            logger.warning("Multimodal inputs detected but skipped in Semi-PD mode for v0.4.8 compatibility")
+            logger.info(f"Semi-PD: Processing multimodal request {recv_req.rid} with mm_inputs")
+            mm_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, mm_inputs
+            )
+            req.extend_image_inputs(mm_inputs)
+            logger.info(f"Semi-PD: Extended multimodal inputs for request {recv_req.rid}, token count: {len(req.origin_input_ids)}")
 
-            # Basic validation to prevent oversized inputs
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 error_msg = (
-                    "Multimodal prompt is too long. "
-                    f"Input length {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
                 logger.error(error_msg)
-                req.origin_input_ids = [0]
-                req.mm_inputs = None
-                req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
+                # Semi-PD: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
                 return
+
+        # Handle legacy image_inputs for backward compatibility
+        elif hasattr(recv_req, 'image_inputs') and recv_req.image_inputs is not None:
+            logger.info(f"Semi-PD: Processing legacy image_inputs for request {recv_req.rid}")
+            # Convert legacy image_inputs to MultimodalInputs
+            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            # Convert to MultimodalInputs format
+            mm_inputs = MultimodalInputs(
+                pixel_values=image_inputs.pixel_values,
+                image_hashes=image_inputs.image_hashes,
+                image_sizes=image_inputs.image_sizes,
+                image_offsets=image_inputs.image_offsets,
+                pad_values=image_inputs.pad_values,
+                modalities=image_inputs.modalities or ["image"],
+            )
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, mm_inputs
+            )
+            req.extend_image_inputs(mm_inputs)
+
+            if len(req.origin_input_ids) >= self.max_req_input_len:
+                error_msg = (
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                )
+                logger.error(error_msg)
+                req.finished_reason = FINISH_ABORT(
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+                # Semi-PD: 使用原版Semi-PD的队列管理
+                self.add_to_waiting_queue(req)
+                return
+
+        # Semi-PD: Multimodal inputs are now handled above immediately after request creation
 
         # Validate prompts length
         error_msg = validate_input_length(

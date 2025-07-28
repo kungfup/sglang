@@ -12,6 +12,8 @@ from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
+# Semi-PD: Multimodal processor support for Semi-PD dual-instance architecture
+
 PROCESSOR_MAPPING = {}
 
 

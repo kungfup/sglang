@@ -384,6 +384,42 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         batch = self.scheduled_prefill_batches.pop(0)
         assert len(batch.reqs) == len(recv_req.next_token_ids)
 
+        # Semi-PD: Process multimodal data received from Prefill instance
+        if recv_req.mm_data is not None and recv_req.mm_info is not None:
+            logger.info(f"Semi-PD: Received multimodal data for {len(recv_req.mm_info)} requests from Prefill instance")
+
+            # Restore multimodal information to requests
+            for req in batch.reqs:
+                if req.rid in recv_req.mm_info:
+                    mm_info = recv_req.mm_info[req.rid]
+                    mm_data = recv_req.mm_data.get(req.rid, {})
+
+                    # Restore multimodal inputs if not already present
+                    if not hasattr(req, 'mm_inputs') or req.mm_inputs is None:
+                        from sglang.srt.managers.schedule_batch import MultimodalInputs, MultimodalDataItem, Modality
+
+                        # Reconstruct MultimodalInputs from transmitted data
+                        data_items = []
+                        if mm_info.get('modalities'):
+                            for i, modality_str in enumerate(mm_info['modalities']):
+                                # Convert string back to Modality enum
+                                modality = Modality.IMAGE if modality_str.lower() == 'image' else Modality.TEXT
+
+                                data_item = MultimodalDataItem(
+                                    modality=modality,
+                                    hash=mm_info.get('pad_values', [0])[i] if i < len(mm_info.get('pad_values', [])) else 0,
+                                    pad_value=mm_info.get('pad_values', [0])[i] if i < len(mm_info.get('pad_values', [])) else 0
+                                )
+                                data_items.append(data_item)
+
+                        req.mm_inputs = MultimodalInputs(
+                            data_items=data_items,
+                            data_offsets=mm_info.get('data_offsets', []),
+                            pad_values=mm_info.get('pad_values', [])
+                        )
+
+                        logger.info(f"Semi-PD: Restored multimodal inputs for request {req.rid}")
+
         logits_processor_output = None
         if recv_req.next_token_logits is not None:
             logits_processor_output = LogitsProcessorOutput(

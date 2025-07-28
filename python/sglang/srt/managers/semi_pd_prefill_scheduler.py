@@ -26,7 +26,7 @@ from sglang.srt.managers.io_struct import (
     GetNextPrefillBatchInput,
     GetNextPrefillBatchOutput,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, MultimodalInputs
 from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -198,9 +198,51 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         if result.logits_output is not None:
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
 
+        # Semi-PD: Extract multimodal data from batch for Prefill->Decode communication
+        mm_data = None
+        mm_info = None
+
+        # Semi-PD: Check if batch contains multimodal inputs
+        has_multimodal = False
+        if hasattr(batch, 'multimodal_inputs') and batch.multimodal_inputs:
+            has_multimodal = True
+        else:
+            # Check individual requests for multimodal inputs
+            for req in batch.reqs:
+                if (hasattr(req, 'mm_inputs') and req.mm_inputs is not None) or \
+                   (hasattr(req, 'multimodal_inputs') and req.multimodal_inputs is not None):
+                    has_multimodal = True
+                    break
+
+        if has_multimodal:
+            # Extract multimodal embeddings and metadata
+            mm_data = {}
+            mm_info = {}
+
+            for req in batch.reqs:
+                if hasattr(req, 'mm_inputs') and req.mm_inputs is not None:
+                    # Store multimodal embeddings if available
+                    if hasattr(result, 'multimodal_embeddings') and result.multimodal_embeddings is not None:
+                        mm_data[req.rid] = {
+                            'embeddings': result.multimodal_embeddings.get(req.rid),
+                            'data_items': [item.__dict__ for item in req.mm_inputs.data_items] if req.mm_inputs.data_items else None
+                        }
+
+                    # Store multimodal metadata
+                    mm_info[req.rid] = {
+                        'data_offsets': req.mm_inputs.data_offsets,
+                        'pad_values': req.mm_inputs.pad_values,
+                        'modalities': [item.modality.value if hasattr(item.modality, 'value') else str(item.modality)
+                                     for item in req.mm_inputs.data_items] if req.mm_inputs.data_items else None
+                    }
+
+            logger.info(f"Semi-PD: Transferring multimodal data for {len(mm_info)} requests to Decode instance")
+
         req = BatchProcessPrefillResultReq(
             next_token_ids=result.next_token_ids.tolist(),
             next_token_logits=next_token_logits,
+            mm_data=mm_data,
+            mm_info=mm_info,
         )
 
         self.send_to_d_instance.send_pyobj(req)
