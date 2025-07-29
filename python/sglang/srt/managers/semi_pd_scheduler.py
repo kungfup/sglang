@@ -73,17 +73,56 @@ class SemiPDScheduler(Scheduler):
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # 🔧 MIGRATION: 适配v0.4.8的API，添加pp_rank参数
-        super().__init__(
-            server_args,
-            port_args,
-            gpu_id,
-            tp_rank,
-            0,  # pp_rank - Semi-PD doesn't use pipeline parallel
-            dp_rank,
-            bypass_load_weight,
-            instance_role,
-        )
+        # 🔧 CRITICAL FIX: 原始Semi-PD不使用pp_rank参数
+        # 直接调用原始Scheduler构造函数，跳过pp_rank
+        import torch.distributed as dist
+        from sglang.srt.managers.scheduler import Scheduler
+
+        # 手动初始化，绕过v0.4.8的pp_rank检查
+        self.server_args = server_args
+        self.port_args = port_args
+        self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
+        self.dp_rank = dp_rank
+        self.bypass_load_weight = bypass_load_weight
+        self.instance_role = instance_role
+
+        # 调用原始Semi-PD兼容的初始化逻辑
+        self._init_semi_pd_compatible()
+
+    def _init_semi_pd_compatible(self):
+        """
+        Semi-PD兼容的初始化逻辑，绕过v0.4.8的pp_rank检查
+        """
+        # 直接调用原始Scheduler的__init__，但跳过pp_rank参数
+        from sglang.srt.managers.scheduler import Scheduler
+
+        # 临时设置pp_rank=0以满足v0.4.8的要求
+        original_init = Scheduler.__init__
+
+        def patched_init(self_inner, *args, **kwargs):
+            # 在args中插入pp_rank=0
+            if len(args) >= 4:  # server_args, port_args, gpu_id, tp_rank
+                new_args = args[:4] + (0,) + args[4:]  # 插入pp_rank=0
+                return original_init(self_inner, *new_args, **kwargs)
+            return original_init(self_inner, *args, **kwargs)
+
+        # 临时替换__init__方法
+        Scheduler.__init__ = patched_init
+        try:
+            Scheduler.__init__(
+                self,
+                self.server_args,
+                self.port_args,
+                self.gpu_id,
+                self.tp_rank,
+                self.dp_rank,
+                self.bypass_load_weight,
+                self.instance_role,
+            )
+        finally:
+            # 恢复原始__init__方法
+            Scheduler.__init__ = original_init
 
     def add_to_waiting_queue(self, req: Req):
         """
@@ -276,8 +315,8 @@ class SemiPDStandaloneScheduler:
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
-            bypass_load_weight=bypass_load_weight,
-            instance_role=instance_role,
+            bypass_load_weight=False,
+            instance_role=InstanceRole.OTHER,
         )
 
         self.max_total_num_tokens = self.tp_worker.max_total_num_tokens
