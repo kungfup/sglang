@@ -321,7 +321,7 @@ class ServerArgs:
 
         # Semi-PD: a little bit more static memory since the activation cost is doubled.
         if self.enable_semi_pd:
-            self.mem_fraction_static = self.mem_fraction_static * 0.9
+            self.mem_fraction_static = self.mem_fraction_static * 1
         logger.info(
             f"Set mem_fraction_static to {self.mem_fraction_static} according to your configuration."
         )
