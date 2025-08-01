@@ -2536,15 +2536,34 @@ class Scheduler(
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(
-                    self.torch_profiler_output_dir,
+            # Semi-PD optimization: each process role's TP0 saves its own files
+            if self.tp_rank == 0:
+                # Get process role for Semi-PD (PREFILL/DECODE)
+                role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+                if hasattr(role_suffix, 'name'):
+                    role_suffix = role_suffix.name
+
+                # Save Chrome trace with role information
+                trace_filename = (
                     self.profile_id
-                    + f"-TP-{self.tp_rank}"
+                    + f"-{role_suffix}-TP-{self.tp_rank}"
                     + stage_suffix
-                    + ".trace.json.gz",
+                    + ".trace.json.gz"
                 )
-            )
+                self.torch_profiler.export_chrome_trace(
+                    os.path.join(self.torch_profiler_output_dir, trace_filename)
+                )
+
+                # Save statistics with role information
+                stats_file = os.path.join(
+                    self.torch_profiler_output_dir,
+                    f"stats_semipd_{role_suffix}_{int(time.time())}.txt"
+                )
+                with open(stats_file, "w") as f:
+                    print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)
+                    print("=" * 50, file=f)
+                    print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
+                    print(f"\nSemi-PD {role_suffix} profiling stats done.", file=f)
             torch.distributed.barrier(self.tp_cpu_group)
 
         if self.rpd_profiler is not None:

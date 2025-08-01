@@ -199,6 +199,10 @@ class TpModelWorker:
     def get_tp_group(self):
         return self.model_runner.tp_group
 
+    def get_tp_cpu_group(self):
+        """Get TP CPU group for Semi-PD compatibility."""
+        return self.model_runner.tp_group.cpu_group
+
     def get_attention_tp_group(self):
         return self.model_runner.attention_tp_group
 
