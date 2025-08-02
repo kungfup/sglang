@@ -73,62 +73,22 @@ class SemiPDScheduler(Scheduler):
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # 🔧 CRITICAL FIX: 原始Semi-PD不使用pp_rank参数
-        # 直接调用原始Scheduler构造函数，跳过pp_rank
-        import torch.distributed as dist
-        from sglang.srt.managers.scheduler import Scheduler
+        # 🔧 完全对齐原生Semi-PD：直接调用super().__init__()
+        # v0.4.8需要pp_rank参数，设置为0（Semi-PD不使用Pipeline Parallel）
+        super().__init__(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            0,  # pp_rank=0 for Semi-PD
+            dp_rank,
+            bypass_load_weight,
+            instance_role,
+        )
 
-        # 手动初始化，绕过v0.4.8的pp_rank检查
-        self.server_args = server_args
-        self.port_args = port_args
-        self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.bypass_load_weight = bypass_load_weight
-        self.instance_role = instance_role
 
-        # 调用原始Semi-PD兼容的初始化逻辑
-        self._init_semi_pd_compatible()
-
-    def _init_semi_pd_compatible(self):
-        """
-        Semi-PD兼容的初始化逻辑，绕过v0.4.8的pp_rank检查
-        """
-        # 直接调用原始Scheduler的__init__，但跳过pp_rank参数
-        from sglang.srt.managers.scheduler import Scheduler
-
-        # 临时设置pp_rank=0以满足v0.4.8的要求
-        original_init = Scheduler.__init__
-
-        def patched_init(self_inner, *args, **kwargs):
-            # 在args中插入pp_rank=0
-            if len(args) >= 4:  # server_args, port_args, gpu_id, tp_rank
-                new_args = args[:4] + (0,) + args[4:]  # 插入pp_rank=0
-                return original_init(self_inner, *new_args, **kwargs)
-            return original_init(self_inner, *args, **kwargs)
-
-        # 临时替换__init__方法
-        Scheduler.__init__ = patched_init
-        try:
-            Scheduler.__init__(
-                self,
-                self.server_args,
-                self.port_args,
-                self.gpu_id,
-                self.tp_rank,
-                self.dp_rank,
-                self.bypass_load_weight,
-                self.instance_role,
-            )
-        finally:
-            # 恢复原始__init__方法
-            Scheduler.__init__ = original_init
 
     def add_to_waiting_queue(self, req: Req):
-        """
-        原版Semi-PD的请求队列管理逻辑
-        撤回的请求具有高优先级，插入队列头部
-        """
         if req.is_retracted:
             self.waiting_queue.insert(0, req)
         else:
@@ -213,7 +173,6 @@ class SemiPDScheduler(Scheduler):
         if recv_req.mm_inputs is not None:
             # 🔧 v0.4.8: For now, skip complex multimodal processing in Semi-PD
             # This maintains compatibility while avoiding complex multimodal logic
-            logger.warning("Multimodal inputs detected but skipped in Semi-PD mode for v0.4.8 compatibility")
 
             # Basic validation to prevent oversized inputs
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -448,12 +407,8 @@ def run_scheduler_process(
     # For Prefill instances, get IPC info from Decode instance first
     ipc_info = None
     if bypass_load_weight:
-        logger.info(f"🔥 Receiving IPC handles from Decode instance... (tp_rank={tp_rank}, queue={ipc_info_queue})")
         try:
-            logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
-            logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
             ipc_info = ipc_info_queue.get()  # 300 second timeout (5 minutes) for large models
-            logger.info(f"✅ Successfully received IPC handles from Decode instance! (type={type(ipc_info)})")
         except Exception as e:
             logger.error(f"❌ Failed to receive IPC handles: {e}")
             raise
@@ -467,13 +422,21 @@ def run_scheduler_process(
         )
     suppress_other_loggers()
 
-    from sglang.semi_pd.utils import get_device_sm_count
+    from sglang.semi_pd.utils import get_device_sm_count, PREFILL_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE
 
     real_sm = get_device_sm_count(gpu_id)
-    mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "100")
-    logger.info(f"🔥 Available SMs: {real_sm}, MPS allocation: {mps_percentage}%")
-    logger.info(f"✅ CUDA MPS successfully configured for {instance_role.name} instance")
-
+    
+    # 优化资源分配：为不同进程分配合适的SM百分比
+    if instance_role == InstanceRole.DECODE:
+        mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", str(DECODE_ENGINE_SM_PERCENTILE))
+        logger.info(f"DECODE process using {mps_percentage}% of available SMs: {real_sm}")
+    elif instance_role == InstanceRole.PREFILL:
+        mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", str(PREFILL_ENGINE_SM_PERCENTILE))
+        logger.info(f"PREFILL process using {mps_percentage}% of available SMs: {real_sm}")
+    else:
+        mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "100")
+        logger.info(f"Available SMs: {real_sm}")
+    
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
@@ -516,13 +479,18 @@ def run_scheduler_process(
 
         if bypass_load_weight:
             scheduler.share_params_from_ipc(ipc_info)
-            logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
 
 
 
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:
+            # 确保Decode进程启用CUDA Graph
+            if server_args.disable_cuda_graph:
+                logger.warning("CUDA Graph is disabled by server_args, but it's recommended for Semi-PD Decode process")
             scheduler.init_cuda_graphs()
+        else:
+            # Prefill进程不需要CUDA Graph
+            logger.info("Skip CUDA Graph initialization for Prefill process")
 
         pipe_writer.send(
             {
@@ -533,9 +501,6 @@ def run_scheduler_process(
         )
 
         logger.info("Scheduler initialized")
-        logger.info(f"Scheduler disaggregation_mode: {scheduler.disaggregation_mode}")
-        logger.info(f"Scheduler enable_overlap: {scheduler.enable_overlap}")
-        logger.info(f"Instance role: {instance_role}")
 
         if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
             logger.debug("Scheduler running in overlap mode")

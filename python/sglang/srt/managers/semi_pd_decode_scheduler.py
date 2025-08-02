@@ -61,7 +61,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             gpu_id,
             tp_rank,
             dp_rank,
-            False,
+            False,  # 🔧 对齐原生Semi-PD: bypass_load_weight=False
             InstanceRole.DECODE,
         )
 
@@ -74,8 +74,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # For requests that has been sent to the prefill scheduler but not yet finished.
         self.scheduled_prefill_batches: List[ScheduleBatch] = []
-
-
 
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
@@ -119,7 +117,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                f"[DECODE] 🧠 D-Scheduler: OOM detected, executing request retraction. "
+                "Decode out of memory happened. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
@@ -150,7 +148,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 self.waiting_queue.insert(0, req)
                 self.send_to_p_instance.send_pyobj(message)
-                logger.info(f"[DECODE] 🧠 D-Scheduler: Sent retracted request {req.rid} back to P-Scheduler")
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -227,11 +224,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        logger.info(f"[DECODE] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
         for req in self.waiting_queue:
             # Semi-PD
             if req.rid not in rids:
-                logger.debug(f"[DECODE] Skipping req.rid={req.rid} (not in rids)")
                 continue
 
             if (
@@ -337,7 +332,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         重要：D-Scheduler拥有最终决策权
         """
-        logger.debug(f"[DECODE] D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler")
+        logger.info(f"[DECODE] Received prefill request: {len(recv_req.rids)} candidates")
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
@@ -347,7 +342,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         batch = self.get_new_batch_prefill(recv_req.rids)
 
         if batch is None:
-            logger.debug(f"[DECODE] D-Scheduler rejected all requests due to resource constraints")
+            logger.info(f"[DECODE] No resources available, rejecting all requests")
             self.bridge_socket.send_pyobj(
                 GetNextPrefillBatchOutput(
                     rids=[],
@@ -366,8 +361,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
             extend_input_lens = [r.extend_input_len for r in batch.reqs]
 
-            logger.debug(f"[DECODE] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
 
+
+            logger.info(f"[DECODE] Approving {len(batch.reqs)} requests for prefill")
             self.bridge_socket.send_pyobj(
                 GetNextPrefillBatchOutput(
                     rids=[r.rid for r in batch.reqs],
@@ -402,7 +398,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             extend_input_len_per_req=None,               # Original Semi-PD (None, not [])
             extend_logprob_start_len_per_req=None,       # Original Semi-PD (None, not [])
             bid=-1,                                      # Original Semi-PD
-            can_run_cuda_graph=False,                    # v0.4.8 addition
+            can_run_cuda_graph=True,                     # 修改为True以启用CUDA Graph
         )
 
         if self.attn_tp_size > 1:

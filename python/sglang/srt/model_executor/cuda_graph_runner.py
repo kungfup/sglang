@@ -278,7 +278,11 @@ class CudaGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-            self.tbo_plugin = TboCudaGraphRunnerPlugin()
+            # 🔧 SEMI-PD OPTIMIZATION: 在Semi-PD模式下禁用TBO插件以减少开销
+            if hasattr(model_runner, 'server_args') and model_runner.server_args.enable_semi_pd:
+                self.tbo_plugin = None  # Semi-PD模式下禁用TBO
+            else:
+                self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -399,6 +403,8 @@ class CudaGraphRunner:
                 record_shapes=True,
             )
 
+        # 移除可能导致卡住的优化代码
+        
         with graph_capture() as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
@@ -542,7 +548,9 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
         )
-        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        # 🔧 SEMI-PD OPTIMIZATION: 只在TBO插件存在时调用
+        if self.tbo_plugin is not None:
+            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -674,7 +682,7 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
         if enable_num_token_non_padded(self.model_runner.server_args):
             self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
-        if self.enable_two_batch_overlap:
+        if self.enable_two_batch_overlap and self.tbo_plugin is not None:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
                 bs=bs,

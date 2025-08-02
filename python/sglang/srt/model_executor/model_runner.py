@@ -1447,6 +1447,12 @@ class ModelRunner:
 
         if self.server_args.disable_cuda_graph:
             return
+            
+        # 检查是否为Semi-PD Prefill实例，如果是则跳过CUDA Graph初始化
+        if hasattr(self, 'instance_role') and self.instance_role == InstanceRole.PREFILL:
+            logger.info("Skip CUDA Graph initialization for Semi-PD Prefill instance")
+            # 移除可能导致卡住的代码
+            return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)

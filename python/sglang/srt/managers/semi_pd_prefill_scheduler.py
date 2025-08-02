@@ -15,8 +15,9 @@
 
 import logging
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import List, Optional, Union
 
+import torch
 import zmq
 
 from sglang.semi_pd.utils import InstanceRole
@@ -58,7 +59,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         self.enable_overlap = False
         self.chunked_rid = None
-
+        
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
             self.send_to_d_instance = get_zmq_socket(
@@ -144,7 +145,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         """
         # 🔧 SEMI-PD IDLE MODE: 当没有等待请求时，直接返回None进入Idle模式
         if not self.waiting_queue:
-            logger.debug("[PREFILL] No waiting requests, entering Idle mode")
             return None
 
         resp = None
@@ -159,10 +159,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 candidates.append(r.rid)
 
             req = GetNextPrefillBatchInput(rids=candidates)
-            logger.debug(f"Send request to D worker: {req}")
+            logger.info(f"[PREFILL] Sending request to D-Scheduler: {len(candidates)} candidates")
             self.send_to_d_instance.send_pyobj(req)
+            logger.info(f"[PREFILL] Waiting for response from D-Scheduler...")
             resp = self.bridge_socket.recv_pyobj()
-            logger.debug(f"Recv response from D worker: {resp}")
+            logger.info(f"[PREFILL] Received response from D-Scheduler: {type(resp)}")
             assert isinstance(
                 resp, GetNextPrefillBatchOutput
             ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
@@ -202,7 +203,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             next_token_ids=result.next_token_ids.tolist(),
             next_token_logits=next_token_logits,
         )
-
         self.send_to_d_instance.send_pyobj(req)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):

@@ -365,6 +365,11 @@ class GroupCoordinator:
     def graph_capture(
         self, graph_capture_context: Optional[GraphCaptureContext] = None
     ):
+        # 优化：针对Semi-PD Prefill实例，直接返回一个不执行实际CUDA操作的上下文
+        if hasattr(torch.cuda, "_is_in_semi_pd_prefill") and torch.cuda._is_in_semi_pd_prefill:
+            yield GraphCaptureContext(torch.cuda.current_stream())
+            return
+
         if graph_capture_context is None:
             stream = torch.cuda.Stream()
             graph_capture_context = GraphCaptureContext(stream)
@@ -1074,6 +1079,11 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
+    # 优化：针对Semi-PD Prefill实例，直接返回一个不执行实际CUDA操作的上下文
+    if hasattr(torch.cuda, "_is_in_semi_pd_prefill") and torch.cuda._is_in_semi_pd_prefill:
+        yield GraphCaptureContext(torch.cuda.current_stream())
+        return
+        
     with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
         context
     ):
