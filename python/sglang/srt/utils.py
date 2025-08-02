@@ -904,8 +904,15 @@ def configure_logger(server_args, prefix: str = ""):
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    
+    # 强制设置为INFO级别，确保profile和Semi-PD相关日志可见
+    log_level = os.environ.get("SGLANG_PROFILE_LOG_LEVEL", server_args.log_level.upper())
+    if "[Profile]" in prefix or "DECODE" in prefix or "PREFILL" in prefix:
+        # 对于Profile和Semi-PD角色的进程，确保日志级别至少为INFO
+        log_level = "INFO"
+        
     logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
+        level=getattr(logging, log_level),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,

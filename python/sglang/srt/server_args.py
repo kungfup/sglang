@@ -338,11 +338,11 @@ class ServerArgs:
             else:
                 self.chunked_prefill_size = 4096
 
-        # Semi-PD: reduce chunked prefill size for dual-instance architecture
+        # Semi-PD: keep user-specified chunked_prefill_size if provided, otherwise use default 
         if self.enable_semi_pd:
-            self.chunked_prefill_size = min(self.chunked_prefill_size, 2048)
+            # 不再强制限制为2048，而是尊重用户设置的参数
             logger.info(
-                f"Semi-PD: Reduced chunked_prefill_size to {self.chunked_prefill_size} for dual-instance memory management."
+                f"Semi-PD: Using chunked_prefill_size of {self.chunked_prefill_size} for prefill optimization."
             )
 
         assert self.chunked_prefill_size % self.page_size == 0

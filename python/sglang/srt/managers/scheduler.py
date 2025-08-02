@@ -1740,6 +1740,14 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
+        # 记录当前角色信息和每100次前向的批次状态
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+        
+        if self.forward_ct % 100 == 0:
+            logger.info(f"[Profile] run_batch in {role_suffix}, forward_ct={self.forward_ct}, mode={batch.forward_mode}")
+        
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -2384,6 +2392,13 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
+        # 记录当前角色信息
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+            
+        logger.info(f"[Profile] Processing profile request in {role_suffix} instance, type={recv_req.type}")
+        
         if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage:
                 return self.init_profile(
@@ -2456,9 +2471,14 @@ class Scheduler(
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        # 记录当前角色信息
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+            
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
+            f"Profiling starts{stage_str} in {role_suffix}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
         activities = self.profiler_activities
@@ -2542,6 +2562,11 @@ class Scheduler(
                 role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
                 if hasattr(role_suffix, 'name'):
                     role_suffix = role_suffix.name
+                
+                # 强制记录角色信息，即使为UNKNOWN也输出
+                logger.info(f"Semi-PD Profiler Role: {role_suffix}")
+                
+                timestamp = int(time.time())
 
                 # Save Chrome trace with role information
                 trace_filename = (
@@ -2557,13 +2582,15 @@ class Scheduler(
                 # Save statistics with role information
                 stats_file = os.path.join(
                     self.torch_profiler_output_dir,
-                    f"stats_semipd_{role_suffix}_{int(time.time())}.txt"
+                    f"stats_semipd_{role_suffix}_{timestamp}.txt"
                 )
                 with open(stats_file, "w") as f:
                     print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)
                     print("=" * 50, file=f)
                     print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
                     print(f"\nSemi-PD {role_suffix} profiling stats done.", file=f)
+                
+                logger.info(f"Profile data saved to: {stats_file}")
             torch.distributed.barrier(self.tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -2603,8 +2630,14 @@ class Scheduler(
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, batch):
+        # 记录当前实例角色信息，方便调试
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+            
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
+                logger.info(f"[Profile] Prefill batch in {role_suffix}, count={self.profiler_prefill_ct}")
                 if self.profiler_prefill_ct == 0:
                     self.start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
@@ -2612,6 +2645,7 @@ class Scheduler(
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
+                logger.info(f"[Profile] Decode batch in {role_suffix}, count={self.profiler_decode_ct}")
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
@@ -2622,6 +2656,7 @@ class Scheduler(
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.DECODE)
             elif batch.forward_mode.is_idle():
+                logger.info(f"[Profile] Idle batch in {role_suffix}")
                 pass
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
@@ -2631,6 +2666,7 @@ class Scheduler(
                 self.profiler_target_forward_ct
                 and self.profiler_target_forward_ct <= self.forward_ct
             ):
+                logger.info(f"[Profile] Stopping profile in {role_suffix}, forward_ct={self.forward_ct}")
                 self.stop_profile()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
