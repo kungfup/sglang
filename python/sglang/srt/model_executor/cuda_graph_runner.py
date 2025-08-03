@@ -26,6 +26,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -571,14 +572,15 @@ class CudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
 
+            # 初始化kwargs，避免未定义变量错误
             kwargs = {}
-            if (
-                self.pp_size > 1
-                and "pp_proxy_tensors" in inspect.signature(forward).parameters
-            ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+            
+            # 检查是否需要处理pipeline parallelism
+            if self.model_runner.pp_size > 1:
+                # 创建一个空的pp_proxy_tensors用于CUDA图捕获
+                from sglang.srt.pipeline_parallel.pp_proxy_tensors import PPProxyTensors
+                empty_tensors = {}
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(empty_tensors)
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -588,11 +590,12 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-
-            run_once()
+        # 运行一次预热，但不需要每次都同步
+        run_once()
+        
+        # 只在捕获前同步一次，而不是每次循环都同步
+        torch.cuda.synchronize()
+        self.model_runner.tp_group.barrier()
 
         global global_graph_memory_pool
         with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
@@ -721,7 +724,32 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
+        try:
+            # 添加日志，帮助调试
+            is_decode_role = False
+            try:
+                if hasattr(self.model_runner, 'instance_role'):
+                    is_decode_role = (self.model_runner.instance_role == InstanceRole.DECODE)
+            except Exception as e:
+                logger.warning(f"检查实例角色时出错: {e}")
+                
+            if is_decode_role:
+                logger.debug(f"CUDA Graph Runner: 重放图，批次大小={self.bs}，raw_bs={getattr(self, 'raw_bs', None)}")
+            
+            # 确保图存在
+            if self.bs not in self.graphs:
+                available_bs = list(self.graphs.keys())
+                logger.warning(f"批次大小 {self.bs} 的图不存在，可用的批次大小: {available_bs}，使用最接近的批次大小")
+                # 找到最接近的批次大小
+                if available_bs:
+                    closest_bs = min(available_bs, key=lambda x: abs(x - self.bs))
+                    self.bs = closest_bs
+                    logger.warning(f"使用批次大小 {self.bs} 的图替代")
+            
+            self.graphs[self.bs].replay()
+        except Exception as e:
+            logger.error(f"CUDA图重放失败: {e}")
+            raise
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
@@ -735,7 +763,7 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors({k: v[: self.raw_bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

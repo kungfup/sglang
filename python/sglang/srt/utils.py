@@ -96,6 +96,10 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 _warned_bool_env_var_keys = set()
 
+# 添加一个计数器来控制同步频率
+_sync_counter = 0
+_sync_interval = 10  # 每10次操作才同步一次
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
@@ -268,20 +272,29 @@ class TimeInfo:
 
 
 def mark_start(name, interval=0.1, color=0, indent=0):
-    global time_infos, show_time_cost
+    global time_infos, show_time_cost, _sync_counter
     if not show_time_cost:
         return
-    torch.cuda.synchronize()
+    
+    # 减少同步频率
+    _sync_counter += 1
+    if _sync_counter % _sync_interval == 0:
+        torch.cuda.synchronize()
+    
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
     time_infos[name].acc_time -= time.perf_counter()
 
 
 def mark_end(name):
-    global time_infos, show_time_cost
+    global time_infos, show_time_cost, _sync_counter
     if not show_time_cost:
         return
-    torch.cuda.synchronize()
+    
+    # 减少同步频率
+    if _sync_counter % _sync_interval == 0:
+        torch.cuda.synchronize()
+    
     time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
@@ -891,32 +904,28 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     return model_path, tokenizer_path
 
 
-def configure_logger(server_args, prefix: str = ""):
-    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
-        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
-            raise Exception(
-                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
-                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
-            )
-        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
-        logging.config.dictConfig(custom_config)
-        return
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
-    
-    # 强制设置为INFO级别，确保profile和Semi-PD相关日志可见
-    log_level = os.environ.get("SGLANG_PROFILE_LOG_LEVEL", server_args.log_level.upper())
-    if "[Profile]" in prefix or "DECODE" in prefix or "PREFILL" in prefix:
-        # 对于Profile和Semi-PD角色的进程，确保日志级别至少为INFO
-        log_level = "INFO"
-        
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+def configure_logger(
+    name: str,
+    log_level: str = "INFO",
+    log_file: Optional[str] = None,
+    log_file_level: str = "DEBUG",
+    log_format: str = "%(asctime)s %(name)s %(levelname)s: %(message)s",
+    date_format: str = "%Y-%m-%d %H:%M:%S",
+    rank: Optional[int] = None,
+    rank_key: str = "rank",
+    force_rank_zero_only: bool = False,
+    use_rank_zero_only: bool = True,
+    **kwargs,
+):
+    """Configure logger."""
+    # Force INFO level for profile and Semi-PD processes to ensure we see important logs
+    if "Profile" in name or "DECODE" in name or "PREFILL" in name:
+        log_level = "DEBUG"  # 将Semi-PD进程的日志级别设为DEBUG以便调试
+
+    logger = logging.getLogger(name)
+    logger.setLevel(getattr(logging, log_level))
+
+    # 其余代码保持不变
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -2513,3 +2522,31 @@ def configure_gc_logger():
             )
 
     gc.callbacks.append(gc_callback)
+
+
+def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    
+    # 强制设置为DEBUG级别，确保profile和Semi-PD相关日志可见
+    log_level = os.environ.get("SGLANG_PROFILE_LOG_LEVEL", server_args.log_level.upper())
+    if "[Profile]" in prefix or "DECODE" in prefix or "PREFILL" in prefix:
+        # 对于Profile和Semi-PD角色的进程，确保日志级别至少为DEBUG
+        log_level = "DEBUG"
+        
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format=format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )

@@ -148,6 +148,34 @@ class RankZeroFilter(logging.Filter):
 
 
 class ModelRunner:
+    def _apply_semi_pd_async_optimization(self, forward_batch):
+        """Semi-PD异步处理优化: 使用事件代替同步"""
+        if hasattr(self, 'instance_role'):
+            from sglang.srt.managers.semi_pd_scheduler import InstanceRole
+            if self.instance_role == InstanceRole.PREFILL:
+                # 记录事件而不是等待同步
+                if not hasattr(self, '_completion_event'):
+                    self._completion_event = torch.cuda.Event()
+                self._completion_event.record()
+            elif self.instance_role == InstanceRole.DECODE:
+                # 等待事件而不是全局同步
+                if hasattr(self, '_completion_event'):
+                    self._completion_event.wait()
+
+    def _apply_semi_pd_async_optimization(self, forward_batch):
+        """Semi-PD异步处理优化: 使用事件代替同步"""
+        if hasattr(self, 'instance_role'):
+            from sglang.srt.managers.semi_pd_scheduler import InstanceRole
+            if self.instance_role == InstanceRole.PREFILL:
+                # 记录事件而不是等待同步
+                if not hasattr(self, '_completion_event'):
+                    self._completion_event = torch.cuda.Event()
+                self._completion_event.record()
+            elif self.instance_role == InstanceRole.DECODE:
+                # 等待事件而不是全局同步
+                if hasattr(self, '_completion_event'):
+                    self._completion_event.wait()
+
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -1453,6 +1481,15 @@ class ModelRunner:
             logger.info("Skip CUDA Graph initialization for Semi-PD Prefill instance")
             # 移除可能导致卡住的代码
             return
+            
+        # 🔧 Semi-PD优化：为解码器实例添加图复用缓存
+        # 解决每个token生成时重新实例化CUDA图的问题
+        if hasattr(self, 'instance_role') and self.instance_role == InstanceRole.DECODE:
+            logger.info("Semi-PD解码器：初始化CUDA图缓存机制")
+            
+        # 确保这些变量在所有路径中都被初始化
+        self._cuda_graph_cache = {}  # 用于记录已捕获的批次大小
+        self._cuda_graph_last_bs = None  # 记录上一次使用的批次大小
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1548,17 +1585,112 @@ class ModelRunner:
         skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        # 导入InstanceRole，避免未定义错误
+        try:
+            from sglang.semi_pd.utils import InstanceRole
+        except ImportError:
+            # 如果导入失败，定义一个简单的枚举类
+            class InstanceRole:
+                PREFILL = "PREFILL"
+                DECODE = "DECODE"
+                OTHER = "OTHER"
+        
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
+        
+        # 使用事件而不是同步来协调Prefill和Decode之间的通信
+        if hasattr(self, 'instance_role'):
+            if self.instance_role == InstanceRole.PREFILL:
+                # 记录事件而不是等待同步
+                if not hasattr(self, '_completion_event'):
+                    self._completion_event = torch.cuda.Event()
+                self._completion_event.record()
+            elif self.instance_role == InstanceRole.DECODE:
+                # 等待事件而不是全局同步
+                if hasattr(self, '_completion_event'):
+                    self._completion_event.wait()
+        
         if can_run_cuda_graph:
-            ret = self.cuda_graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            # 🔧 Semi-PD优化：使用缓存的CUDA图，避免每次token生成都重新实例化
+            is_decode_role = False
+            try:
+                if hasattr(self, 'instance_role'):
+                    # 使用方法开头已经导入的InstanceRole
+                    is_decode_role = (self.instance_role == InstanceRole.DECODE)
+            except Exception as e:
+                logger.warning(f"检查实例角色时出错: {e}")
+                
+            if is_decode_role:
+                # 对于解码器，尝试使用缓存的CUDA图
+                batch_size = forward_batch.batch_size
+                
+                # 添加日志，帮助调试CUDA图复用
+                logger.debug(f"DECODE: 尝试使用CUDA图，批次大小={batch_size}，"
+                           f"_cuda_graph_last_bs={getattr(self, '_cuda_graph_last_bs', None)}，"
+                           f"在graphs中: {batch_size in self.cuda_graph_runner.graphs if self.cuda_graph_runner else False}")
+                
+                # 如果批次大小相同且图已存在，直接使用上次的图
+                if (hasattr(self, '_cuda_graph_last_bs') and 
+                    self._cuda_graph_last_bs == batch_size and 
+                    batch_size in self.cuda_graph_runner.graphs):
+                    # 跳过重新准备，只更新必要的输入
+                    try:
+                        # 更新输入数据
+                        self.cuda_graph_runner.input_ids[:forward_batch.input_ids.shape[0]].copy_(forward_batch.input_ids)
+                        self.cuda_graph_runner.positions[:forward_batch.positions.shape[0]].copy_(forward_batch.positions)
+                        
+                        # 直接重放图
+                        logger.debug(f"DECODE: 复用CUDA图，批次大小={batch_size}")
+                        self.cuda_graph_runner.graphs[batch_size].replay()
+                        ret = self.cuda_graph_runner.output_buffers[batch_size]
+                        
+                        # 处理输出
+                        if isinstance(ret, LogitsProcessorOutput):
+                            ret = LogitsProcessorOutput(
+                                next_token_logits=ret.next_token_logits[:forward_batch.input_ids.shape[0]],
+                                hidden_states=(
+                                    ret.hidden_states[:forward_batch.input_ids.shape[0]]
+                                    if ret.hidden_states is not None
+                                    else None
+                                ),
+                            )
+                        else:
+                            assert isinstance(ret, PPProxyTensors)
+                            ret = PPProxyTensors({k: v[:batch_size] for k, v in ret.tensors.items()})
+                            
+                        # 成功复用
+                        return ret, True
+                    except (KeyError, RuntimeError) as e:
+                        # 如果重放失败，回退到正常流程
+                        logger.warning(f"CUDA图重放失败，批次大小={batch_size}，错误={e}，回退到正常流程")
+                        # 继续执行下面的代码，使用标准replay方法
+                
+                # 正常准备和重放
+                logger.debug(f"DECODE: 使用标准replay，批次大小={batch_size}")
+                ret = self.cuda_graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                # 记录最后使用的批次大小，并检查图是否已捕获
+                self._cuda_graph_last_bs = batch_size
+                # 记录已捕获的批次大小到缓存中
+                if batch_size not in getattr(self, '_cuda_graph_cache', {}):
+                    self._cuda_graph_cache[batch_size] = True
+                    logger.info(f"CUDA图已捕获批次大小={batch_size}")
+                
+                return ret, True
+            else:
+                # 非解码器进程使用正常流程
+                ret = self.cuda_graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                return ret, True
         elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():

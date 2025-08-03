@@ -231,6 +231,23 @@ class Scheduler(
         self.tp_size = server_args.tp_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
+        
+        # 保存实例角色信息，确保profile时正确识别角色
+        self.instance_role = instance_role
+        if hasattr(instance_role, 'name'):
+            self._role_name = instance_role.name
+            # 创建一个文件标记当前进程角色，便于后续识别
+            if self.tp_rank == 0:
+                try:
+                    import os
+                    marker_dir = "/tmp/semi_pd_roles"
+                    os.makedirs(marker_dir, exist_ok=True)
+                    with open(f"{marker_dir}/role_{os.getpid()}.txt", "w") as f:
+                        f.write(self._role_name)
+                except:
+                    pass
+        else:
+            self._role_name = "UNKNOWN"
         self.schedule_policy = server_args.schedule_policy
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -2073,7 +2090,14 @@ class Scheduler(
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
+                # 只在必要时同步，例如当需要立即使用结果时
+                # 在Semi-PD模式下，减少同步点
+                if not self.server_args.enable_semi_pd:
+                    self.current_stream.synchronize()
+                elif hasattr(self, 'instance_role') and self.instance_role == InstanceRole.PREFILL:
+                    # 在Prefill阶段，同步可能是必要的
+                    self.current_stream.synchronize()
+                # 否则避免同步
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
@@ -2558,10 +2582,72 @@ class Scheduler(
             self.torch_profiler.stop()
             # Semi-PD optimization: each process role's TP0 saves its own files
             if self.tp_rank == 0:
-                # Get process role for Semi-PD (PREFILL/DECODE)
-                role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+                # 改进的角色识别逻辑，确保不会出现UNKNOWN
+                role_suffix = getattr(self, 'instance_role', None)
                 if hasattr(role_suffix, 'name'):
                     role_suffix = role_suffix.name
+                
+                # 如果仍然无法获取角色，尝试多种方式识别
+                if role_suffix is None or role_suffix == 'UNKNOWN':
+                    # 方法1：从类名识别
+                    if 'PrefillScheduler' in self.__class__.__name__:
+                        role_suffix = 'PREFILL'
+                    elif 'DecodeScheduler' in self.__class__.__name__:
+                        role_suffix = 'DECODE'
+                    # 方法2：从日志前缀识别
+                    elif hasattr(self, 'get_print_prefix'):
+                        prefix = self.get_print_prefix()
+                        if 'PREFILL' in prefix:
+                            role_suffix = 'PREFILL'
+                        elif 'DECODE' in prefix:
+                            role_suffix = 'DECODE'
+                    # 方法3：从环境变量识别
+                    elif 'SGLANG_PROCESS_NAME' in os.environ:
+                        process_name = os.environ['SGLANG_PROCESS_NAME']
+                        if 'PREFILL' in process_name:
+                            role_suffix = 'PREFILL'
+                        elif 'DECODE' in process_name:
+                            role_suffix = 'DECODE'
+                    # 方法4：使用默认进程识别命令
+                    else:
+                        try:
+                            import psutil
+                            proc_name = psutil.Process().name()
+                            if 'prefill' in proc_name.lower():
+                                role_suffix = 'PREFILL'
+                            elif 'decode' in proc_name.lower():
+                                role_suffix = 'DECODE'
+                        except:
+                                        # 简化，放弃这些高级尝试，直接从日志前缀进行判断
+                            role_suffix = 'UNKNOWN'
+
+                # 优先使用在初始化时保存的角色名称
+                if hasattr(self, '_role_name') and self._role_name not in (None, 'UNKNOWN'):
+                    role_suffix = self._role_name
+                # 如果前面所有方法都失败，尝试从角色标记文件中识别
+                elif role_suffix == 'UNKNOWN':
+                    try:
+                        from glob import glob
+                        # 先查找本进程的角色标记文件
+                        marker_file = f"/tmp/semi_pd_roles/role_{os.getpid()}.txt"
+                        if os.path.exists(marker_file):
+                            with open(marker_file, 'r') as f:
+                                content = f.read().strip()
+                                if content in ('PREFILL', 'DECODE'):
+                                    role_suffix = content
+                        # 如果没有标记文件，尝试从日志内容推断
+                        else:
+                            for log_file in glob('/tmp/*.log'):
+                                with open(log_file, 'r') as f:
+                                    content = f.read()
+                                    if 'PREFILL TP0' in content or 'PREFILL TP1' in content:
+                                        role_suffix = 'PREFILL'
+                                        break
+                                    elif 'DECODE TP0' in content or 'DECODE TP1' in content:
+                                        role_suffix = 'DECODE'
+                                        break
+                    except:
+                        pass  # 保持 'UNKNOWN'
                 
                 # 强制记录角色信息，即使为UNKNOWN也输出
                 logger.info(f"Semi-PD Profiler Role: {role_suffix}")
@@ -2584,13 +2670,18 @@ class Scheduler(
                     self.torch_profiler_output_dir,
                     f"stats_semipd_{role_suffix}_{timestamp}.txt"
                 )
-                with open(stats_file, "w") as f:
-                    print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)
-                    print("=" * 50, file=f)
-                    print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
-                    print(f"\nSemi-PD {role_suffix} profiling stats done.", file=f)
-                
-                logger.info(f"Profile data saved to: {stats_file}")
+                try:
+                    with open(stats_file, "w") as f:
+                        print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)
+                        print("=" * 50, file=f)
+                        print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
+                        print(f"\nSemi-PD {role_suffix} profiling stats done.", file=f)
+                    
+                    # 刷新文件缓冲区确保写入磁盘
+                    os.sync()
+                    logger.info(f"Profile data saved to: {stats_file}")
+                except Exception as e:
+                    logger.error(f"Error saving profile data for {role_suffix}: {str(e)}")
             torch.distributed.barrier(self.tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -2624,6 +2715,18 @@ class Scheduler(
             "Profiling done. Traces are saved to: %s",
             self.torch_profiler_output_dir,
         )
+        
+        # 确保所有日志都已刷新到磁盘
+        logging.getLogger().handlers[0].flush()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        # 如果是PREFILL进程，等待一段时间确保文件写入完成
+        role_suffix = getattr(self, 'instance_role', None)
+        if hasattr(role_suffix, 'name') and role_suffix.name == 'PREFILL':
+            logger.info("PREFILL进程等待3秒确保文件写入完成...")
+            time.sleep(3)
+            
         self.torch_profiler = None
         self.profile_in_progress = False
 
