@@ -19,6 +19,12 @@
 // comment this for test_mscclpp_allreduce.cu
 #include "utils.h"
 
+// Semi-PD 异步优化
+#define SEMI_PD_ASYNC_OPTIMIZATION
+#ifdef SEMI_PD_ASYNC_OPTIMIZATION
+#include "semi_pd_async_allreduce.cuh"
+#endif
+
 namespace sglang {
 
 __device__ mscclpp::DeviceSyncer deviceSyncer;
@@ -566,6 +572,12 @@ class Msccl1NodeLLcontext {
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
     mscclpp::MemoryChannelDeviceHandle* memChans;
     if (capturing_status != cudaStreamCaptureStatusActive) {
+#ifdef SEMI_PD_ASYNC_OPTIMIZATION
+      // 使用 Semi-PD 异步内存句柄管理器，避免强制同步
+      auto& manager = semi_pd::getAsyncMemoryHandleManager();
+      memChans = manager.getMemoryHandleAsync(static_cast<void*>(input), this, stream);
+#else
+      // 原始实现（带强制同步）
       std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
       comm_group_->make_device_memory_handle_base_on_new_ptr(
           memory_channels_,
@@ -578,6 +590,7 @@ class Msccl1NodeLLcontext {
           h2d_stream);
       CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
       memChans = d_memHandles_.data();
+#endif
     } else {
       void* input_void_ptr = reinterpret_cast<void*>(input);
       if (input_ptr2d_memHandles_.find(input_void_ptr) == input_ptr2d_memHandles_.end()) {
@@ -725,6 +738,12 @@ class Msccl2NodeLLcontext {
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capturing_status));
     mscclpp::MemoryChannelDeviceHandle* memChans;
     if (capturing_status != cudaStreamCaptureStatusActive) {
+#ifdef SEMI_PD_ASYNC_OPTIMIZATION
+      // 使用 Semi-PD 异步内存句柄管理器，避免强制同步
+      auto& manager = semi_pd::getAsyncMemoryHandleManager();
+      memChans = manager.getMemoryHandleAsync(static_cast<void*>(input), this, stream);
+#else
+      // 原始实现（带强制同步）
       std::unordered_map<int, mscclpp::MemoryChannel> memory_channels;
       comm_group_->make_device_memory_handle_base_on_new_ptr(
           memory_channels_,
@@ -737,6 +756,7 @@ class Msccl2NodeLLcontext {
           h2d_stream);
       CHECK_CUDA_SUCCESS(cudaStreamSynchronize(h2d_stream));
       memChans = d_memHandles_.data();
+#endif
     } else {
       void* input_void_ptr = reinterpret_cast<void*>(input);
       if (input_ptr2d_memHandles_.find(input_void_ptr) == input_ptr2d_memHandles_.end()) {

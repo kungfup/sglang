@@ -423,8 +423,54 @@ def run_scheduler_process(
     suppress_other_loggers()
 
     from sglang.semi_pd.utils import get_device_sm_count, PREFILL_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE
+    from sglang.srt.utils_async_optimization import SemiPDAsyncContext, apply_tensor_optimization_patches, print_sync_optimization_stats
+    
+    # 导入真实性能优化
+    try:
+        import sys
+        sys.path.append('/home/yzh/semi_pd_migration/sglang_0.4.8')
+        from optimize_real_bottlenecks import apply_real_performance_optimizations, print_real_optimization_stats
+        REAL_OPTIMIZATION_AVAILABLE = True
+    except ImportError as e:
+        logger.warning(f"⚠️ 真实性能优化模块不可用: {e}")
+        REAL_OPTIMIZATION_AVAILABLE = False
+    from sglang.srt.utils_deadlock_prevention import (
+        setup_deadlock_prevention, 
+        register_semi_pd_process, 
+        semi_pd_heartbeat,
+        with_timeout,
+        ENABLE_DEADLOCK_PREVENTION
+    )
 
     real_sm = get_device_sm_count(gpu_id)
+    
+    # 注册进程并启动死锁预防
+    process_name = f"SEMI_PD_{instance_role.name}_GPU{gpu_id}"
+    if ENABLE_DEADLOCK_PREVENTION:
+        logger.info(f"🛡️ 启用死锁预防机制 ({process_name})")
+        setup_deadlock_prevention()
+        register_semi_pd_process(process_name)
+    
+    # 应用真正有效的异步优化：减少 .item() 调用的同步开销
+    if os.environ.get('SEMI_PD_ASYNC_OPT_ENABLED', '1') == '1':
+        logger.info(f"🚀 启用 Semi-PD 张量同步优化 ({instance_role.name} 进程)")
+        apply_tensor_optimization_patches()
+    else:
+        logger.info(f"❌ Semi-PD 张量同步优化已禁用 ({instance_role.name} 进程)")
+        
+    # 设置心跳线程
+    def heartbeat_thread():
+        while True:
+            try:
+                semi_pd_heartbeat(process_name)
+                time.sleep(10)  # 每10秒发送心跳
+            except Exception as e:
+                logger.error(f"❌ 心跳线程出错: {e}")
+                break
+                
+    if ENABLE_DEADLOCK_PREVENTION:
+        heartbeat_worker = threading.Thread(target=heartbeat_thread, daemon=True)
+        heartbeat_worker.start()
     
     # 优化资源分配：为不同进程分配合适的SM百分比
     if instance_role == InstanceRole.DECODE:
