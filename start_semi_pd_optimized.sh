@@ -18,17 +18,6 @@ python semi_pd_memory_config.py
 echo "🚀 启动Semi-PD服务器..."
 cd python
 
-python -m sglang.launch_server \
-    --model-path /home/yzh/model/Qwen/Qwen2.5-1.5B-Instruct \
-    --tp-size 2 \
-    --enable-semi-pd \
-    --max-total-tokens 512 \
-    --log-level debug \
-    --mem-fraction-static 0.80 \
-    --disable-radix-cache \
-    --port 30001 \
-    --chunked-prefill-size 8192 \
-    --max-prefill-tokens 32768 \
-    --disable-overlap-schedule
+python -m sglang.launch_server --model-path /home/yzh/model/Qwen/Qwen2.5-32B-Instruct --tp-size 2 --disable-radix-cache --disable-overlap-schedule --mem-fraction-static 0.8 --max-prefill-tokens 32768 --port 40069 --enable-semi-pd --chunked-prefill-size 8192  
 
 echo "✅ Semi-PD服务器启动完成"

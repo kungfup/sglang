@@ -157,21 +157,19 @@ _original_tensor_item = torch.Tensor.item
 
 # 猴子补丁：替换常见的 .item() 调用模式
 def apply_tensor_optimization_patches():
-    """应用张量优化补丁 (已禁用 - 原生模式)"""
-    # logger.info("🚀 应用 Semi-PD 张量同步优化补丁...")
-    # 
-    # def patched_item(self):
-    #     """优化的 item 方法"""
-    #     if self.is_cuda and self.numel() == 1:
-    #         return optimized_item(self)
-    #     return _original_tensor_item(self)
-    # 
-    # # 应用补丁
-    # torch.Tensor.item = patched_item
-    # 
-    # logger.info("✅ 张量同步优化补丁已应用")
+    """应用张量优化补丁"""
+    logger.info("🚀 应用 Semi-PD 张量同步优化补丁...")
     
-    logger.info("🚫 张量同步优化补丁已禁用 (使用原生torch.Tensor.item)")
+    def patched_item(self):
+        """优化的 item 方法"""
+        if self.is_cuda and self.numel() == 1:
+            return optimized_item(self)
+        return _original_tensor_item(self)
+    
+    # 应用补丁
+    torch.Tensor.item = patched_item
+    
+    logger.info("✅ 张量同步优化补丁已应用")
 
 def remove_tensor_optimization_patches():
     """移除张量优化补丁"""
@@ -297,23 +295,16 @@ def batch_extract_items(tensors: list) -> list:
     # 提取所有值
     return [_original_tensor_item(t) for t in tensors]
 
-# 环境变量控制 (已禁用 - 完全移除优化)
+# 环境变量控制
 import os
 
-# ENABLE_ASYNC_OPTIMIZATION = os.environ.get('SEMI_PD_ASYNC_OPT_ENABLED', '1') == '1'
-# OPTIMIZATION_CACHE_SIZE = int(os.environ.get('SEMI_PD_CACHE_SIZE', '1000'))
-# OPTIMIZATION_TTL = float(os.environ.get('SEMI_PD_CACHE_TTL', '0.1'))
+ENABLE_ASYNC_OPTIMIZATION = os.environ.get('SEMI_PD_ASYNC_OPT_ENABLED', '1') == '1'
+OPTIMIZATION_CACHE_SIZE = int(os.environ.get('SEMI_PD_CACHE_SIZE', '1000'))
+OPTIMIZATION_TTL = float(os.environ.get('SEMI_PD_CACHE_TTL', '0.1'))
 
-# 强制禁用所有异步优化
-ENABLE_ASYNC_OPTIMIZATION = False
-OPTIMIZATION_CACHE_SIZE = 0
-OPTIMIZATION_TTL = 0.0
-
-# 根据环境变量配置优化器 (已注释 - 完全禁用)
-# if ENABLE_ASYNC_OPTIMIZATION:
-#     _tensor_cache = AsyncTensorCache(OPTIMIZATION_CACHE_SIZE, OPTIMIZATION_TTL)
-#     logger.info(f"✅ Semi-PD 异步优化已启用 (缓存大小: {OPTIMIZATION_CACHE_SIZE}, TTL: {OPTIMIZATION_TTL}s)")
-# else:
-#     logger.info("❌ Semi-PD 异步优化已禁用")
-
-logger.info("🚫 Semi-PD 异步优化已强制禁用 (原生模式)") 
+# 根据环境变量配置优化器
+if ENABLE_ASYNC_OPTIMIZATION:
+    _tensor_cache = AsyncTensorCache(OPTIMIZATION_CACHE_SIZE, OPTIMIZATION_TTL)
+    logger.info(f"✅ Semi-PD 异步优化已启用 (缓存大小: {OPTIMIZATION_CACHE_SIZE}, TTL: {OPTIMIZATION_TTL}s)")
+else:
+    logger.info("❌ Semi-PD 异步优化已禁用") 
