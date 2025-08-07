@@ -1535,6 +1535,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        # Semi-PD: 确保CUDA Graph相关字段被正确设置
+        if not hasattr(self, 'global_num_tokens') or self.global_num_tokens is None:
+            self.global_num_tokens = [bs]  # 默认设置为batch size
+        if not hasattr(self, 'global_num_tokens_for_logprob') or self.global_num_tokens_for_logprob is None:
+            self.global_num_tokens_for_logprob = [bs]  # 默认设置为batch size
+        if not hasattr(self, 'can_run_dp_cuda_graph'):
+            self.can_run_dp_cuda_graph = True  # 默认允许CUDA Graph
+
         if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
@@ -1721,7 +1729,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu = (
                 seq_lens_cpu_cache
                 if seq_lens_cpu_cache is not None
-                else self.seq_lens.cpu()
+                else self.seq_lens.cpu()  # 恢复原始调用，问题可能在别处
             )
         else:
             seq_lens_cpu = None

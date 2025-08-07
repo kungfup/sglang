@@ -267,11 +267,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             for j in range(self.layer_num):
                 self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
                     device_pool.k_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
+                    non_blocking=False,
                 )
                 self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
                     device_pool.v_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
+                    non_blocking=False,
                 )
 
     def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
@@ -285,7 +285,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.kv_buffer[
                     0, layer_id - self.start_layer, h_index : h_index + self.page_size
                 ],
-                non_blocking=True,
+                non_blocking=False,
             )
             device_pool.v_buffer[layer_id - self.start_layer][
                 d_index : d_index + self.page_size
@@ -293,7 +293,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.kv_buffer[
                     1, layer_id - self.start_layer, h_index : h_index + self.page_size
                 ],
-                non_blocking=True,
+                non_blocking=False,
             )
 
 
@@ -362,7 +362,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             for j in range(self.layer_num):
                 self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
                     device_pool.kv_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
+                    non_blocking=False,
                 )
 
     def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
@@ -376,5 +376,5 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.kv_buffer[
                     layer_id - self.start_layer, h_index : h_index + self.page_size
                 ],
-                non_blocking=True,
+                non_blocking=False,
             )

@@ -10,11 +10,8 @@ import zmq
 try:
     import semi_pd_ipc
     SEMI_PD_IPC_AVAILABLE = True
-    print("✅ [V0.4.8] Semi-PD IPC extension loaded successfully")
 except ImportError as e:
     SEMI_PD_IPC_AVAILABLE = False
-    print(f"❌ [V0.4.8] Semi-PD IPC extension not available: {e}")
-    print("🔧 [V0.4.8] Semi-PD will not work without proper CUDA IPC support")
 
     # Create a placeholder that will raise meaningful errors
     class SemiPdIpcNotAvailable:

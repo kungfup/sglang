@@ -380,6 +380,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        import numpy as np
 
         batch = self.scheduled_prefill_batches.pop(0)
         assert len(batch.reqs) == len(recv_req.next_token_ids)
@@ -394,7 +395,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             )
 
         # TODO: return logprobs is not supported in Semi-PD mode
-        # CRITICAL: Match original Semi-PD diff exactly (lines 182-190)
+        # CRITICAL FIX: decode进程应该独立判断can_run_cuda_graph
+        # 不应该依赖prefill进程的状态，因为prefill很少使用CUDA graph
+        can_run_cuda_graph_decode = self._can_decode_use_cuda_graph()
+        
         result = GenerationBatchResult(
             next_token_ids=recv_req.next_token_ids,      # Original Semi-PD order
             logits_output=logits_processor_output,       # Original Semi-PD order
@@ -402,19 +406,26 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             extend_input_len_per_req=None,               # Original Semi-PD (None, not [])
             extend_logprob_start_len_per_req=None,       # Original Semi-PD (None, not [])
             bid=-1,                                      # Original Semi-PD
-            can_run_cuda_graph=False,                    # v0.4.8 addition
+            can_run_cuda_graph=can_run_cuda_graph_decode,  # FIX: 独立判断CUDA Graph状态
         )
 
         if self.attn_tp_size > 1:
             dist.barrier(group=self.attn_tp_cpu_group)
 
-        # Semi-PD: Critical batch.output_ids setting (matches original Semi-PD logic)
+        for i, req in enumerate(batch.reqs):
+            req.next_token_id = recv_req.next_token_ids[i]
+
+        batch.next_token_ids = recv_req.next_token_ids
+        batch.next_token_logits = recv_req.next_token_logits
+
+        # 添加原版Semi-PD的关键逻辑：设置batch.output_ids
         batch.output_ids = torch.from_numpy(
             np.array(result.next_token_ids, dtype=np.int64)
         ).to(self.device, dtype=torch.int64, non_blocking=True)
-
+        
         self.process_batch_result_prefill(batch, result)
 
+        # 添加原版Semi-PD的filter和running_batch处理逻辑
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
 
         if not batch.is_empty():
@@ -423,5 +434,18 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             else:
                 self.running_batch.merge_batch(batch)
 
-
-
+    def _can_decode_use_cuda_graph(self):
+        """
+        decode进程独立判断是否可以使用CUDA graph
+        不依赖prefill进程的状态
+        """
+        # decode进程的CUDA graph使用条件：
+        # 1. CUDA graph功能未被禁用
+        # 2. 有初始化的CUDA graph runner
+        # 3. decode操作通常是固定形状，适合CUDA graph
+        
+        # 简化判断：如果有CUDA graph runner就使用
+        # decode进程在初始化时已经正确设置了cuda_graph_runner
+        return (hasattr(self, 'tp_worker') and 
+                hasattr(self.tp_worker, 'model_runner') and
+                self.tp_worker.model_runner.cuda_graph_runner is not None)

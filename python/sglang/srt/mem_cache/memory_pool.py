@@ -330,10 +330,10 @@ class MHATokenToKVPool(KVCache):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu = self.k_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                    "cpu", non_blocking=False
                 )
                 v_cpu = self.v_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                    "cpu", non_blocking=False
                 )
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
         torch.cuda.synchronize()
@@ -350,8 +350,8 @@ class MHATokenToKVPool(KVCache):
                     kv_cache_cpu[layer_id][i // chunk_size][1],
                 )
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=False)
+                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=False)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
         torch.cuda.synchronize()
@@ -687,7 +687,7 @@ class MLATokenToKVPool(KVCache):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
+                    "cpu", non_blocking=False
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
         torch.cuda.synchronize()
@@ -701,7 +701,7 @@ class MLATokenToKVPool(KVCache):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=False)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
 

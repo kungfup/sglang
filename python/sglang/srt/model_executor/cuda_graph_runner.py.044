@@ -581,8 +581,9 @@ class CudaGraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         for _ in range(2):
-            torch.cuda.synchronize()      
-            self.model_runner.tp_group.barrier()  
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+
             run_once()
 
         global global_graph_memory_pool
@@ -593,33 +594,30 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = getattr(
+        """
+        🔧 SEMI_PD_FIX: 简化recapture逻辑，基于0.4.4版本的稳定实现
+        
+        复杂的0.4.8逻辑在Semi-PD环境下频繁触发重新capture，
+        导致每次"replay"实际耗时50ms而不是<1ms。
+        """
+        # If the capture_hidden_mode changes, we need to recapture the graph
+        hidden_mode_from_spec_info = getattr(
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.model_runner.server_args.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
-        )
-
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
+        
+        if (
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and self.capture_hidden_mode != CaptureHiddenMode.FULL
+        ):
+            print(f"[SEMI_PD_FIX] CUDA Graph recapture: forward_batch要求FULL模式")
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+            self.capture()
+        elif (
+            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
+            and self.capture_hidden_mode != hidden_mode_from_spec_info
+        ):
+            print(f"[SEMI_PD_FIX] CUDA Graph recapture: 切换到{hidden_mode_from_spec_info}模式")
+            self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
     def replay_prepare(
@@ -658,7 +656,7 @@ class CudaGraphRunner:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-        
+
         if pp_proxy_tensors:
             for key in self.pp_proxy_tensors.keys():
                 dim = pp_proxy_tensors[key].shape[0]
@@ -726,7 +724,6 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
-
     def get_spec_info(self, num_tokens: int):
         spec_info = None
         if self.model_runner.spec_algorithm.is_eagle():

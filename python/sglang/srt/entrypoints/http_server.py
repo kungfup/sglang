@@ -961,7 +961,7 @@ def _wait_and_warmup(
             )
             assert res.status_code == 200, f"{res}"
         else:
-            logger.info(f"Start of prefill warmup ...")
+            logger.info(f"Start of prefill warmup for Semi-PD mode (this may take 30-60 minutes for large models)...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -981,7 +981,7 @@ def _wait_and_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
+                timeout=3600,  # Semi-PD: Extended timeout for 32B model initialization
             )
             logger.info(
                 f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"

@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import warnings
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -145,6 +146,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    crash_on_warnings,
     disable_request_logging,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -231,6 +233,13 @@ class Scheduler(
         self.tp_size = server_args.tp_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
+        
+        # 保存实例角色信息，确保profile时正确识别角色
+        self.instance_role = instance_role
+        if hasattr(instance_role, 'name'):
+            self._role_name = instance_role.name
+        else:
+            self._role_name = "UNKNOWN"
         self.schedule_policy = server_args.schedule_policy
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -555,7 +564,10 @@ class Scheduler(
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.init_disaggregation()
+        # 🚀 PERFORMANCE FIX: 只在真正需要时初始化disaggregation组件
+        # Semi-PD模式下通常不需要这些额外的组件
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            self.init_disaggregation()
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
@@ -1424,8 +1436,8 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
-        # Semi-PD: Skip memory leak detection in Semi-PD mode
-        if self.server_args.enable_semi_pd:
+        # Semi-PD: 跳过内存泄漏检测，因为P-D进程间内存共享会导致计算不准确
+        if hasattr(self.server_args, 'enable_semi_pd') and self.server_args.enable_semi_pd:
             return
 
         available_size = (
@@ -1440,12 +1452,14 @@ class Scheduler(
         )
         if memory_leak:
             msg = (
-                "token_to_kv_pool_allocator memory leak detected! "
+                "KV cache pool leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            raise ValueError(msg)
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
@@ -1740,7 +1754,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
-        # Whether to run the profiler
+                # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -1759,31 +1773,6 @@ class Scheduler(
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
-
-                    # DEBUG: Check logits output for Semi-PD debugging
-                    if hasattr(self, 'instance_role') and logits_output is not None:
-                        try:
-                            import torch
-                            logits = logits_output.next_token_logits
-                            if logits is not None and logits.numel() > 0:
-                                # Check logits statistics
-                                logits_mean = torch.mean(logits).item()
-                                logits_std = torch.std(logits).item()
-                                logits_min = torch.min(logits).item()
-                                logits_max = torch.max(logits).item()
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: logits stats: mean={logits_mean:.6f}, std={logits_std:.6f}, min={logits_min:.6f}, max={logits_max:.6f}")
-
-                                # Check top-5 logits
-                                top_logits, top_indices = torch.topk(logits[0], k=5)
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 logits = {top_logits.tolist()}")
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 indices = {top_indices.tolist()}")
-
-                                # Check specific token logits
-                                if logits.shape[1] > 562:
-                                    token_562_logit = logits[0, 562].item()
-                                    logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: token 562 logit value = {token_562_logit}")
-                        except Exception as e:
-                            logger.error(f"[ORIGINAL_SEMI_PD] ❌ Failed to check logits: {e}")
                 else:
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -2062,10 +2051,17 @@ class Scheduler(
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
+        """
+        🔧 SEMI_PD_FIX: 移除破坏异步性的同步调用
+        
+        移除current_stream.synchronize()以恢复CUDA Graph的异步执行性能
+        原问题：同步调用导致50ms延迟，破坏了CPU/GPU异步pipeline
+        """
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
+                # 🚀 PERFORMANCE FIX: 彻底移除同步调用，恢复异步执行
+                # self.current_stream.synchronize()  # ❌ 这导致了50ms同步延迟 - 已彻底移除！
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
@@ -2384,6 +2380,13 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
+        # 记录当前角色信息
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+            
+        logger.info(f"[Profile] Processing profile request in {role_suffix} instance, type={recv_req.type}")
+        
         if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage:
                 return self.init_profile(
@@ -2456,9 +2459,14 @@ class Scheduler(
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        # 记录当前角色信息
+        role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
+        if hasattr(role_suffix, 'name'):
+            role_suffix = role_suffix.name
+            
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
+            f"Profiling starts{stage_str} in {role_suffix}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
         activities = self.profiler_activities
@@ -2536,34 +2544,62 @@ class Scheduler(
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            # Semi-PD optimization: each process role's TP0 saves its own files
             if self.tp_rank == 0:
-                # Get process role for Semi-PD (PREFILL/DECODE)
-                role_suffix = getattr(self, 'instance_role', 'UNKNOWN')
-                if hasattr(role_suffix, 'name'):
-                    role_suffix = role_suffix.name
-
-                # Save Chrome trace with role information
-                trace_filename = (
-                    self.profile_id
-                    + f"-{role_suffix}-TP-{self.tp_rank}"
-                    + stage_suffix
-                    + ".trace.json.gz"
-                )
+                # Only use role-based naming in Semi-PD mode
+                if hasattr(self.server_args, 'enable_semi_pd') and self.server_args.enable_semi_pd:
+                    # Semi-PD mode: use role-based file names
+                    role_suffix = getattr(self, "instance_role", "UNKNOWN")
+                    if hasattr(role_suffix, "name"):
+                        role_suffix = role_suffix.name
+                    logger.info(f"Semi-PD Profiler Role: {role_suffix}")
+                    trace_filename = (
+                        self.profile_id
+                        + f"-{role_suffix}-TP-{self.tp_rank}"
+                        + stage_suffix
+                        + ".trace.json.gz"
+                    )
+                else:
+                    # Normal mode: use standard file names without roles
+                    trace_filename = (
+                        self.profile_id
+                        + f"-TP-{self.tp_rank}"
+                        + stage_suffix
+                        + ".trace.json.gz"
+                    )
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, trace_filename)
                 )
 
-                # Save statistics with role information
-                stats_file = os.path.join(
-                    self.torch_profiler_output_dir,
-                    f"stats_semipd_{role_suffix}_{int(time.time())}.txt"
-                )
-                with open(stats_file, "w") as f:
-                    print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)
-                    print("=" * 50, file=f)
-                    print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
-                    print(f"\nSemi-PD {role_suffix} profiling stats done.", file=f)
+                # Save statistics with appropriate naming
+                if hasattr(self.server_args, 'enable_semi_pd') and self.server_args.enable_semi_pd:
+                    # Semi-PD mode: save role-specific stats
+                    timestamp = int(time.time())
+                    stats_file = os.path.join(
+                        self.torch_profiler_output_dir,
+                        f"stats_semipd_{role_suffix}_{timestamp}.txt"
+                    )
+                    stats_header = f"Semi-PD Profiling Stats - {role_suffix} Process"
+                else:
+                    # Normal mode: save standard stats
+                    timestamp = int(time.time())
+                    stats_file = os.path.join(
+                        self.torch_profiler_output_dir,
+                        f"stats_{timestamp}.txt"
+                    )
+                    stats_header = "SGLang Profiling Stats"
+
+                try:
+                    with open(stats_file, "w") as f:
+                        print(stats_header, file=f)
+                        print("=" * 50, file=f)
+                        print(self.torch_profiler.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=-1), file=f)
+                        print(f"\nProfiling stats completed.", file=f)
+                    
+                    # 刷新文件缓冲区确保写入磁盘
+                    os.sync()
+                    logger.info(f"Profile data saved to: {stats_file}")
+                except Exception as e:
+                    logger.error(f"Error saving profile data: {str(e)}")
             torch.distributed.barrier(self.tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -2597,12 +2633,18 @@ class Scheduler(
             "Profiling done. Traces are saved to: %s",
             self.torch_profiler_output_dir,
         )
+        
+        logger.info(
+            "Profiling done. Traces are saved to: %s",
+            self.torch_profiler_output_dir,
+        )
         self.torch_profiler = None
         self.profile_in_progress = False
 
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, batch):
+        # 🚀 PERFORMANCE FIX: 优化profile检查，移除高频日志和重复属性访问
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:

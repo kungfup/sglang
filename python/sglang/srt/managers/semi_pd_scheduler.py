@@ -116,9 +116,12 @@ class SemiPDScheduler(Scheduler):
                 self.port_args,
                 self.gpu_id,
                 self.tp_rank,
-                self.dp_rank,
-                self.bypass_load_weight,
-                self.instance_role,
+                # 🔧 CRITICAL FIX: 正确的参数顺序，考虑pp_rank=0的插入
+                # 原参数: server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank, bypass_load_weight, instance_role
+                # 传递参数时跳过pp_rank（将由patched_init插入）
+                self.dp_rank,           # 这将成为正确的dp_rank参数
+                self.bypass_load_weight, # 这将成为正确的bypass_load_weight参数
+                self.instance_role,     # 这将成为正确的instance_role参数
             )
         finally:
             # 恢复原始__init__方法

@@ -312,18 +312,14 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
 
+        self.cuda_graph_runner = None
         if self.device == "cuda":
             self.init_cublas()
             if not self.server_args.enable_semi_pd:
-                # Normal mode: Follow original 0.4.8 logic exactly
+                # Semi-PD
                 self.init_attention_backend()
                 self.init_cuda_graphs()
-            else:
-                # 🚀 SEMI_PD_FIX: 在Semi-PD模式下设置必要的初始状态
-                # 确保CUDA Graph Runner在后续初始化时有正确的基础状态
-                self.cuda_graph_runner = None  # 明确设置为None，将在scheduler中初始化
         else:
-            self.cuda_graph_runner = None
             self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
@@ -862,6 +858,11 @@ class ModelRunner:
                 bypass_load_weight=self.bypass_load_weight,
             )
 
+            # Debug: Confirm model was created
+            if hasattr(self, 'model') and self.model is not None:
+                logger.info(f"Model created successfully: {type(self.model).__name__}")
+            else:
+                logger.error("Model creation failed!")
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -1438,6 +1439,8 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
+        self.cuda_graph_runner = None
+
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
@@ -1553,18 +1556,17 @@ class ModelRunner:
         elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
-            ret = self.forward_extend(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
+            ret = self.forward_extend(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        elif forward_batch.forward_mode.is_prefill():
+            ret = self.forward_prefill(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        elif forward_batch.forward_mode.is_radix_cache():
+            ret = self.forward_radix_cache(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors
             )
-        elif forward_batch.forward_mode.is_idle():
-            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         return ret, can_run_cuda_graph
-
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
