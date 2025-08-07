@@ -858,11 +858,6 @@ class ModelRunner:
                 bypass_load_weight=self.bypass_load_weight,
             )
 
-            # Debug: Confirm model was created
-            if hasattr(self, 'model') and self.model is not None:
-                logger.info(f"Model created successfully: {type(self.model).__name__}")
-            else:
-                logger.error("Model creation failed!")
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -1439,8 +1434,6 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        self.cuda_graph_runner = None
-
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return

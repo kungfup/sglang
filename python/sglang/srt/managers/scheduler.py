@@ -1765,23 +1765,6 @@ class Scheduler(
                         try:
                             import torch
                             logits = logits_output.next_token_logits
-                            if logits is not None and logits.numel() > 0:
-                                # Check logits statistics
-                                logits_mean = torch.mean(logits).item()
-                                logits_std = torch.std(logits).item()
-                                logits_min = torch.min(logits).item()
-                                logits_max = torch.max(logits).item()
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: logits stats: mean={logits_mean:.6f}, std={logits_std:.6f}, min={logits_min:.6f}, max={logits_max:.6f}")
-
-                                # Check top-5 logits
-                                top_logits, top_indices = torch.topk(logits[0], k=5)
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 logits = {top_logits.tolist()}")
-                                logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: top-5 indices = {top_indices.tolist()}")
-
-                                # Check specific token logits
-                                if logits.shape[1] > 562:
-                                    token_562_logit = logits[0, 562].item()
-                                    logger.info(f"[ORIGINAL_SEMI_PD] 🔧 DEBUG: token 562 logit value = {token_562_logit}")
                         except Exception as e:
                             logger.error(f"[ORIGINAL_SEMI_PD] ❌ Failed to check logits: {e}")
                 else:

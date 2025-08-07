@@ -340,7 +340,7 @@ class ServerArgs:
 
         # Semi-PD: reduce chunked prefill size for dual-instance architecture
         if self.enable_semi_pd:
-            self.chunked_prefill_size = min(self.chunked_prefill_size, 2048)
+            self.chunked_prefill_size = min(self.chunked_prefill_size, 8192)
             logger.info(
                 f"Semi-PD: Reduced chunked_prefill_size to {self.chunked_prefill_size} for dual-instance memory management."
             )
