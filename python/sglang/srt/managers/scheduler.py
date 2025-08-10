@@ -2048,7 +2048,8 @@ class Scheduler(
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
+                if self.enable_overlap:
+                    self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):

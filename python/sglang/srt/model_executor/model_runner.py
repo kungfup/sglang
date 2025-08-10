@@ -1536,7 +1536,8 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
-            forward_batch.forward_mode.is_cuda_graph()
+            not os.getenv("SGLANG_FORCE_EAGER")
+            and forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )

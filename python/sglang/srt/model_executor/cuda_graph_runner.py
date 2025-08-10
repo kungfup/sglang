@@ -581,8 +581,9 @@ class CudaGraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
+            if not os.getenv("SGLANG_CG_DISABLE_WARMUP_SYNC"):
+                torch.cuda.synchronize()
+                self.model_runner.tp_group.barrier()
 
             run_once()
 
@@ -594,6 +595,10 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
+        # Skip recapture if disabled by environment variable
+        if os.getenv("SGLANG_CG_DISABLE_RECAPTURE"):
+            logger.info("[CG-RECAPTURE] Recapture disabled by SGLANG_CG_DISABLE_RECAPTURE")
+            return
 
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
@@ -621,6 +626,7 @@ class CudaGraphRunner:
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
+            logger.info(f"[CG-RECAPTURE] Hidden mode change: {self.capture_hidden_mode} -> {required_capture_hidden_mode}")
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
@@ -699,6 +705,13 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
 
+        # Log stream info for debugging
+        try:
+            stream_id = int(self.stream.cuda_stream) if hasattr(self.stream, 'cuda_stream') else 'NA'
+            logger.info(f"[CG-STREAM] replay_prepare bs={bs}, raw_bs={raw_bs}, mode={self.capture_forward_mode.name}, stream_id={stream_id}")
+        except Exception:
+            pass
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -712,8 +725,50 @@ class CudaGraphRunner:
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        # Replay
-        self.graphs[self.bs].replay()
+        # Replay with host/gpu timing logs
+        import time as _t
+
+        _evt_start = None
+        _evt_end = None
+        try:
+            if os.getenv("SGLANG_CG_MEASURE_GPU_REPLAY"):
+                _evt_start = torch.cuda.Event(enable_timing=True)
+                _evt_end = torch.cuda.Event(enable_timing=True)
+                _evt_start.record(self.stream)
+        except Exception:
+            _evt_start = None
+            _evt_end = None
+
+        _t0 = _t.perf_counter()
+        # Ensure we launch on the captured stream to avoid cross-stream waits
+        try:
+            with torch.cuda.stream(self.stream):
+                self.graphs[self.bs].replay()
+        except Exception:
+            # Fallback to default stream if needed
+            self.graphs[self.bs].replay()
+
+        # Log host-side launch overhead immediately after replay (no device sync)
+        try:
+            _dt = (_t.perf_counter() - _t0) * 1000
+            logger.info(
+                f"[CG-LAUNCH] cudaGraphLaunch host_cost={_dt:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}, stream_id={int(self.stream.cuda_stream) if hasattr(self.stream,'cuda_stream') else 'NA'}"
+            )
+        except Exception:
+            pass
+
+        # Finish GPU event timing if enabled
+        try:
+            if _evt_start is not None:
+                _evt_end.record(self.stream)
+                if os.getenv("SGLANG_CG_MEASURE_GPU_SYNC", "1") != "0":
+                    _evt_end.synchronize()
+                _evt_ms = _evt_start.elapsed_time(_evt_end)
+                logger.info(
+                    f"[CG-LAUNCH-GPU] cudaGraphReplay gpu_cost={_evt_ms:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}, stream_id={int(self.stream.cuda_stream) if hasattr(self.stream,'cuda_stream') else 'NA'}"
+                )
+        except Exception:
+            pass
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

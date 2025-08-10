@@ -262,7 +262,7 @@ class GroupCoordinator:
         )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
+        if use_pynccl and self.world_size > 1 and not os.getenv("SGLANG_DISABLE_PYNCCL"):
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -408,7 +408,8 @@ class GroupCoordinator:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.cuda.current_stream()
+                    enable=True,
+                    stream=(torch.cuda.current_stream() if os.getenv("SGLANG_PYNCCL_USE_CURRENT_STREAM") else None),
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
