@@ -548,9 +548,24 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
+                # DEBUG: scheduler sending decode ids (truncate for log)
+                try:
+                    _rid = getattr(req, "rid", "NA")
+                    _send_off = getattr(req, "send_decode_id_offset", 0)
+                    if self.model_config.is_multimodal_gen:
+                        _to_send = decode_ids
+                    else:
+                        _to_send = decode_ids[_send_off:]
+                    _head = _to_send[:10] if isinstance(_to_send, list) else []
+                    logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
+                except Exception:
+                    pass
 
-
-                if self.model_config.is_multimodal_gen:
+                # 恢复原逻辑：多模态发送完整，文本发送增量
+                if self.server_args.enable_semi_pd:
+                    # Semi-PD: always send full decode_ids to keep detokenizer offsets consistent
+                    decode_ids_list.append(decode_ids)
+                elif self.model_config.is_multimodal_gen:
                     decode_ids_list.append(decode_ids)
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])

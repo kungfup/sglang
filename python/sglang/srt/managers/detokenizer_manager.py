@@ -89,6 +89,10 @@ class DetokenizerManager:
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+        try:
+            logger.info(f"[DBG_DETOKENIZER_INIT] tokenizer_path={getattr(server_args,'tokenizer_path',None)} mode={getattr(server_args,'tokenizer_mode',None)} trust_rc={getattr(server_args,'trust_remote_code',None)} class={type(self.tokenizer).__name__ if self.tokenizer else None}")
+        except Exception:
+            pass
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = server_args.load_format == "dummy"
@@ -138,6 +142,25 @@ class DetokenizerManager:
         return recv_obj
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+        # DEBUG: detokenizer receiving decode ids (truncate for log)
+        try:
+            _heads = []
+            for lst in recv_obj.decode_ids[: min(1, len(recv_obj.decode_ids))]:
+                if isinstance(lst, list):
+                    _heads.append(lst[:10])
+                else:
+                    _heads.append([])
+            logger.info(f"[DBG_DETOKENIZER] batch={len(recv_obj.rids)} head={_heads} read_offsets={recv_obj.read_offsets[:min(4, len(recv_obj.read_offsets))]}")
+            # quick decode check
+            if self.tokenizer and _heads and isinstance(_heads[0], list):
+                try:
+                    _txt = self.tokenizer.decode(_heads[0])
+                    logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         bs = len(recv_obj.rids)
 
         # Initialize decode status

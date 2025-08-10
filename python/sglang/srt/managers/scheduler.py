@@ -1759,14 +1759,6 @@ class Scheduler(
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
-
-                    # DEBUG: Check logits output for Semi-PD debugging
-                    if hasattr(self, 'instance_role') and logits_output is not None:
-                        try:
-                            import torch
-                            logits = logits_output.next_token_logits
-                        except Exception as e:
-                            logger.error(f"[ORIGINAL_SEMI_PD] ❌ Failed to check logits: {e}")
                 else:
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -2048,8 +2040,7 @@ class Scheduler(
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                if self.enable_overlap:
-                    self.current_stream.synchronize()
+                self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):

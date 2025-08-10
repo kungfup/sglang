@@ -757,6 +757,10 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
+        # Reset incremental streaming offsets to keep detokenizer state consistent after retract
+        self.send_decode_id_offset = 0
+        self.surr_offset = None
+        self.read_offset = None
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
