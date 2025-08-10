@@ -51,8 +51,19 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        # Add support for dense layers
+        elif layer_name in ["LlamaDecoderLayer", "Qwen2DecoderLayer", "Qwen3DecoderLayer", 
+                            "GemmaDecoderLayer", "Gemma2DecoderLayer", "MistralDecoderLayer"]:
+            return OperationsStrategy.concat(
+                [
+                    _compute_dense_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"TBO not implemented for layer type: {layer_name}")
 
 
 def _assert_all_same(items: List):
@@ -68,7 +79,12 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
-    assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    # Remove the dense layer restriction since we're now supporting dense layers too
+    # assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    if hasattr(layer, 'is_layer_sparse') and not layer.is_layer_sparse:
+        # This is actually a dense layer, redirect to dense strategy
+        return _compute_dense_layer_operations_strategy_tbo(layer, forward_mode)
+    
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_blog_prefill(layer)
     elif (
@@ -145,6 +161,11 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
+    # Support both sparse and dense layers
+    if hasattr(layer, 'is_layer_sparse') and not layer.is_layer_sparse:
+        # This is actually a dense layer, redirect to dense strategy
+        return _compute_dense_layer_operations_strategy_tbo(layer, forward_mode)
+        
     assert layer.is_layer_sparse, "qwen3 moe only support sparse layers"
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_qwen3_prefill(layer)
@@ -207,5 +228,74 @@ def _compute_moe_qwen3_decode(layer):
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
             operations.YieldOperation(),
+        ],
+    )
+
+
+# -------------------------------- Strategy for Dense Layers ---------------------------------------
+
+
+def _compute_dense_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    """TBO strategy for dense layers (Llama, Qwen2, Gemma, etc.)"""
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_dense_layer_prefill(layer)
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return _compute_dense_layer_decode(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=} for dense layer TBO")
+
+
+def _compute_dense_layer_prefill(layer):
+    """Dense layer prefill strategy - fine-grained TP communication overlap"""
+    from sglang.srt.managers.schedule_batch import global_server_args_dict
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=global_server_args_dict.get("tbo_delta_extend", 0),
+        operations=[
+            # Stage 1: Compute-only operations
+            layer.op_input_norm_and_qkv,
+            layer.op_attention_compute,
+            operations.YieldOperation(),  # Allow batch overlap before attention communication
+            # Stage 2: TP communication for attention
+            layer.op_attention_output_proj_and_allreduce,
+            operations.YieldOperation(),  # Allow batch overlap after attention communication
+            # Stage 3: Compute-only operations  
+            layer.op_post_attn_norm_and_gate_up,
+            operations.YieldOperation(),  # Allow batch overlap before MLP communication
+            # Stage 4: TP communication for MLP
+            layer.op_mlp_down_proj_and_allreduce,
+            operations.YieldOperation(),  # Allow batch overlap after MLP communication
+            layer.op_residual_add_final,
+        ],
+    )
+
+
+def _compute_dense_layer_decode(layer):
+    """Dense layer decode strategy - aggressive TP communication overlap"""
+    from sglang.srt.managers.schedule_batch import global_server_args_dict
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=global_server_args_dict.get("tbo_delta_decode", 2),
+        operations=[
+            # Stage 1: Compute-only operations
+            layer.op_input_norm_and_qkv,
+            operations.YieldOperation(),  # Switch to second batch
+            layer.op_attention_compute,
+            operations.YieldOperation(),  # Switch back
+            # Stage 2: TP communication for attention
+            layer.op_attention_output_proj_and_allreduce,
+            operations.YieldOperation(),  # Switch to second batch
+            # Stage 3: Compute-only operations
+            layer.op_post_attn_norm_and_gate_up,
+            operations.YieldOperation(),  # Switch back
+            # Stage 4: TP communication for MLP
+            layer.op_mlp_down_proj_and_allreduce,
+            operations.YieldOperation(),  # Switch to second batch
+            layer.op_residual_add_final,
         ],
     )

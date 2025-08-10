@@ -282,6 +282,10 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
 
+    # 新增：TBO delta 参数
+    tbo_delta_extend: int = 0
+    tbo_delta_decode: int = 2
+
     def __post_init__(self):
         # Check deprecated arguments
         def print_deprecated_warning(message: str):
@@ -1704,6 +1708,20 @@ class ServerArgs:
             type=float,
             default=ServerArgs.tbo_token_distribution_threshold,
             help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
+            "--tbo-delta-extend",
+            type=int,
+            choices=[0, 1, 2],
+            default=ServerArgs.tbo_delta_extend,
+            help="Set TBO delta stages for EXTEND (prefill) phase. 0=conservative, 1=medium, 2=aggressive.",
+        )
+        parser.add_argument(
+            "--tbo-delta-decode",
+            type=int,
+            choices=[0, 1, 2],
+            default=ServerArgs.tbo_delta_decode,
+            help="Set TBO delta stages for DECODE phase. 0=conservative, 1=medium, 2=aggressive.",
         )
         parser.add_argument(
             "--enable-torch-compile",

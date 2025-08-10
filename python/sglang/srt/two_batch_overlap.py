@@ -27,6 +27,13 @@ from sglang.srt.operations import execute_operations, execute_overlapped_operati
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, is_hip
+import os
+
+_TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+
+def _tbo_log(msg: str):
+    if _TBO_DEBUG:
+        print(f"[TBO] {msg}", flush=True)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -800,6 +807,10 @@ def model_forward_maybe_tbo(
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
+    if _TBO_DEBUG:
+        _tbo_log(
+            f"maybe_tbo: enable={enable_tbo}, mode={forward_batch.global_forward_mode}, delta={operations_strategy.tbo_delta_stages}"
+        )
     if enable_tbo:
         return _model_forward_tbo(
             inputs=inputs,
@@ -904,7 +915,7 @@ def _model_forward_tbo_split_inputs_raw(
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
 ) -> List[Dict]:
-    return [
+    out = [
         dict(
             **_model_forward_filter_inputs(
                 hidden_states=hidden_states,
@@ -923,6 +934,13 @@ def _model_forward_tbo_split_inputs_raw(
             forward_batch.tbo_children
         )
     ]
+    if _TBO_DEBUG:
+        lens = [
+            x["hidden_states"].shape[0] if x["hidden_states"] is not None else 0
+            for x in out
+        ]
+        _tbo_log(f"split_inputs: micro_batch_sizes={lens}")
+    return out
 
 
 def _model_forward_filter_inputs(

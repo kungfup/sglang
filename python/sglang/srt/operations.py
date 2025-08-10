@@ -1,4 +1,5 @@
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Sequence, Union
@@ -6,9 +7,15 @@ from typing import Any, Callable, Dict, Generator, List, Sequence, Union
 import torch
 
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
+_TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
 
 if _ENABLE_PROFILE:
     import nvtx
+
+
+def _tbo_log(message: str):
+    if _TBO_DEBUG:
+        print(f"[TBO] {message}", flush=True)
 
 
 def execute_operations(inputs, operations):
@@ -34,6 +41,18 @@ def execute_overlapped_operations(
 
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
+
+    if _TBO_DEBUG:
+        _tbo_log(
+            f"overlap plan: delta={delta_stage}, stages_a={len(stages_a)}, stages_b={len(stages_b)}"
+        )
+        # 打印每个阶段的 op 名称列表，便于识别通信阶段
+        def _stage_op_names(stages):
+            return ["+".join(op.debug_name for op in stage) for stage in stages]
+
+        _tbo_log(f"stages_a_ops={_stage_op_names(stages_a)}")
+        _tbo_log(f"stages_b_ops={_stage_op_names(stages_b)}")
+
     executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
     executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
 
@@ -77,6 +96,8 @@ class _StageExecutor:
         assert not self.done
 
         stage = self._stages[self._index]
+        op_names = "+".join(op.debug_name for op in stage)
+        t0 = time.time() if _TBO_DEBUG else None
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
@@ -87,6 +108,12 @@ class _StageExecutor:
                             self._stage_output if self._stage_output is not None else {}
                         ),
                     )
+
+        if _TBO_DEBUG:
+            dt_ms = (time.time() - t0) * 1000.0
+            _tbo_log(
+                f"stage {self._debug_name}{self._index}: ops=[{op_names}] time_ms={dt_ms:.3f}"
+            )
 
         self._index += 1
 

@@ -49,7 +49,17 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.communicator import LayerScatterModes
 from sglang.srt.utils import add_prefix, make_layers
+import os
+
+_TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+
+def _tbo_log(msg: str):
+    if _TBO_DEBUG:
+        print(f"[TBO][qwen2] {msg}", flush=True)
 
 Qwen2Config = None
 
@@ -227,6 +237,14 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        
+        # Initialize layer_scatter_modes for TBO support
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=False,  # Dense layer
+            is_previous_layer_sparse=False,  # Dense model, previous layer is also dense
+        )
 
     def forward(
         self,
@@ -251,6 +269,104 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    # Enhanced TBO Operations with TP Communication Overlap
+    def op_input_norm_and_qkv(self, state, **kwargs):
+        """TBO Stage 1: Input layernorm + QKV projection (no communication)"""
+        # 清理上一层可能残留的临时状态，避免重复写入冲突
+        for _k in (
+            "qkv_ready",
+            "attn_output_before_proj",
+            "attn_final_output",
+            "gate_up_output",
+            "hidden_states_mlp_output",
+            "residual_after_input_ln",
+            "residual_after_comm_pre_mlp",
+        ):
+            try:
+                if state.get(_k) is not None:
+                    state.pop(_k)
+            except Exception:
+                pass
+        positions = kwargs.get("positions")
+        forward_batch = kwargs.get("forward_batch")
+        # 兼容 CUDA Graph 捕获路径：若未显式传入 positions，则从 forward_batch.positions 获取
+        if positions is None and forward_batch is not None and hasattr(forward_batch, "positions"):
+            positions = forward_batch.positions
+        hidden_states = kwargs.get("hidden_states")
+        residual = kwargs.get("residual", None)
+        if residual is None:
+            state.residual_after_input_ln = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, state.residual_after_input_ln = self.input_layernorm(hidden_states, residual)
+        
+        # QKV projection (no all-reduce needed, it's ColumnParallel)
+        qkv, _ = self.self_attn.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
+        q, k = self.self_attn.rotary_emb(positions, q, k)
+        state.qkv_ready = (q, k, v)
+        return dict(hidden_states=hidden_states, positions=positions, forward_batch=forward_batch)
+
+    def op_attention_compute(self, state, **kwargs):
+        """TBO Stage 2: Attention computation (no communication)"""
+        forward_batch = kwargs.get("forward_batch")
+        q, k, v = state.qkv_ready
+        attn_output = self.self_attn.attn(q, k, v, forward_batch)
+        state.attn_output_before_proj = attn_output
+        return dict(forward_batch=forward_batch)
+
+    def op_attention_output_proj_and_allreduce(self, state, **kwargs):
+        """TBO Stage 3: O projection + TP all-reduce (communication intensive)"""
+        if _TBO_DEBUG:
+            _tbo_log("enter attention_output_proj_allreduce")
+        # Do the RowParallel linear which includes all-reduce
+        attn_output, _ = self.self_attn.o_proj(state.attn_output_before_proj)
+        state.attn_final_output = attn_output
+        forward_batch = kwargs.get("forward_batch")
+        return dict(forward_batch=forward_batch)
+
+    def op_post_attn_norm_and_gate_up(self, state, **kwargs):
+        """TBO Stage 4: Post-attention norm + Gate/Up projection (no communication)"""
+        forward_batch = kwargs.get("forward_batch")
+        hidden_states, residual = self.post_attention_layernorm(state.attn_final_output, state.residual_after_input_ln)
+        # Gate/Up projection (no all-reduce needed, it's ColumnParallel)
+        gate_up, _ = self.mlp.gate_up_proj(hidden_states)
+        gate_up_activated = self.mlp.act_fn(gate_up)
+        state.gate_up_output = gate_up_activated
+        state.residual_after_comm_pre_mlp = residual
+        return dict(forward_batch=forward_batch)
+
+    def op_mlp_down_proj_and_allreduce(self, state, **kwargs):
+        """TBO Stage 5: Down projection + TP all-reduce (communication intensive)"""
+        if _TBO_DEBUG:
+            _tbo_log("enter mlp_down_proj_allreduce")
+        forward_batch = kwargs.get("forward_batch")
+        # Do the RowParallel linear which includes all-reduce
+        mlp_output, _ = self.mlp.down_proj(state.gate_up_output)
+        state.hidden_states_mlp_output = mlp_output
+        final_residual = state.residual_after_comm_pre_mlp
+        return dict(hidden_states=mlp_output, residual=final_residual, forward_batch=forward_batch)
+
+    def op_residual_add_final(self, state, hidden_states, residual, **kwargs):
+        """TBO Stage 6: Final residual connection"""
+        output = dict(hidden_states=hidden_states, residual=residual)
+        # 手动清理本层的临时状态键，避免覆盖冲突
+        for _k in (
+            "qkv_ready",
+            "attn_output_before_proj",
+            "attn_final_output",
+            "gate_up_output",
+            "hidden_states_mlp_output",
+            "residual_after_input_ln",
+            "residual_after_comm_pre_mlp",
+        ):
+            try:
+                if state.get(_k) is not None:
+                    state.pop(_k)
+            except Exception:
+                pass
+        return output
 
 
 class Qwen2Model(nn.Module):
@@ -330,19 +446,46 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+        # Check if we can use TBO for the layers
+        if hasattr(forward_batch, 'can_run_tbo') and forward_batch.can_run_tbo and len(self.layers) > 0:
+            # Use TBO for overlapped execution
+            aux_hidden_states = []
+            for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual if residual is not None else hidden_states
+                    )
+            layers_to_run = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+            if _TBO_DEBUG:
+                _tbo_log(f"forward use TBO: can_run_tbo={getattr(forward_batch,'can_run_tbo',None)}, num_layers={len(layers_to_run)}")
+            # Execute all layers with TBO
+            if layers_to_run:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=layers_to_run,
+                    enable_tbo=True,
+                    input_data_scatter_mode=ScatterMode.model_input_output(),
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
                 )
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+        else:
+            if _TBO_DEBUG:
+                _tbo_log(f"forward fallback sequential: can_run_tbo={getattr(forward_batch,'can_run_tbo',None)}")
+            # Use standard sequential execution
+            aux_hidden_states = []
+            for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual if residual is not None else hidden_states
+                    )
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
