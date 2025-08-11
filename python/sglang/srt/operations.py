@@ -8,6 +8,8 @@ import torch
 
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
 _TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+# 是否启用独立通信流（默认关闭，避免在小批次时引入额外开销）
+_ENABLE_SEPARATE_COMM_STREAM = bool(int(os.environ.get("SGLANG_TBO_SEPARATE_COMM_STREAM", "0")))
 
 if _ENABLE_PROFILE:
     import nvtx
@@ -16,6 +18,12 @@ if _ENABLE_PROFILE:
 def _tbo_log(message: str):
     if _TBO_DEBUG:
         print(f"[TBO] {message}", flush=True)
+
+# CUDA availability
+try:
+    _HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    _HAS_CUDA = False
 
 
 def execute_operations(inputs, operations):
@@ -78,6 +86,7 @@ class YieldOperation:
 class ExecutionOperation:
     debug_name: str
     fn: Callable
+    is_comm: bool = False
 
 
 Operation = Union[YieldOperation, ExecutionOperation, Callable]
@@ -91,23 +100,76 @@ class _StageExecutor:
         self._index = 0
         self._stage_state = _StateDict()
         self._stage_output = inputs
+        # 记录上一阶段是否为通信阶段，用于在回到计算阶段时做依赖同步
+        self._last_stage_was_comm = False
+        # 每个微批自己的通信流与事件，避免跨微批相互等待（仅在开关开启且 CUDA 可用时创建）
+        self._comm_stream = (
+            torch.cuda.Stream() if (_HAS_CUDA and _ENABLE_SEPARATE_COMM_STREAM) else None
+        )
+        self._last_compute_event = (
+            torch.cuda.Event(enable_timing=False)
+            if (_HAS_CUDA and _ENABLE_SEPARATE_COMM_STREAM)
+            else None
+        )
+        self._last_comm_event = (
+            torch.cuda.Event(enable_timing=False)
+            if (_HAS_CUDA and _ENABLE_SEPARATE_COMM_STREAM)
+            else None
+        )
+
+    def _record_event_on_current(self, event: torch.cuda.Event):
+        if _HAS_CUDA and event is not None:
+            event.record(torch.cuda.current_stream())
+
+    def _wait_event_on_stream(self, stream: torch.cuda.Stream, event: torch.cuda.Event):
+        if _HAS_CUDA and stream is not None and event is not None:
+            stream.wait_event(event)
 
     def next(self):
         assert not self.done
 
         stage = self._stages[self._index]
         op_names = "+".join(op.debug_name for op in stage)
+        is_comm_stage = any(getattr(op, "is_comm", False) for op in stage)
         t0 = time.time() if _TBO_DEBUG else None
 
+        # 在阶段边界处理同一微批的跨流依赖（仅等待本微批产生的事件）
+        use_comm_stream = self._comm_stream is not None and is_comm_stage
+        if use_comm_stream:
+            # 通信阶段：在通信流上执行，并等待本微批最近一次计算事件
+            stream_ctx = torch.cuda.stream(self._comm_stream)
+            if self._last_compute_event is not None:
+                self._comm_stream.wait_event(self._last_compute_event)
+        else:
+            # 计算阶段：如上一阶段是通信，等待本微批的通信事件（仅在启用独立通信流时）
+            if (
+                self._last_stage_was_comm
+                and self._comm_stream is not None
+                and self._last_comm_event is not None
+            ):
+                torch.cuda.current_stream().wait_event(self._last_comm_event)
+            stream_ctx = contextmanager(lambda: (yield))()
+
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
-            for op in stage:
-                with _annotate_region(debug_name=op.debug_name):
-                    self._stage_output = op.fn(
-                        state=self._stage_state,
-                        **(
-                            self._stage_output if self._stage_output is not None else {}
-                        ),
-                    )
+            with stream_ctx:
+                for op in stage:
+                    with _annotate_region(debug_name=op.debug_name):
+                        self._stage_output = op.fn(
+                            state=self._stage_state,
+                            **(
+                                self._stage_output if self._stage_output is not None else {}
+                            ),
+                        )
+
+        # 执行完成后，在对应流上记录事件，供下一阶段依赖
+        if _HAS_CUDA and _ENABLE_SEPARATE_COMM_STREAM:
+            if use_comm_stream and self._last_comm_event is not None:
+                # 事件要在通信流上记录
+                with torch.cuda.stream(self._comm_stream):
+                    self._last_comm_event.record(self._comm_stream)
+            elif (not is_comm_stage) and self._last_compute_event is not None:
+                # 事件要在当前（计算）流上记录
+                self._last_compute_event.record(torch.cuda.current_stream())
 
         if _TBO_DEBUG:
             dt_ms = (time.time() - t0) * 1000.0
@@ -115,6 +177,7 @@ class _StageExecutor:
                 f"stage {self._debug_name}{self._index}: ops=[{op_names}] time_ms={dt_ms:.3f}"
             )
 
+        self._last_stage_was_comm = is_comm_stage
         self._index += 1
 
     @property
@@ -206,11 +269,22 @@ def _decorate_operations(operations: List[Operation], debug_name_prefix: str = "
     return [_decorate_operation(op, debug_name_prefix) for op in operations]
 
 
+def _is_comm_op_name(name: str) -> bool:
+    n = name.lower()
+    return (
+        ("allreduce" in n)
+        or ("all_reduce" in n)
+        or ("reduce_scatter" in n)
+    )
+
+
 def _decorate_operation(operation: Operation, debug_name_prefix: str):
     if isinstance(operation, YieldOperation):
         return operation
+    name = getattr(operation, "__name__", "unknown").replace("op_", "")
+    debug_name = debug_name_prefix + name
     return ExecutionOperation(
-        debug_name=debug_name_prefix
-        + getattr(operation, "__name__", "unknown").replace("op_", ""),
+        debug_name=debug_name,
         fn=operation,
+        is_comm=_is_comm_op_name(name),
     )

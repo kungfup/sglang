@@ -1037,6 +1037,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
+        # 早退：当微批为空（num_tokens==0）时，直接返回，避免在捕获期对空张量做索引
+        if num_tokens == 0:
+            return query, key
+
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
@@ -1052,14 +1056,14 @@ class MRotaryEmbedding(RotaryEmbedding):
             )
 
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
+        key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
