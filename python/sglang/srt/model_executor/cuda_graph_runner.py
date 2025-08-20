@@ -56,6 +56,9 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+# 添加调试日志控制
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -650,6 +653,8 @@ class CudaGraphRunner:
             self.capture()
 
     def _log_streams(self, where: str):
+        if not DEBUG_LOGS_ENABLED:
+            return
         try:
             dev = torch.cuda.current_device()
             cur = torch.cuda.current_stream()
@@ -744,7 +749,7 @@ class CudaGraphRunner:
             self.bs = bs
 
             # Optional diagnostics
-            if self.model_runner.server_args.enable_semi_pd:
+            if DEBUG_LOGS_ENABLED and self.model_runner.server_args.enable_semi_pd:
                 try:
                     stream_id = int(self.stream.cuda_stream) if hasattr(self.stream, 'cuda_stream') else 'NA'
                     logger.info(f"[CG-STREAM] replay_prepare bs={bs}, raw_bs={raw_bs}, mode={self.capture_forward_mode.name}, stream_id={stream_id}")
@@ -763,7 +768,8 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_semi_pd:
             original_stream = torch.cuda.current_stream()
             if original_stream != self.stream:
-                logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
+                if DEBUG_LOGS_ENABLED:
+                    logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
                 torch.cuda.set_stream(self.stream)
         
         if not skip_attn_backend_init:
@@ -781,7 +787,8 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_semi_pd:
             original_stream = torch.cuda.current_stream()
             if original_stream != self.stream:
-                logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
+                if DEBUG_LOGS_ENABLED:
+                    logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
                 torch.cuda.set_stream(self.stream)
 
         # 添加 NVTX 标记和精确计时
@@ -793,12 +800,14 @@ class CudaGraphRunner:
         
         # 检查当前流状态
         current_stream_before = torch.cuda.current_stream()
-        logger.info(f"[CG-STREAM-FIX] about_to_replay current={current_stream_before.cuda_stream:x}, graph={self.stream.cuda_stream:x}")
+        if DEBUG_LOGS_ENABLED:
+            logger.info(f"[CG-STREAM-FIX] about_to_replay current={current_stream_before.cuda_stream:x}, graph={self.stream.cuda_stream:x}")
         
         # 确保在正确的流上
         if current_stream_before != self.stream:
             torch.cuda.set_stream(self.stream)
-            logger.info(f"[CG-CRITICAL-STREAM-SWITCH] forced stream switch at replay time")
+            if DEBUG_LOGS_ENABLED:
+                logger.info(f"[CG-CRITICAL-STREAM-SWITCH] forced stream switch at replay time")
         
         torch.cuda.nvtx.range_pop()  # Pre_Replay
         _t_prepare_end = time.perf_counter()
@@ -842,7 +851,8 @@ class CudaGraphRunner:
         # 恢复原始流（如果需要）
         if original_stream and original_stream != self.stream:
             torch.cuda.set_stream(original_stream)
-            logger.info(f"[CG-STREAM-EARLY-FIX] restored to {original_stream.cuda_stream:x}")
+            if DEBUG_LOGS_ENABLED:
+                logger.info(f"[CG-STREAM-EARLY-FIX] restored to {original_stream.cuda_stream:x}")
         
         torch.cuda.nvtx.range_pop()  # Post_Replay
         torch.cuda.nvtx.range_pop()  # Total
@@ -856,12 +866,13 @@ class CudaGraphRunner:
         post_time = (_t_post_end - _t_post_start) * 1000
         total_time = (_t_post_end - _t_prepare_start) * 1000
         
-        logger.info(
-            f"[CG-LAUNCH] cudaGraphLaunch host_cost={core_replay_time:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}"
-        )
-        logger.info(
-            f"[CG-DETAILED-TIMING] prepare={prepare_time:.3f}ms, core_replay={core_replay_time:.3f}ms, post={post_time:.3f}ms, total={total_time:.3f}ms"
-        )
+        if DEBUG_LOGS_ENABLED:
+            logger.info(
+                f"[CG-LAUNCH] cudaGraphLaunch host_cost={core_replay_time:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}"
+            )
+            logger.info(
+                f"[CG-DETAILED-TIMING] prepare={prepare_time:.3f}ms, core_replay={core_replay_time:.3f}ms, post={post_time:.3f}ms, total={total_time:.3f}ms"
+            )
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

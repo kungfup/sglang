@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -19,6 +21,9 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# 添加调试日志控制
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
 
 DEFAULT_FORCE_STREAM_INTERVAL = 128
 
@@ -557,7 +562,8 @@ class SchedulerOutputProcessorMixin:
                     else:
                         _to_send = decode_ids[_send_off:]
                     _head = _to_send[:10] if isinstance(_to_send, list) else []
-                    logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
+                    if DEBUG_LOGS_ENABLED:
+                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
                 except Exception:
                     pass
 

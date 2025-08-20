@@ -46,6 +46,9 @@ from sglang.utils import (
 
 logger = logging.getLogger(__name__)
 
+# 添加调试日志控制
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
 # For more details, see: https://github.com/sgl-project/sglang/issues/2812
@@ -90,7 +93,8 @@ class DetokenizerManager:
                 revision=server_args.revision,
             )
         try:
-            logger.info(f"[DBG_DETOKENIZER_INIT] tokenizer_path={getattr(server_args,'tokenizer_path',None)} mode={getattr(server_args,'tokenizer_mode',None)} trust_rc={getattr(server_args,'trust_remote_code',None)} class={type(self.tokenizer).__name__ if self.tokenizer else None}")
+            if DEBUG_LOGS_ENABLED:
+                logger.info(f"[DBG_DETOKENIZER_INIT] tokenizer_path={getattr(server_args,'tokenizer_path',None)} mode={getattr(server_args,'tokenizer_mode',None)} trust_rc={getattr(server_args,'trust_remote_code',None)} class={type(self.tokenizer).__name__ if self.tokenizer else None}")
         except Exception:
             pass
 
@@ -144,20 +148,22 @@ class DetokenizerManager:
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         # DEBUG: detokenizer receiving decode ids (truncate for log)
         try:
-            _heads = []
-            for lst in recv_obj.decode_ids[: min(1, len(recv_obj.decode_ids))]:
-                if isinstance(lst, list):
-                    _heads.append(lst[:10])
-                else:
-                    _heads.append([])
-            logger.info(f"[DBG_DETOKENIZER] batch={len(recv_obj.rids)} head={_heads} read_offsets={recv_obj.read_offsets[:min(4, len(recv_obj.read_offsets))]}")
-            # quick decode check
-            if self.tokenizer and _heads and isinstance(_heads[0], list):
-                try:
-                    _txt = self.tokenizer.decode(_heads[0])
-                    logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
-                except Exception:
-                    pass
+            if DEBUG_LOGS_ENABLED:
+                _heads = []
+                for lst in recv_obj.decode_ids[: min(1, len(recv_obj.decode_ids))]:
+                    if isinstance(lst, list):
+                        _heads.append(lst[:10])
+                    else:
+                        _heads.append([])
+                logger.info(f"[DBG_DETOKENIZER] batch={len(recv_obj.rids)} head={_heads} read_offsets={recv_obj.read_offsets[:min(4, len(recv_obj.read_offsets))]}")
+                # quick decode check
+                if self.tokenizer and _heads and isinstance(_heads[0], list):
+                    try:
+                        _txt = self.tokenizer.decode(_heads[0])
+                        if DEBUG_LOGS_ENABLED:
+                            logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
