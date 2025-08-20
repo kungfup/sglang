@@ -582,12 +582,14 @@ class ServerArgs:
             if not (1 <= self.semi_pd_decode_sm_percentage <= 100):
                 raise ValueError(f"semi_pd_decode_sm_percentage must be between 1-100, got {self.semi_pd_decode_sm_percentage}")
 
+            # 注释掉：这个设置导致 CUDA Graph 性能问题（50ms）
             # Disable custom all reduce for Semi-PD
-            if not self.disable_custom_all_reduce:
-                logger.warning(
-                    "Semi-PD is enabled. Disable custom all reduce to prevent hanging."
-                )
-                self.disable_custom_all_reduce = True
+            # if not self.disable_custom_all_reduce:
+            #     logger.warning(
+            #         "Semi-PD is enabled. Disable custom all reduce to prevent hanging."
+            #     )
+            #     self.disable_custom_all_reduce = True
+            logger.info("Semi-PD: Keeping custom all reduce enabled for better CUDA Graph performance")
 
             # Semi-PD doesn't support DP attention yet
             if self.enable_dp_attention:

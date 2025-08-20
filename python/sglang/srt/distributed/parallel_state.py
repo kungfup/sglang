@@ -378,7 +378,12 @@ class GroupCoordinator:
         # capture the graph on another stream
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
-            stream.wait_stream(curr_stream)
+            # CRITICAL: In Semi-PD mode, wait_stream causes long blocking due to IPC memory sharing
+            # Skip stream waiting to maintain async execution
+            import os
+            if not os.getenv("SGLANG_ENABLE_SEMI_PD", "").lower() in ("1", "true"):
+                stream.wait_stream(curr_stream)
+            # else: Semi-PD mode - skip wait_stream to avoid IPC-induced blocking
 
         with torch.cuda.stream(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective

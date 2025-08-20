@@ -19,12 +19,14 @@ import bisect
 import inspect
 import logging
 import os
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
+import torch.cuda.nvtx
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -204,6 +206,28 @@ class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
+        # Enforce non-blocking CUDA launch to avoid host blocking equal to GPU runtime
+        try:
+            clb = os.environ.get("CUDA_LAUNCH_BLOCKING", "")
+            if clb and str(clb).lower() not in ("0", "false", "no"):
+                logger.warning(
+                    f"[CG-SAFETY] Detected CUDA_LAUNCH_BLOCKING={clb}, force set to 0 to avoid blocking cudaGraphLaunch."
+                )
+                os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+            logger.info(
+                f"[CG-SAFETY] Effective CUDA_LAUNCH_BLOCKING={os.environ.get('CUDA_LAUNCH_BLOCKING', '') or 'unset'}"
+            )
+        except Exception:
+            pass
+
+        # Reset PyTorch CUDA sync debug mode if available
+        try:
+            if hasattr(torch.cuda, "set_sync_debug_mode"):
+                torch.cuda.set_sync_debug_mode("default")
+                logger.info("[CG-SAFETY] torch.cuda.set_sync_debug_mode('default') applied")
+        except Exception:
+            pass
+
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
@@ -402,6 +426,7 @@ class CudaGraphRunner:
         with graph_capture() as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
+                self._log_streams("after_capture_set_stream")
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
@@ -581,9 +606,8 @@ class CudaGraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         for _ in range(2):
-            if not os.getenv("SGLANG_CG_DISABLE_WARMUP_SYNC"):
-                torch.cuda.synchronize()
-                self.model_runner.tp_group.barrier()
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
 
             run_once()
 
@@ -595,10 +619,6 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-        # Skip recapture if disabled by environment variable
-        if os.getenv("SGLANG_CG_DISABLE_RECAPTURE"):
-            logger.info("[CG-RECAPTURE] Recapture disabled by SGLANG_CG_DISABLE_RECAPTURE")
-            return
 
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
@@ -626,21 +646,33 @@ class CudaGraphRunner:
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
-            logger.info(f"[CG-RECAPTURE] Hidden mode change: {self.capture_hidden_mode} -> {required_capture_hidden_mode}")
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
+
+    def _log_streams(self, where: str):
+        try:
+            dev = torch.cuda.current_device()
+            cur = torch.cuda.current_stream()
+            graph = getattr(self, 'stream', None)
+            cur_id = int(cur.cuda_stream) if hasattr(cur, 'cuda_stream') else 'NA'
+            graph_id = int(graph.cuda_stream) if (graph is not None and hasattr(graph, 'cuda_stream')) else 'NA'
+            logger.info(f"[CG-DEVICE] {where} device={dev}, current_stream={cur}, graph_stream={graph} (cur_id={cur_id}, graph_id={graph_id})")
+        except Exception:
+            pass
 
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # Ensure graph state matches required hidden mode
         self.recapture_if_needed(forward_batch)
+        self._log_streams("replay_prepare:entry")
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
-        # Pad
+        # Decide captured bs (pad up to nearest captured bs if needed)
         if self.require_mlp_tp_gather:
             total_batch_size = (
                 sum(forward_batch.global_num_tokens_cpu) / self.num_tokens_per_bs
@@ -651,12 +683,16 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs != raw_bs:
-            self.seq_lens.fill_(self.seq_len_fill_value)
+
+        # Run all buffer updates and metadata init on the captured stream to avoid cross-stream deps
+        with torch.cuda.stream(self.stream):
+            self._log_streams("replay_prepare:in_stream_before_copy")
+            # Pad related state
+            if bs != raw_bs:
+                self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
 
-        # Common inputs on captured stream to avoid cross-stream waits
-        with torch.cuda.stream(self.stream):
+            # Common inputs
             self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
             self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
             self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
@@ -681,16 +717,16 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
             if enable_num_token_non_padded(self.model_runner.server_args):
                 self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
-        if self.enable_two_batch_overlap:
-            self.tbo_plugin.replay_prepare(
-                forward_mode=self.capture_forward_mode,
-                bs=bs,
-                num_token_non_padded=len(forward_batch.input_ids),
-            )
-        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
-            forward_batch.spec_info.custom_mask = self.custom_mask
-        # Attention backend on captured stream
-        with torch.cuda.stream(self.stream):
+            if self.enable_two_batch_overlap:
+                self.tbo_plugin.replay_prepare(
+                    forward_mode=self.capture_forward_mode,
+                    bs=bs,
+                    num_token_non_padded=len(forward_batch.input_ids),
+                )
+            if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
+                forward_batch.spec_info.custom_mask = self.custom_mask
+
+            # Attention backend metadata init must be on the same stream
             self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 self.req_pool_indices[:bs],
@@ -702,17 +738,19 @@ class CudaGraphRunner:
                 seq_lens_cpu=self.seq_lens_cpu[:bs],
             )
 
-        # Store fields
-        self.raw_bs = raw_bs
-        self.raw_num_token = raw_num_token
-        self.bs = bs
+            # Store fields used by replay()
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_num_token
+            self.bs = bs
 
-        # Log stream info for debugging
-        try:
-            stream_id = int(self.stream.cuda_stream) if hasattr(self.stream, 'cuda_stream') else 'NA'
-            logger.info(f"[CG-STREAM] replay_prepare bs={bs}, raw_bs={raw_bs}, mode={self.capture_forward_mode.name}, stream_id={stream_id}")
-        except Exception:
-            pass
+            # Optional diagnostics
+            if self.model_runner.server_args.enable_semi_pd:
+                try:
+                    stream_id = int(self.stream.cuda_stream) if hasattr(self.stream, 'cuda_stream') else 'NA'
+                    logger.info(f"[CG-STREAM] replay_prepare bs={bs}, raw_bs={raw_bs}, mode={self.capture_forward_mode.name}, stream_id={stream_id}")
+                except Exception:
+                    pass
+        self._log_streams("replay_prepare:exit")
 
     def replay(
         self,
@@ -720,6 +758,14 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # CRITICAL: Semi-PD流同步修复 - 在任何操作前就设置正确的流
+        original_stream = None
+        if self.model_runner.server_args.enable_semi_pd:
+            original_stream = torch.cuda.current_stream()
+            if original_stream != self.stream:
+                logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
+                torch.cuda.set_stream(self.stream)
+        
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -727,50 +773,95 @@ class CudaGraphRunner:
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        # Replay with host/gpu timing logs
-        import time as _t
+        # Replay
+        self._log_streams("replay:entry")
+        
+        # CRITICAL: Semi-PD流同步修复 - 在任何操作前就设置正确的流
+        original_stream = None
+        if self.model_runner.server_args.enable_semi_pd:
+            original_stream = torch.cuda.current_stream()
+            if original_stream != self.stream:
+                logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
+                torch.cuda.set_stream(self.stream)
 
-        _evt_start = None
-        _evt_end = None
-        try:
-            if os.getenv("SGLANG_CG_MEASURE_GPU_REPLAY"):
-                _evt_start = torch.cuda.Event(enable_timing=True)
-                _evt_end = torch.cuda.Event(enable_timing=True)
-                _evt_start.record(self.stream)
-        except Exception:
-            _evt_start = None
-            _evt_end = None
-
-        _t0 = _t.perf_counter()
-        # Ensure we launch on the captured stream to avoid cross-stream waits
-        try:
-            with torch.cuda.stream(self.stream):
-                self.graphs[self.bs].replay()
-        except Exception:
-            # Fallback to default stream if needed
+        # 添加 NVTX 标记和精确计时
+        torch.cuda.nvtx.range_push("CudaGraph_Replay_Total")
+        
+        # 测量 replay 前的准备时间
+        _t_prepare_start = time.perf_counter()
+        torch.cuda.nvtx.range_push("CudaGraph_Pre_Replay")
+        
+        # 检查当前流状态
+        current_stream_before = torch.cuda.current_stream()
+        logger.info(f"[CG-STREAM-FIX] about_to_replay current={current_stream_before.cuda_stream:x}, graph={self.stream.cuda_stream:x}")
+        
+        # 确保在正确的流上
+        if current_stream_before != self.stream:
+            torch.cuda.set_stream(self.stream)
+            logger.info(f"[CG-CRITICAL-STREAM-SWITCH] forced stream switch at replay time")
+        
+        torch.cuda.nvtx.range_pop()  # Pre_Replay
+        _t_prepare_end = time.perf_counter()
+        
+        # 精确测量 CUDA Graph replay 时间
+        torch.cuda.nvtx.range_push("CudaGraph_Core_Replay")
+        _t0 = time.perf_counter()
+        
+        # 核心 replay 调用 - Semi-PD 优化
+        if self.model_runner.server_args.enable_semi_pd:
+            # Semi-PD 特殊处理：检查Graph状态并优化执行
+            graph = self.graphs[self.bs]
+            
+            # 检查Graph是否有效（避免重新捕获导致的开销）
+            if hasattr(graph, '_is_captured') and not graph._is_captured:
+                logger.info(f"[CG-WARNING] Graph not properly captured for bs={self.bs}")
+            
+            # 使用GPU事件计时而非CPU计时来减少host-device同步
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            graph.replay()
+            end_event.record()
+            
+            # 非阻塞检查（仅用于调试）
+            if end_event.query():
+                gpu_time = start_event.elapsed_time(end_event)
+                logger.info(f"[CG-GPU-TIMING] GPU execution time: {gpu_time:.3f}ms")
+        else:
+            # 标准执行
             self.graphs[self.bs].replay()
+        
+        _t1 = time.perf_counter()
+        torch.cuda.nvtx.range_pop()  # Core_Replay
+        
+        # 测量 replay 后的清理时间
+        torch.cuda.nvtx.range_push("CudaGraph_Post_Replay")
+        _t_post_start = time.perf_counter()
+        
+        # 恢复原始流（如果需要）
+        if original_stream and original_stream != self.stream:
+            torch.cuda.set_stream(original_stream)
+            logger.info(f"[CG-STREAM-EARLY-FIX] restored to {original_stream.cuda_stream:x}")
+        
+        torch.cuda.nvtx.range_pop()  # Post_Replay
+        torch.cuda.nvtx.range_pop()  # Total
+        _t_post_end = time.perf_counter()
 
-        # Log host-side launch overhead immediately after replay (no device sync)
-        try:
-            _dt = (_t.perf_counter() - _t0) * 1000
-            logger.info(
-                f"[CG-LAUNCH] cudaGraphLaunch host_cost={_dt:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}, stream_id={int(self.stream.cuda_stream) if hasattr(self.stream,'cuda_stream') else 'NA'}"
-            )
-        except Exception:
-            pass
-
-        # Finish GPU event timing if enabled
-        try:
-            if _evt_start is not None:
-                _evt_end.record(self.stream)
-                if os.getenv("SGLANG_CG_MEASURE_GPU_SYNC", "1") != "0":
-                    _evt_end.synchronize()
-                _evt_ms = _evt_start.elapsed_time(_evt_end)
-                logger.info(
-                    f"[CG-LAUNCH-GPU] cudaGraphReplay gpu_cost={_evt_ms:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}, stream_id={int(self.stream.cuda_stream) if hasattr(self.stream,'cuda_stream') else 'NA'}"
-                )
-        except Exception:
-            pass
+        self._log_streams("replay:exit")
+        
+        # 详细的性能日志
+        prepare_time = (_t_prepare_end - _t_prepare_start) * 1000
+        core_replay_time = (_t1 - _t0) * 1000
+        post_time = (_t_post_end - _t_post_start) * 1000
+        total_time = (_t_post_end - _t_prepare_start) * 1000
+        
+        logger.info(
+            f"[CG-LAUNCH] cudaGraphLaunch host_cost={core_replay_time:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}"
+        )
+        logger.info(
+            f"[CG-DETAILED-TIMING] prepare={prepare_time:.3f}ms, core_replay={core_replay_time:.3f}ms, post={post_time:.3f}ms, total={total_time:.3f}ms"
+        )
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
