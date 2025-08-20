@@ -57,7 +57,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 # 添加调试日志控制
-DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "1").lower() not in ("1", "true", "yes")
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
