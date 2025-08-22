@@ -816,7 +816,7 @@ def _launch_semi_pd_subprocesses(
     scheduler_infos = []
     if server_args.dp_size == 1:
         # Allocate ports for inter-process communications
-        port_args = SemiPDPortArgs.init_new(server_args)
+        base_port_args = SemiPDPortArgs.init_new(server_args)
 
         # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -837,95 +837,166 @@ def _launch_semi_pd_subprocesses(
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
 
-        # Init P & D schedulers.
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                DECODE_ENGINE_SM_PERCENTILE
-            )
-            logger.info(
-                f"Launch D instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
-            )
-            d_reader, d_writer = mp.Pipe(duplex=False)
-            d_proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    None,
-                    d_writer,
-                    p_ipc_info_queue,
-                    False,
-                    InstanceRole.DECODE,
-                ),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                d_proc.start()
-            scheduler_procs.append(d_proc)
-            d_scheduler_pipe_readers.append(d_reader)
+        # 🚀 PIPELINE INTEGRATION: 为每个pipeline stage创建SemiPD双进程
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * server_args.node_rank,
+            pp_size_per_node * (server_args.node_rank + 1),
+        )
+        
+        logger.info(f"🔥 [SemiPD-Pipeline] 启动 pp_size={server_args.pp_size}, pp_rank_range={list(pp_rank_range)}")
+        
+        # 为每个pipeline stage创建IPC queue组
+        pp_ipc_info_queues = {}
+        for pp_rank in pp_rank_range:
+            pp_ipc_info_queues[pp_rank] = [
+                mp.Queue() for _ in range(tp_size_per_node)
+            ]
 
+        # Init P & D schedulers for each pipeline stage
+        for pp_rank in pp_rank_range:
+            logger.info(f"🚀 [SemiPD-Pipeline] 创建Pipeline Stage {pp_rank}/{server_args.pp_size-1}")
+            
+            # 🔥 CRITICAL FIX: 为每个pipeline stage创建独立的IPC地址
+            if server_args.pp_size > 1:
+                # 为每个stage生成独立的IPC前缀
+                stage_ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_stage{pp_rank}"
+                
+                port_args = SemiPDPortArgs(
+                    tokenizer_ipc_name=base_port_args.tokenizer_ipc_name,  # tokenizer保持共享
+                    s_scheduler_input_ipc_name=f"ipc://{stage_ipc_prefix}_s_scheduler",
+                    p_scheduler_input_ipc_name=f"ipc://{stage_ipc_prefix}_p_scheduler",
+                    d_scheduler_input_ipc_name=f"ipc://{stage_ipc_prefix}_d_scheduler",
+                    detokenizer_ipc_name=base_port_args.detokenizer_ipc_name,  # detokenizer保持共享
+                    bridge_ipc_name=f"ipc://{stage_ipc_prefix}_bridge",  # 🔥 关键：每个stage独立的bridge
+                    rpc_ipc_name=f"ipc://{stage_ipc_prefix}_rpc",
+                    s_nccl_port=base_port_args.s_nccl_port,
+                    p_nccl_port=base_port_args.p_nccl_port,
+                    d_nccl_port=base_port_args.d_nccl_port,
+                )
+                logger.info(f"🔧 [Stage-{pp_rank}] 独立IPC地址: bridge={port_args.bridge_ipc_name}")
+            else:
+                port_args = base_port_args
+            
+            for tp_rank in tp_rank_range:
+                queue_idx = tp_rank % tp_size_per_node
+                p_ipc_info_queue = pp_ipc_info_queues[pp_rank][queue_idx]
+                
+                # 计算每个stage的GPU ID
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                
+                logger.info(f"🔥 [Stage-{pp_rank}] GPU {gpu_id}, TP {tp_rank}")
+                
+                # D (Decode) instance for this stage
+                os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                    DECODE_ENGINE_SM_PERCENTILE
+                )
+                logger.info(
+                    f"Launch D instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+                )
+                d_reader, d_writer = mp.Pipe(duplex=False)
+                d_proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,  # 🔥 关键：传递真实的pp_rank
+                        None,  # dp_rank
+                        d_writer,
+                        p_ipc_info_queue,
+                        False,  # decode不bypass weight loading
+                        InstanceRole.DECODE,
+                    ),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    d_proc.start()
+                scheduler_procs.append(d_proc)
+                d_scheduler_pipe_readers.append(d_reader)
+
+        # Wait for all D instances across all pipeline stages to be ready
+        total_d_instances = len(pp_rank_range) * len(tp_rank_range)
+        logger.info(f"🔥 [SemiPD-Pipeline] 等待 {total_d_instances} 个 D instances 启动完成...")
         for i, reader in enumerate(d_scheduler_pipe_readers):
-            logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
+            pp_rank = list(pp_rank_range)[i // len(tp_rank_range)]
+            tp_rank = list(tp_rank_range)[i % len(tp_rank_range)]
+            logger.info(f"Waiting for D instance PP{pp_rank} TP{tp_rank} to be ready")
             data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
-            server_args.max_total_tokens = data["max_total_num_tokens"]
-            if i > 0:
-                assert (
-                    server_args.max_total_tokens
-                    ==  data["max_total_num_tokens"]
+            if data["status"] == "ready":
+                logger.info(f"✅ D instance PP{pp_rank} TP{tp_rank} is ready")
+                scheduler_infos.append(data)
+                server_args.max_total_tokens = data["max_total_num_tokens"]
+                if i > 0:
+                    assert (
+                        server_args.max_total_tokens
+                        == data["max_total_num_tokens"]
+                    )
+            else:
+                raise RuntimeError(f"❌ D instance PP{pp_rank} TP{tp_rank} failed to start: {data}")
+
+        # P scheduler starts after ALL D schedulers finish loading weights
+        logger.info("🚀 [SemiPD-Pipeline] 启动 P (Prefill) instances...")
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                queue_idx = tp_rank % tp_size_per_node
+                p_ipc_info_queue = pp_ipc_info_queues[pp_rank][queue_idx]
+                
+                # P (Prefill) instance for this stage
+                os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                    PREFILL_ENGINE_SM_PERCENTILE
                 )
 
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                PREFILL_ENGINE_SM_PERCENTILE
-            )
-
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            logger.info(
-                f"Launch P instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
-            )
-            p_reader, p_writer = mp.Pipe(duplex=False)
-            p_proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    None,
-                    p_writer,
-                    p_ipc_info_queue,
-                    True,
-                    InstanceRole.PREFILL,
-                ),
-            )
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                logger.info(
+                    f"Launch P instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+                )
+                p_reader, p_writer = mp.Pipe(duplex=False)
+                p_proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,  # 🔥 关键：传递真实的pp_rank
+                        None,  # dp_rank
+                        p_writer,
+                        p_ipc_info_queue,
+                        True,  # bypass_load_weight=True for prefill
+                        InstanceRole.PREFILL,
+                    ),
+                )
             with memory_saver_adapter.configure_subprocess():
                 p_proc.start()
             scheduler_procs.append(p_proc)
             p_scheduler_pipe_readers.append(p_reader)
 
-        assert len(p_scheduler_pipe_readers) == len(d_scheduler_pipe_readers)
-
+        # Wait for all P instances across all pipeline stages to be ready
+        total_p_instances = len(pp_rank_range) * len(tp_rank_range)
+        assert len(p_scheduler_pipe_readers) == len(d_scheduler_pipe_readers) == total_p_instances
+        
+        logger.info(f"🔥 [SemiPD-Pipeline] 等待 {total_p_instances} 个 P instances 启动完成...")
         for i, reader in enumerate(p_scheduler_pipe_readers):
-            logger.info(f"Waiting for P instance {tp_rank_base + i} to be ready")
+            pp_rank = list(pp_rank_range)[i // len(tp_rank_range)]
+            tp_rank = list(tp_rank_range)[i % len(tp_rank_range)]
+            logger.info(f"Waiting for P instance PP{pp_rank} TP{tp_rank} to be ready")
             data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
+            if data["status"] == "ready":
+                logger.info(f"✅ P instance PP{pp_rank} TP{tp_rank} is ready")
+                scheduler_infos.append(data)
+            else:
+                raise RuntimeError(f"❌ P instance PP{pp_rank} TP{tp_rank} failed to start: {data}")
 
-        logger.info("All schedulers are ready")
+        logger.info("🎉 [SemiPD-Pipeline] All schedulers are ready!")
     else:
         # Allocate ports for inter-process communications
         port_args = PortArgs.init_new(server_args)

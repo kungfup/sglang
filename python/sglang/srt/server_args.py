@@ -1794,22 +1794,48 @@ class SemiPDPortArgs:
         d_port = SemiPDPortArgs.get_nccl_port(server_args)
 
         if not server_args.enable_dp_attention:
-            # Create unified IPC addresses - all processes use the same addresses
-            # Generate unique prefix based on server port to avoid conflicts
-            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
+            # 🚀 SEMIPD PIPELINE FIX: 在pipeline模式下为每个stage分配独立的IPC地址
+            pp_size = getattr(server_args, 'pp_size', 1)
+            if pp_size > 1:
+                # Pipeline模式：每个stage需要独立的IPC地址
+                print(f"🔧 [SemiPD-Pipeline] 为{pp_size}个pipeline stage分配独立IPC地址")
+                
+                # 返回多个SemiPDPortArgs，每个stage一个
+                # 但这里返回的是单个，所以我们需要另一种方法
+                # 使用pp_rank作为区分标识
+                # 注意：这需要在engine.py中为每个stage传递不同的参数
+                
+                base_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
+                
+                # 这里我们仍然返回一个通用的配置，但在engine.py中会为每个stage修改
+                return SemiPDPortArgs(
+                    tokenizer_ipc_name=f"ipc://{base_prefix}_tokenizer",
+                    s_scheduler_input_ipc_name=f"ipc://{base_prefix}_s_scheduler",
+                    p_scheduler_input_ipc_name=f"ipc://{base_prefix}_p_scheduler",
+                    d_scheduler_input_ipc_name=f"ipc://{base_prefix}_d_scheduler", 
+                    detokenizer_ipc_name=f"ipc://{base_prefix}_detokenizer",
+                    bridge_ipc_name=f"ipc://{base_prefix}_bridge",
+                    rpc_ipc_name=f"ipc://{base_prefix}_rpc",
+                    s_nccl_port=s_port,
+                    p_nccl_port=p_port,
+                    d_nccl_port=d_port,
+                )
+            else:
+                # 传统semipd模式：统一IPC地址
+                ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
 
-            return SemiPDPortArgs(
-                tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
-                s_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_s_scheduler",
-                p_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_p_scheduler",
-                d_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_d_scheduler",
-                detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
-                bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
-                rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
-                s_nccl_port=s_port,
-                p_nccl_port=p_port,
-                d_nccl_port=d_port,
-            )
+                return SemiPDPortArgs(
+                    tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
+                    s_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_s_scheduler",
+                    p_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_p_scheduler",
+                    d_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_d_scheduler",
+                    detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
+                    bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
+                    rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
+                    s_nccl_port=s_port,
+                    p_nccl_port=p_port,
+                    d_nccl_port=d_port,
+                )
         else:
             if server_args.nnodes > 1:
                 raise NotImplementedError("Multi-node SemiPD is not supported yet")

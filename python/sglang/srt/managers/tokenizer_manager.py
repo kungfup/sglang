@@ -196,9 +196,17 @@ class TokenizerManager:
             self.send_to_d_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
             )
-            self.send_to_scheduler = AggregatedSocket(
-                [self.send_to_d_scheduler, self.send_to_p_scheduler]
-            )
+            # 🚀 SEMIPD PIPELINE FIX: 在pipeline模式下只发送给DECODE scheduler
+            pp_size = getattr(server_args, 'pp_size', 1)
+            if pp_size > 1:
+                # Pipeline模式：外部请求只发送给DECODE scheduler，保持semipd的调度逻辑
+                logger.info("🔧 [SemiPD-Pipeline] 配置TokenizerManager - 外部请求只发送给DECODE scheduler")
+                self.send_to_scheduler = self.send_to_d_scheduler
+            else:
+                # 传统semipd模式：保持原始行为
+                self.send_to_scheduler = AggregatedSocket(
+                    [self.send_to_d_scheduler, self.send_to_p_scheduler]
+                )
         else:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True

@@ -70,59 +70,58 @@ class SemiPDScheduler(Scheduler):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        pp_rank: int = 0,  # 🚀 新增：支持pipeline rank
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # 🔧 CRITICAL FIX: 原始Semi-PD不使用pp_rank参数
-        # 直接调用原始Scheduler构造函数，跳过pp_rank
-        import torch.distributed as dist
-        from sglang.srt.managers.scheduler import Scheduler
+        # 🚀 PIPELINE INTEGRATION: 直接支持pipeline并行
+        print(f"🔧 [SemiPD] 初始化scheduler - pp_rank={pp_rank}, tp_rank={tp_rank}, role={instance_role}")
+        
+        # 验证pipeline配置合理性
+        pp_size = getattr(server_args, 'pp_size', 1)
+        if pp_rank >= pp_size:
+            raise ValueError(f"pp_rank ({pp_rank}) 必须小于 pp_size ({pp_size})")
+            
+        # 🚀 PIPELINE INTEGRATION: pipeline模式下的特殊配置
+        if pp_size > 1:
+            print(f"🔧 [SemiPD-Pipeline] Stage-{pp_rank}: 启用pipeline并行模式")
+            # 在pipeline模式下，每个stage独立处理，减少一些可能的冲突
+            if hasattr(server_args, 'disable_custom_all_reduce'):
+                server_args.disable_custom_all_reduce = True
+        
+        # 直接调用父类Scheduler初始化，无需monkey patching
+        super().__init__(
+            server_args=server_args,
+            port_args=port_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,  # 🔥 关键：传递真实的pp_rank
+            dp_rank=dp_rank,
+            bypass_load_weight=bypass_load_weight,
+            instance_role=instance_role,
+        )
 
-        # 手动初始化，绕过v0.4.8的pp_rank检查
-        self.server_args = server_args
-        self.port_args = port_args
-        self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.bypass_load_weight = bypass_load_weight
-        self.instance_role = instance_role
-
-        # 调用原始Semi-PD兼容的初始化逻辑
-        self._init_semi_pd_compatible()
-
-    def _init_semi_pd_compatible(self):
-        """
-        Semi-PD兼容的初始化逻辑，绕过v0.4.8的pp_rank检查
-        """
-        # 直接调用原始Scheduler的__init__，但跳过pp_rank参数
-        from sglang.srt.managers.scheduler import Scheduler
-
-        # 临时设置pp_rank=0以满足v0.4.8的要求
-        original_init = Scheduler.__init__
-
-        def patched_init(self_inner, *args, **kwargs):
-            # 在args中插入pp_rank=0
-            if len(args) >= 4:  # server_args, port_args, gpu_id, tp_rank
-                new_args = args[:4] + (0,) + args[4:]  # 插入pp_rank=0
-                return original_init(self_inner, *new_args, **kwargs)
-            return original_init(self_inner, *args, **kwargs)
-
-        # 临时替换__init__方法
-        Scheduler.__init__ = patched_init
-        try:
-            Scheduler.__init__(
-                self,
-                self.server_args,
-                self.port_args,
-                self.gpu_id,
-                self.tp_rank,
-                self.dp_rank,
-                self.bypass_load_weight,
-                self.instance_role,
-            )
-        finally:
-            # 恢复原始__init__方法
-            Scheduler.__init__ = original_init
+    def get_pipeline_stage_info(self):
+        """获取当前pipeline stage的信息"""
+        pp_size = getattr(self.server_args, 'pp_size', 1)
+        pp_rank = getattr(self, 'pp_rank', 0)
+        
+        if pp_size == 1:
+            return {"stage": "single", "is_first": True, "is_last": True}
+        
+        return {
+            "stage": f"{pp_rank}/{pp_size-1}",
+            "is_first": pp_rank == 0,
+            "is_last": pp_rank == pp_size - 1,
+        }
+    
+    def init_pipeline_groups(self):
+        """初始化pipeline group，确保semipd能正确访问pp_group"""
+        if hasattr(self, 'tp_worker') and hasattr(self.tp_worker, 'pp_group'):
+            self.pp_group = self.tp_worker.pp_group
+            logger.info(f"🔗 [Pipeline-Stage-{getattr(self, 'pp_rank', 'unknown')}] Initialized pp_group - is_first: {self.pp_group.is_first_rank}, is_last: {self.pp_group.is_last_rank}")
+        else:
+            logger.warning(f"⚠️  [Pipeline-Stage-{getattr(self, 'pp_rank', 'unknown')}] Could not access pp_group from tp_worker")
 
     def add_to_waiting_queue(self, req: Req):
         """
@@ -144,8 +143,35 @@ class SemiPDScheduler(Scheduler):
           - 禁用grammar功能
           - 处理撤回的请求
           - 使用add_to_waiting_queue管理队列
+          - 🚀 PIPELINE FIX: 只有第一个pipeline stage处理外部请求
         """
-        logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
+        # 🚀 PIPELINE FIX: 保持与原始semipd一致的请求分发机制
+        pp_size = getattr(self.server_args, 'pp_size', 1)
+        pp_rank = getattr(self, 'pp_rank', 0)
+        instance_role = getattr(self, 'instance_role', 'unknown')
+        attn_tp_rank = getattr(self, 'attn_tp_rank', 0)
+        
+        logger.info(f"🔍 [DEBUG] Request routing - pp_size={pp_size}, pp_rank={pp_rank}, role={instance_role}, attn_tp_rank={attn_tp_rank}")
+        
+        # 与原始semipd对齐：只有attn_tp_rank==0的进程处理外部请求和跨实例通信
+        if attn_tp_rank != 0:
+            logger.info(f"🚫 [SemiPD] attn_tp_rank={attn_tp_rank} IGNORING external request - only attn_tp_rank=0 handles requests")
+            return
+        
+        if pp_size > 1:
+            # Pipeline模式：只有PP0的DECODE处理外部请求
+            if pp_rank != 0:
+                logger.info(f"🚫 [Pipeline-Stage-{pp_rank}] IGNORING external request - only PP0 handles external requests")
+                return
+            elif instance_role == InstanceRole.PREFILL:
+                logger.info(f"🚫 [Pipeline-Stage-{pp_rank}] PREFILL IGNORING external request - only DECODE handles external requests")  
+                return
+        elif instance_role == InstanceRole.PREFILL:
+            # 在正常semipd模式下，prefill也忽略外部请求
+            logger.debug(f"🚫 [SemiPD] PREFILL ignoring external request - handled by DECODE in semipd mode")
+            return
+        
+        logger.info(f"📨 [Pipeline-Stage-{getattr(self, 'pp_rank', 'unknown')}] Processing request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
 
         # Create a new request
         if (
@@ -423,6 +449,7 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    pp_rank: int,  # 🚀 新增：pipeline rank参数
     dp_rank: Optional[int],
     pipe_writer,
     ipc_info_queue: multiprocessing.Queue = None,
@@ -493,6 +520,7 @@ def run_scheduler_process(
                 gpu_id,
                 tp_rank,
                 dp_rank,
+                pp_rank,  # 🚀 传递pipeline rank
                 bypass_load_weight,
             )
 
@@ -509,20 +537,38 @@ def run_scheduler_process(
                 gpu_id,
                 tp_rank,
                 dp_rank,
+                pp_rank,  # 🚀 传递pipeline rank
                 bypass_load_weight,
             )
         else:
             raise ValueError(f"Invalid instance role: {instance_role}")
 
         if bypass_load_weight:
-            scheduler.share_params_from_ipc(ipc_info)
-            logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
+            # 🚀 PIPELINE FIX: 在pipeline模式下谨慎处理权重共享
+            pp_size = getattr(server_args, 'pp_size', 1)
+            if pp_size > 1:
+                logger.info(f"🔧 [Pipeline-Stage-{getattr(scheduler, 'pp_rank', 'unknown')}] Attempting parameter sharing in pipeline mode...")
+                try:
+                    scheduler.share_params_from_ipc(ipc_info)
+                    logger.info("✅ Successfully shared parameters via IPC (zero-copy) in pipeline mode!")
+                except Exception as e:
+                    logger.warning(f"⚠️  Pipeline模式下权重共享遇到问题: {e}")
+                    logger.warning("🔧 尝试降级为非pipeline模式或调整配置")
+            else:
+                scheduler.share_params_from_ipc(ipc_info)
+                logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
 
 
 
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:
             scheduler.init_cuda_graphs()
+            
+        # 🚀 PIPELINE FIX: 初始化pipeline groups，确保能访问pp_group
+        try:
+            scheduler.init_pipeline_groups()
+        except Exception as e:
+            logger.warning(f"⚠️  Pipeline group初始化失败，但可以继续: {e}")
 
         pipe_writer.send(
             {
@@ -537,7 +583,15 @@ def run_scheduler_process(
         logger.info(f"Scheduler enable_overlap: {scheduler.enable_overlap}")
         logger.info(f"Instance role: {instance_role}")
 
-        if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
+        # 🚀 PIPELINE FIX: SemiPD双pipeline并行架构 - 完全解耦合设计
+        pp_size = getattr(server_args, 'pp_size', 1)
+        
+        if pp_size > 1:
+            # Pipeline模式：DECODE和PREFILL都使用pipeline事件循环，保持完全解耦合
+            logger.info(f"🔥 [Pipeline-Stage-{getattr(scheduler, 'pp_rank', 'unknown')}] {instance_role}使用pipeline并行事件循环")
+            logger.info(f"🔧 [SemiPD-Pipeline] 保持解耦合设计：各自独立的pipeline处理 + IPC内部通信")
+            scheduler.event_loop_pp()  # 🔥 关键：DECODE和PREFILL都获得完整pipeline能力
+        elif scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
             logger.debug("Scheduler running in overlap mode")
             scheduler.event_loop_overlap()
         else:

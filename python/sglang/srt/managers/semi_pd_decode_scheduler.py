@@ -53,15 +53,18 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        pp_rank: int = 0,  # 🚀 新增：支持pipeline rank
         bypass_load_weight: bool = False,
     ):
+        print(f"🔥 [SemiPD-DECODE] 启动decode scheduler - pp_rank={pp_rank}")
         super().__init__(
             server_args,
             port_args,
             gpu_id,
             tp_rank,
             dp_rank,
-            False,
+            pp_rank,  # 🔥 传递pp_rank给父类
+            False,    # bypass_load_weight=False (decode进程负责加载模型)
             InstanceRole.DECODE,
         )
 

@@ -1254,7 +1254,12 @@ class ModelRunner:
             assert self.is_draft_worker
 
         if self.use_mla_backend:
-            self.token_to_kv_pool = MLATokenToKVPool(
+            # 🚀 SEMIPD FIX: PREFILL进程不分配MLA KV Pool
+            if self.bypass_load_weight:
+                logger.info("🔧 [SemiPD] PREFILL进程跳过MLA KV Pool分配")
+                self.token_to_kv_pool = None
+            else:
+                self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
@@ -1271,7 +1276,12 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         elif self.server_args.enable_double_sparsity:
-            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
+            # 🚀 SEMIPD FIX: PREFILL进程不分配DoubleSparse KV Pool
+            if self.bypass_load_weight:
+                logger.info("🔧 [SemiPD] PREFILL进程跳过DoubleSparse KV Pool分配")
+                self.token_to_kv_pool = None
+            else:
+                self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
@@ -1285,21 +1295,30 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
+            # 🚀 SEMIPD FIX: PREFILL进程不应该分配KV Cache
+            if self.bypass_load_weight:
+                logger.info("🔧 [SemiPD] PREFILL进程跳过KV Cache分配，将通过IPC访问DECODE的KV Cache")
+                self.token_to_kv_pool = None  # PREFILL不分配KV Cache
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
 
         if self.token_to_kv_pool_allocator is None:
-            if self.page_size == 1:
+            # 🚀 SEMIPD FIX: PREFILL进程也不应该分配KV Pool Allocator
+            if self.bypass_load_weight:
+                logger.info("🔧 [SemiPD] PREFILL进程跳过KV Pool Allocator分配")
+                self.token_to_kv_pool_allocator = None
+            elif self.page_size == 1:
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,

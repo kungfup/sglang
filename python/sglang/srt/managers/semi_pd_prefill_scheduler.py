@@ -44,15 +44,18 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
-        bypass_load_weight: bool = False,
+        pp_rank: int = 0,  # 🚀 新增：支持pipeline rank 
+        bypass_load_weight: bool = True,  # prefill进程默认不加载权重
     ):
+        print(f"🔥 [SemiPD-PREFILL] 启动prefill scheduler - pp_rank={pp_rank}")
         super().__init__(
             server_args,
             port_args,
             gpu_id,
             tp_rank,
             dp_rank,
-            bypass_load_weight,
+            pp_rank,  # 🔥 传递pp_rank给父类
+            bypass_load_weight,  # prefill进程通过IPC获取权重
             InstanceRole.PREFILL,
         )
 
@@ -194,15 +197,25 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done=None,
     ):
+        # 🚀 PIPELINE FIX: 在pipeline并行模式下，只有最后一个stage生成next_token_ids
+        if result.next_token_ids is None:
+            # 中间pipeline stage不生成tokens，跳过处理
+            logger.debug(f"[Pipeline-Stage-{getattr(self, 'pp_rank', 'unknown')}] "
+                        f"Skipping token processing - intermediate stage")
+            return
+        
         next_token_logits = None
         if result.logits_output is not None:
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
 
+        next_token_ids_list = result.next_token_ids.tolist()
         req = BatchProcessPrefillResultReq(
-            next_token_ids=result.next_token_ids.tolist(),
+            next_token_ids=next_token_ids_list,
             next_token_logits=next_token_logits,
         )
 
+        logger.debug(f"[Pipeline-Stage-{getattr(self, 'pp_rank', 'unknown')}] "
+                    f"Sending tokens to decode instance: {len(next_token_ids_list)} tokens")
         self.send_to_d_instance.send_pyobj(req)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):

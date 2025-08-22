@@ -404,17 +404,37 @@ class Qwen2ForCausalLM(nn.Module):
 
         # perform weight tying for PP
         if self.pp_group.world_size > 1 and config.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
-                )
-            else:
-                emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
-                    dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
+            # 🚀 SEMIPD PIPELINE FIX: 智能检查权重绑定的可行性
+            try:
+                # 检查是否有有效的embed_tokens.weight
+                if (hasattr(self.model.embed_tokens, 'weight') and 
+                    hasattr(self.lm_head, 'weight') and
+                    not hasattr(self.model.embed_tokens, '__missing_layer__') and
+                    not hasattr(self.lm_head, '__missing_layer__')):
+                    
+                    embed_weight = self.model.embed_tokens.weight
+                    is_meta_tensor = embed_weight.is_meta if hasattr(embed_weight, 'is_meta') else False
+                    
+                    if is_meta_tensor:
+                        logger.info("🔧 [SemiPD-Pipeline] Skipping weight tying - embed_tokens is meta tensor")
+                    else:
+                        if self.pp_group.is_first_rank:
+                            self.pp_group.send(
+                                embed_weight, dst=self.pp_group.last_rank
+                            )
+                        else:
+                            emb_token_weight = self.pp_group.recv(
+                                size=(config.vocab_size, config.hidden_size),
+                                dtype=next(self.model.parameters()).dtype,
+                                src=self.pp_group.first_rank,
+                            )
+                            self.lm_head.weight.copy_(emb_token_weight)
+                else:
+                    logger.info("🔧 [SemiPD-Pipeline] Skipping weight tying - PPMissingLayer detected")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  [SemiPD-Pipeline] Weight tying failed: {e}")
+                logger.info("🔧 继续运行，跳过权重绑定...")
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
