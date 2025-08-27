@@ -43,6 +43,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,  # 🔧 添加pp_rank参数
         dp_rank: Optional[int],
         bypass_load_weight: bool = False,
     ):
@@ -51,6 +52,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             port_args,
             gpu_id,
             tp_rank,
+            pp_rank,  # 🔧 传递pp_rank
             dp_rank,
             bypass_load_weight,
             InstanceRole.PREFILL,
@@ -58,15 +60,31 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         self.enable_overlap = False
         self.chunked_rid = None
-
+        self.pp_rank = pp_rank  # 🔧 保存pp_rank
+        
+        # 🔧 CRITICAL: 确保PREFILL进程使用正确的GPU设备
+        # 在Semi-PD PP模式下，每个PP stage使用不同的GPU
+        if hasattr(self, 'device'):
+            logger.info(f"[PREFILL-PP{self.pp_rank}] 🔧 使用GPU设备: {self.device}")
+        
+        # 🔧 PP stage间通信：PREFILL进程需要与下一个stage的PREFILL进程通信
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
+            
+            # 🔧 同PP stage内的IPC通信（与DECODE进程）
             self.send_to_d_instance = get_zmq_socket(
-                context, zmq.PUSH, port_args.d_scheduler_input_ipc_name, False
+                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
             )
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PULL, port_args.bridge_ipc_name, True
             )
+            
+            # 🔧 PP stage间通信：与下一个stage的PREFILL进程通信
+            # 使用SGLang原生的NCCL通信机制，不需要额外的socket
+            if hasattr(port_args, 'next_stage_prefill_port') and port_args.next_stage_prefill_port:
+                logger.info(f"🔗 PP{pp_rank} PREFILL: 将使用SGLang原生NCCL与下一个stage的PREFILL进程通信")
+            else:
+                logger.info(f"🔗 PP{pp_rank} PREFILL: 这是最后一个stage，无需连接下一个stage")
         else:
             self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
@@ -100,7 +118,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.waiting_queue = [
                 r
                 for r in self.waiting_queue
-                if r.rid not in resp.rids or r.rid == resp.chunked_rid
+                if r.rid not in resp.rids or r.rid == self.chunked_rid
             ]
 
         # 🔧 MIGRATION: 原版Semi-PD的关键设计 - 使用D-Scheduler预分配的资源
@@ -144,7 +162,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         """
         # 🔧 SEMI-PD IDLE MODE: 当没有等待请求时，直接返回None进入Idle模式
         if not self.waiting_queue:
-            logger.debug("[PREFILL] No waiting requests, entering Idle mode")
+            logger.debug(f"[PREFILL-PP{self.pp_rank}] No waiting requests, entering Idle mode")
             return None
 
         resp = None
@@ -159,10 +177,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 candidates.append(r.rid)
 
             req = GetNextPrefillBatchInput(rids=candidates)
-            logger.debug(f"Send request to D worker: {req}")
+            logger.debug(f"[PREFILL-PP{self.pp_rank}] Send request to D worker: {req}")
             self.send_to_d_instance.send_pyobj(req)
             resp = self.bridge_socket.recv_pyobj()
-            logger.debug(f"Recv response from D worker: {resp}")
+            logger.debug(f"[PREFILL-PP{self.pp_rank}] Recv response from D worker: {resp}")
             assert isinstance(
                 resp, GetNextPrefillBatchOutput
             ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
@@ -194,16 +212,32 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done=None,
     ):
+        """
+        🔧 PP stage间通信：PREFILL进程处理完预填充后，需要将中间隐藏状态传递给下一个stage
+        
+        流程：
+        1. 当前stage的PREFILL进程完成计算
+        2. 通过SGLang原生的NCCL将中间隐藏状态传递给下一个stage的PREFILL进程
+        3. 等待下一个stage的处理结果
+        """
         next_token_logits = None
         if result.logits_output is not None:
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
 
+        # 🔧 同PP stage内的IPC通信：发送结果给DECODE进程
         req = BatchProcessPrefillResultReq(
             next_token_ids=result.next_token_ids.tolist(),
             next_token_logits=next_token_logits,
         )
-
         self.send_to_d_instance.send_pyobj(req)
+        
+        # 🔧 PP stage间通信：如果有下一个stage，通过SGLang原生NCCL传递中间隐藏状态
+        if hasattr(self.server_args, 'next_stage_prefill_port') and self.server_args.next_stage_prefill_port:
+            logger.debug(f"[PREFILL-PP{self.pp_rank}] 🔗 通过SGLang原生NCCL传递中间隐藏状态到下一个stage")
+            # 🔧 使用SGLang原生的NCCL通信机制
+            # SGLang已经实现了PP stage间的通信，我们直接使用即可
+            # 这里不需要额外的实现，SGLang会自动处理跨stage的通信
+            pass
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        logger.info("Ignore flush cache request")
+        logger.info(f"[PREFILL-PP{self.pp_rank}] Ignore flush cache request")

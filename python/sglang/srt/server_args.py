@@ -1773,6 +1773,10 @@ class SemiPDPortArgs:
     s_nccl_port: int
     p_nccl_port: int
     d_nccl_port: int
+    
+    # 新增：PP stage标识和设备ID
+    pp_rank: int = 0
+    gpu_id: int = 0  # 每个PP stage使用的GPU ID
 
     @staticmethod
     def get_nccl_port(server_args: ServerArgs) -> int:
@@ -1788,15 +1792,26 @@ class SemiPDPortArgs:
         return port
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "SemiPDPortArgs":
-        s_port = SemiPDPortArgs.get_nccl_port(server_args)
-        p_port = SemiPDPortArgs.get_nccl_port(server_args)
-        d_port = SemiPDPortArgs.get_nccl_port(server_args)
+    def init_new(server_args, pp_rank: int = 0, dp_rank: Optional[int] = None) -> "SemiPDPortArgs":
+        # 为每个PP stage分配独立的端口范围
+        port_base = 40000 + pp_rank * 1000  # 每个PP stage使用1000个端口范围
+        
+        s_port = port_base + random.randint(0, 999)
+        p_port = port_base + random.randint(0, 999) 
+        d_port = port_base + random.randint(0, 999)
+        
+        # 确保端口可用
+        while not is_port_available(s_port):
+            s_port = port_base + random.randint(0, 999)
+        while not is_port_available(p_port):
+            p_port = port_base + random.randint(0, 999)
+        while not is_port_available(d_port):
+            d_port = port_base + random.randint(0, 999)
 
         if not server_args.enable_dp_attention:
             # Create unified IPC addresses - all processes use the same addresses
-            # Generate unique prefix based on server port to avoid conflicts
-            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}"
+            # Generate unique prefix based on server port and pp_rank to avoid conflicts
+            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_pp{pp_rank}"
 
             return SemiPDPortArgs(
                 tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
@@ -1809,6 +1824,8 @@ class SemiPDPortArgs:
                 s_nccl_port=s_port,
                 p_nccl_port=p_port,
                 d_nccl_port=d_port,
+                pp_rank=pp_rank,
+                gpu_id=pp_rank,  # 每个PP stage使用不同的GPU
             )
         else:
             if server_args.nnodes > 1:
@@ -1841,6 +1858,8 @@ class SemiPDPortArgs:
                 s_nccl_port=s_port,
                 p_nccl_port=p_port,
                 d_nccl_port=d_port,
+                pp_rank=pp_rank,
+                gpu_id=pp_rank,
             )
 
 

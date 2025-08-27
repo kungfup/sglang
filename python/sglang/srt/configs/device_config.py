@@ -13,9 +13,16 @@ class DeviceConfig:
         """
         Semi-PD:
         - Allow meta device for P & D instances.
+        - Support pipeline parallel with different GPU devices per stage.
         """
         if device in ["cuda", "xpu", "hpu", "cpu", "npu", "meta"]:
             self.device_type = device
         else:
             raise RuntimeError(f"Not supported device type: {device}")
-        self.device = torch.device(self.device_type)
+        
+        # 在Semi-PD PP模式下，设备会在GroupCoordinator中正确设置
+        # 这里只设置设备类型，具体设备ID由parallel_state.py处理
+        if device == "meta":
+            self.device = None  # meta设备不需要具体设备ID
+        else:
+            self.device = torch.device(self.device_type)

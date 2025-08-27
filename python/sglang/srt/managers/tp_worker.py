@@ -171,6 +171,10 @@ class TpModelWorker:
         """Share parameters from IPC for Semi-PD."""
         self.model_runner.share_params_from_ipc(ipc_info)
 
+    def notify_weights_shared(self):
+        """Notify that weights have been shared via IPC for Semi-PD."""
+        self.model_runner.notify_weights_shared()
+
     def register_hicache_layer_transfer_counter(self, counter):
         self.hicache_layer_transfer_counter = counter
 

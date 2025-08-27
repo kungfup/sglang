@@ -815,117 +815,11 @@ def _launch_semi_pd_subprocesses(
     scheduler_procs = []
     scheduler_infos = []
     if server_args.dp_size == 1:
-        # Allocate ports for inter-process communications
-        port_args = SemiPDPortArgs.init_new(server_args)
-
-        # Launch tensor parallel scheduler processes
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-
-        p_scheduler_pipe_readers = []
-        d_scheduler_pipe_readers = []
-        tp_size_per_node = server_args.tp_size // server_args.nnodes
-        tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
-        )
-
-        p_ipc_info_queues: List[mp.Queue] = [
-            mp.Queue() for _ in range(tp_size_per_node)
-        ]
-
-        tp_rank_base = tp_size_per_node * server_args.node_rank
-
-        # Init P & D schedulers.
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                DECODE_ENGINE_SM_PERCENTILE
-            )
-            logger.info(
-                f"Launch D instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
-            )
-            d_reader, d_writer = mp.Pipe(duplex=False)
-            d_proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    None,
-                    d_writer,
-                    p_ipc_info_queue,
-                    False,
-                    InstanceRole.DECODE,
-                ),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                d_proc.start()
-            scheduler_procs.append(d_proc)
-            d_scheduler_pipe_readers.append(d_reader)
-
-        for i, reader in enumerate(d_scheduler_pipe_readers):
-            logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
-            server_args.max_total_tokens = data["max_total_num_tokens"]
-            if i > 0:
-                assert (
-                    server_args.max_total_tokens
-                    ==  data["max_total_num_tokens"]
-                )
-
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                PREFILL_ENGINE_SM_PERCENTILE
-            )
-
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            logger.info(
-                f"Launch P instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
-            )
-            p_reader, p_writer = mp.Pipe(duplex=False)
-            p_proc = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    None,
-                    p_writer,
-                    p_ipc_info_queue,
-                    True,
-                    InstanceRole.PREFILL,
-                ),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                p_proc.start()
-            scheduler_procs.append(p_proc)
-            p_scheduler_pipe_readers.append(p_reader)
-
-        assert len(p_scheduler_pipe_readers) == len(d_scheduler_pipe_readers)
-
-        for i, reader in enumerate(p_scheduler_pipe_readers):
-            logger.info(f"Waiting for P instance {tp_rank_base + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
-
-        logger.info("All schedulers are ready")
+        # 扩展：支持PP并行
+        if server_args.pp_size > 1:
+            return _launch_semi_pd_pp_tp_subprocesses(server_args)
+        else:
+            return _launch_semi_pd_tp_subprocesses(server_args)
     else:
         # Allocate ports for inter-process communications
         port_args = PortArgs.init_new(server_args)
@@ -962,6 +856,311 @@ def _launch_semi_pd_subprocesses(
             )
         return None, None, None
 
+    # Launch detokenizer process with pipe for ready signal
+    detoken_reader, detoken_writer = mp.Pipe(duplex=False)
+    detoken_proc = mp.Process(
+        target=run_detokenizer_process,
+        args=(
+            server_args,
+            port_args,
+            detoken_writer,  # Pass pipe_writer for ready signal
+        ),
+    )
+    detoken_proc.start()
+
+    # Wait for detokenizer to be ready
+    logger.info("Waiting for Detokenizer to be ready...")
+    try:
+        if detoken_reader.poll(60):  # 60 seconds timeout for L20
+            detoken_data = detoken_reader.recv()
+            logger.info(f"Received data from detokenizer: {detoken_data}")
+            if detoken_data["status"] == "ready":
+                logger.info("✅ Detokenizer is ready")
+            else:
+                logger.error(f"❌ Detokenizer failed to start: {detoken_data}")
+                raise RuntimeError("Detokenizer initialization failed")
+        else:
+            logger.error("❌ Timeout waiting for Detokenizer ready signal after 60 seconds")
+            raise RuntimeError("Detokenizer ready timeout")
+    except Exception as e:
+        logger.error(f"❌ Error waiting for Detokenizer: {e}")
+        raise
+
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    template_manager = TemplateManager()
+
+    # Assume all schedulers have the same scheduler_info
+    scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    return tokenizer_manager, template_manager, scheduler_info
+
+
+def _launch_semi_pd_tp_subprocesses(
+    server_args: ServerArgs,
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    """原有的TP并行逻辑，保持不变"""
+    from sglang.srt.managers.semi_pd_scheduler import run_scheduler_process
+
+    # Allocate ports for inter-process communications
+    port_args = SemiPDPortArgs.init_new(server_args)
+
+    # Launch tensor parallel scheduler processes
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.enable_memory_saver
+    )
+
+    p_scheduler_pipe_readers = []
+    d_scheduler_pipe_readers = []
+    tp_size_per_node = server_args.tp_size // server_args.nnodes
+    tp_rank_range = range(
+        tp_size_per_node * server_args.node_rank,
+        tp_size_per_node * (server_args.node_rank + 1),
+    )
+
+    p_ipc_info_queues: List[mp.Queue] = [
+        mp.Queue() for _ in range(tp_size_per_node)
+    ]
+
+    tp_rank_base = tp_size_per_node * server_args.node_rank
+
+    # Init P & D schedulers.
+    for tp_rank in tp_rank_range:
+        queue_idx = tp_rank % tp_size_per_node
+        p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+        gpu_id = (
+            server_args.base_gpu_id
+            + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+        )
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+            DECODE_ENGINE_SM_PERCENTILE
+        )
+        logger.info(
+            f"Launch D instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+        )
+        d_reader, d_writer = mp.Pipe(duplex=False)
+        d_proc = mp.Process(
+            target=run_scheduler_process,
+            args=(
+                server_args,
+                port_args,
+                gpu_id,
+                tp_rank,
+                None,
+                d_writer,
+                InstanceRole.DECODE,
+                p_ipc_info_queue,
+                False,
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            d_proc.start()
+        scheduler_procs.append(d_proc)
+        d_scheduler_pipe_readers.append(d_reader)
+
+    for i, reader in enumerate(d_scheduler_pipe_readers):
+        logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
+        data = reader.recv()
+        assert data["status"] == "ready"
+        scheduler_infos.append(data)
+        server_args.max_total_tokens = data["max_total_num_tokens"]
+        if i > 0:
+            assert (
+                server_args.max_total_tokens
+                ==  data["max_total_num_tokens"]
+            )
+
+    for tp_rank in tp_rank_range:
+        queue_idx = tp_rank % tp_size_per_node
+        p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+            PREFILL_ENGINE_SM_PERCENTILE
+        )
+
+        gpu_id = (
+            server_args.base_gpu_id
+            + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+        )
+        logger.info(
+            f"Launch P instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+        )
+        p_reader, p_writer = mp.Pipe(duplex=False)
+        p_proc = mp.Process(
+            target=run_scheduler_process,
+            args=(
+                server_args,
+                port_args,
+                gpu_id,
+                tp_rank,
+                None,
+                p_writer,
+                InstanceRole.PREFILL,
+                p_ipc_info_queue,
+                True,
+            ),
+        )
+        with memory_saver_adapter.configure_subprocess():
+            p_proc.start()
+        scheduler_procs.append(p_proc)
+        p_scheduler_pipe_readers.append(p_reader)
+
+    assert len(p_scheduler_pipe_readers) == len(d_scheduler_pipe_readers)
+
+    for i, reader in enumerate(p_scheduler_pipe_readers):
+        logger.info(f"Waiting for P instance {tp_rank_base + i} to be ready")
+        data = reader.recv()
+        assert data["status"] == "ready"
+        scheduler_infos.append(data)
+
+    logger.info("All schedulers are ready")
+    
+    # 启动detokenizer和tokenizer进程
+    return _launch_semi_pd_common_processes(server_args, port_args, scheduler_infos)
+
+
+def _launch_semi_pd_pp_tp_subprocesses(
+    server_args: ServerArgs,
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    """新增：支持PP+TP并行的Semi-PD启动逻辑"""
+    from sglang.srt.managers.semi_pd_scheduler import run_scheduler_process
+
+    logger.info(f"Launching Semi-PD with PP={server_args.pp_size}, TP={server_args.tp_size}")
+
+    # 为每个PP stage分配端口和设备
+    pp_port_args = []
+    for pp_rank in range(server_args.pp_size):
+        port_args = SemiPDPortArgs.init_new(server_args, pp_rank)
+        # 确保每个PP stage使用不同的GPU
+        port_args.gpu_id = server_args.base_gpu_id + pp_rank
+        pp_port_args.append(port_args)
+        logger.info(f"PP stage {pp_rank} assigned to GPU {port_args.gpu_id}")
+
+    # Launch tensor parallel scheduler processes
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.enable_memory_saver
+    )
+
+    scheduler_procs = []
+    scheduler_infos = []
+    
+    # 计算每个节点的PP和TP配置
+    nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+    )
+
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+    )
+
+    # 为每个PP stage启动进程
+    for pp_rank in pp_rank_range:
+        port_args = pp_port_args[pp_rank]
+        p_scheduler_pipe_readers = []
+        d_scheduler_pipe_readers = []
+        
+        # 为每个TP rank启动P & D schedulers
+        for tp_rank in tp_rank_range:
+            # 使用PP stage分配的GPU ID，而不是计算
+            gpu_id = port_args.gpu_id
+            
+            # 启动D instance (decode进程，替代standalone进程)
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                DECODE_ENGINE_SM_PERCENTILE
+            )
+            logger.info(
+                f"Launch D instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+            )
+            
+            d_reader, d_writer = mp.Pipe(duplex=False)
+            d_proc = mp.Process(
+                target=run_scheduler_process,
+                args=(
+                    server_args,
+                    port_args,
+                    gpu_id,
+                    tp_rank,
+                    pp_rank,  # 传递pp_rank参数
+                    None,  # dp_rank (PP模式下为None)
+                    d_writer,
+                    InstanceRole.DECODE,
+                    None,  # 不需要IPC queue，因为decode进程直接加载模型
+                    False,
+                ),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                d_proc.start()
+            scheduler_procs.append(d_proc)
+            d_scheduler_pipe_readers.append(d_reader)
+
+        # 等待所有D instances就绪
+        for i, reader in enumerate(d_scheduler_pipe_readers):
+            logger.info(f"Waiting for D instance PP{pp_rank} TP{tp_rank_range[i]} to be ready")
+            data = reader.recv()
+            assert data["status"] == "ready"
+            scheduler_infos.append(data)
+            server_args.max_total_tokens = data["max_total_num_tokens"]
+            if i > 0:
+                assert (
+                    server_args.max_total_tokens
+                    ==  data["max_total_num_tokens"]
+                )
+
+        # 启动P instances (prefill进程)
+        for tp_rank in tp_rank_range:
+            gpu_id = port_args.gpu_id
+            
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                PREFILL_ENGINE_SM_PERCENTILE
+            )
+            logger.info(
+                f"Launch P instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
+            )
+            
+            p_reader, p_writer = mp.Pipe(duplex=False)
+            p_proc = mp.Process(
+                target=run_scheduler_process,
+                args=(
+                    server_args,
+                    port_args,
+                    gpu_id,
+                    tp_rank,
+                    pp_rank,  # 传递pp_rank参数
+                    None,  # dp_rank (PP模式下为None)
+                    p_writer,
+                    InstanceRole.PREFILL,
+                    None,  # 不需要IPC queue，因为prefill进程通过NCCL获取参数
+                    True,
+                ),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                p_proc.start()
+            scheduler_procs.append(p_proc)
+            p_scheduler_pipe_readers.append(p_reader)
+
+        # 等待所有P instances就绪
+        for i, reader in enumerate(p_scheduler_pipe_readers):
+            logger.info(f"Waiting for P instance PP{pp_rank} TP{tp_rank_range[i]} to be ready")
+            data = reader.recv()
+            assert data["status"] == "ready"
+            scheduler_infos.append(data)
+
+    logger.info("All Semi-PD PP+TP schedulers are ready")
+    
+    # 启动detokenizer和tokenizer进程
+    return _launch_semi_pd_common_processes(server_args, pp_port_args[0], scheduler_infos)
+
+
+def _launch_semi_pd_common_processes(
+    server_args: ServerArgs,
+    port_args: Union[PortArgs, SemiPDPortArgs],
+    scheduler_infos: List[Dict],
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    """Semi-PD公共进程启动逻辑"""
     # Launch detokenizer process with pipe for ready signal
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
     detoken_proc = mp.Process(

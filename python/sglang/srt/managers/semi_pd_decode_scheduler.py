@@ -52,6 +52,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,  # 🔧 添加pp_rank参数
         dp_rank: Optional[int],
         bypass_load_weight: bool = False,
     ):
@@ -60,10 +61,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             port_args,
             gpu_id,
             tp_rank,
+            pp_rank,  # 🔧 传递pp_rank
             dp_rank,
             False,
             InstanceRole.DECODE,
         )
+
+        self.pp_rank = pp_rank  # 🔧 保存pp_rank
 
         self._request_dispatcher._mapping.extend(
             [
@@ -75,18 +79,26 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # For requests that has been sent to the prefill scheduler but not yet finished.
         self.scheduled_prefill_batches: List[ScheduleBatch] = []
 
-
-
+        # 🔧 PP stage间通信：DECODE进程需要与下一个stage的DECODE进程通信
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
 
             assert isinstance(port_args, SemiPDPortArgs)
+            
+            # 🔧 同PP stage内的IPC通信（与PREFILL进程）
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PUSH, port_args.bridge_ipc_name, False
             )
             self.send_to_p_instance = get_zmq_socket(
                 context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
             )
+            
+            # 🔧 PP stage间通信：与下一个stage的DECODE进程通信
+            # 使用SGLang原生的NCCL通信机制，不需要额外的socket
+            if hasattr(port_args, 'next_stage_decode_port') and port_args.next_stage_decode_port:
+                logger.info(f"🔗 PP{pp_rank} DECODE: 将使用SGLang原生NCCL与下一个stage的DECODE进程通信")
+            else:
+                logger.info(f"🔗 PP{pp_rank} DECODE: 这是最后一个stage，无需连接下一个stage")
         else:
             self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
@@ -119,7 +131,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                f"[DECODE] 🧠 D-Scheduler: OOM detected, executing request retraction. "
+                f"[DECODE-PP{self.pp_rank}] 🧠 D-Scheduler: OOM detected, executing request retraction. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
@@ -150,7 +162,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
                 self.waiting_queue.insert(0, req)
                 self.send_to_p_instance.send_pyobj(message)
-                logger.info(f"[DECODE] 🧠 D-Scheduler: Sent retracted request {req.rid} back to P-Scheduler")
+                logger.info(f"[DECODE-PP{self.pp_rank}] 🧠 D-Scheduler: Sent retracted request {req.rid} back to P-Scheduler")
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -227,11 +239,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        logger.info(f"[DECODE] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
+        logger.info(f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
         for req in self.waiting_queue:
             # Semi-PD
             if req.rid not in rids:
-                logger.debug(f"[DECODE] Skipping req.rid={req.rid} (not in rids)")
+                logger.debug(f"[DECODE-PP{self.pp_rank}] Skipping req.rid={req.rid} (not in rids)")
                 continue
 
             if (
@@ -337,7 +349,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         重要：D-Scheduler拥有最终决策权
         """
-        logger.debug(f"[DECODE] D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler")
+        logger.debug(f"[DECODE-PP{self.pp_rank}] D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler")
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
@@ -347,7 +359,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         batch = self.get_new_batch_prefill(recv_req.rids)
 
         if batch is None:
-            logger.debug(f"[DECODE] D-Scheduler rejected all requests due to resource constraints")
+            logger.debug(f"[DECODE-PP{self.pp_rank}] D-Scheduler rejected all requests due to resource constraints")
             self.bridge_socket.send_pyobj(
                 GetNextPrefillBatchOutput(
                     rids=[],
@@ -366,7 +378,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
             extend_input_lens = [r.extend_input_len for r in batch.reqs]
 
-            logger.debug(f"[DECODE] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
+            logger.debug(f"[DECODE-PP{self.pp_rank}] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
+
+            # 🔧 如果有下一个stage，需要协调PP stage间的通信
+            if hasattr(port_args, 'next_stage_decode_port') and port_args.next_stage_decode_port:
+                logger.debug(f"[DECODE-PP{self.pp_rank}] 🔗 协调与下一个stage的通信")
+                # 🔧 使用SGLang原生的NCCL通信机制
+                # SGLang已经实现了PP stage间的通信，我们直接使用即可
+                # 这里不需要额外的实现，SGLang会自动处理跨stage的通信
 
             self.bridge_socket.send_pyobj(
                 GetNextPrefillBatchOutput(

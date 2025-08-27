@@ -240,8 +240,20 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        # Semi-PD PP模式下的设备分配
         if is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
+            # 检查是否是Semi-PD PP模式
+            import os
+            if os.getenv("SGLANG_ENABLE_SEMI_PD", "").lower() in ("1", "true"):
+                # 在Semi-PD PP模式下，每个PP stage使用不同的GPU
+                # 通过环境变量SGLANG_PP_RANK来设置设备ID
+                pp_rank = int(os.getenv("SGLANG_PP_RANK", "0"))
+                gpu_id = int(os.getenv("SGLANG_GPU_ID", str(pp_rank)))
+                self.device = torch.device(f"cuda:{gpu_id}")
+                logger.info(f"Semi-PD PP mode: PP stage {pp_rank} using GPU {gpu_id}")
+            else:
+                # 原有逻辑：使用local_rank
+                self.device = torch.device(f"cuda:{local_rank}")
         else:
             self.device = torch.device("cpu")
 

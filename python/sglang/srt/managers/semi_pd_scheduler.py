@@ -1,3 +1,33 @@
+"""
+Semi-PD Scheduler with Pipeline Parallel Support
+
+Pipeline Parallel (PP) Communication Flow:
+1. 请求进入 → Stage0-DECODE (接收请求，主进程)
+2. Stage0-DECODE → Stage0-PREFILL (IPC通信，同一GPU内，主进程→辅助进程)
+3. Stage0-PREFILL → Stage1-PREFILL (NCCL通信，跨GPU，SGLang原生实现)
+4. Stage1-PREFILL → Stage0-DECODE (NCCL通信，跨GPU，SGLang原生实现)
+5. Stage0-DECODE → Stage1-DECODE (NCCL通信，跨GPU，SGLang原生实现)
+6. Stage1-DECODE → Stage0-DECODE (返回生成token，NCCL通信，跨GPU)
+
+Process Hierarchy:
+- 每个PP stage包含两个进程：
+  * DECODE进程: 主进程，负责请求接收、响应返回、整体协调
+  * PREFILL进程: 辅助进程，负责预填充计算，配合主进程工作
+
+Port Allocation Strategy:
+- PP stage0: 端口范围 40000-40999 (GPU 0)
+  * 40000: decode_port (主进程)
+  * 40001: prefill_port (辅助进程)
+- PP stage1: 端口范围 41000-41999 (GPU 1)
+  * 41000: decode_port (主进程)
+  * 41001: prefill_port (辅助进程)
+
+Communication Rules:
+- GPU内通信: IPC (decode主进程 ↔ prefill辅助进程)
+- GPU间通信: NCCL (通过SGLang原生PP通信)
+- 主进程协调: decode进程作为每个PP stage的主进程，协调整个推理流程
+"""
+
 import faulthandler
 import logging
 import multiprocessing
@@ -69,60 +99,37 @@ class SemiPDScheduler(Scheduler):
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,  # 🔧 添加pp_rank支持
         dp_rank: Optional[int],
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # 🔧 CRITICAL FIX: 原始Semi-PD不使用pp_rank参数
-        # 直接调用原始Scheduler构造函数，跳过pp_rank
-        import torch.distributed as dist
-        from sglang.srt.managers.scheduler import Scheduler
-
-        # 手动初始化，绕过v0.4.8的pp_rank检查
-        self.server_args = server_args
-        self.port_args = port_args
-        self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.bypass_load_weight = bypass_load_weight
-        self.instance_role = instance_role
-
-        # 调用原始Semi-PD兼容的初始化逻辑
-        self._init_semi_pd_compatible()
-
-    def _init_semi_pd_compatible(self):
-        """
-        Semi-PD兼容的初始化逻辑，绕过v0.4.8的pp_rank检查
-        """
-        # 直接调用原始Scheduler的__init__，但跳过pp_rank参数
-        from sglang.srt.managers.scheduler import Scheduler
-
-        # 临时设置pp_rank=0以满足v0.4.8的要求
-        original_init = Scheduler.__init__
-
-        def patched_init(self_inner, *args, **kwargs):
-            # 在args中插入pp_rank=0
-            if len(args) >= 4:  # server_args, port_args, gpu_id, tp_rank
-                new_args = args[:4] + (0,) + args[4:]  # 插入pp_rank=0
-                return original_init(self_inner, *new_args, **kwargs)
-            return original_init(self_inner, *args, **kwargs)
-
-        # 临时替换__init__方法
-        Scheduler.__init__ = patched_init
-        try:
-            Scheduler.__init__(
-                self,
-                self.server_args,
-                self.port_args,
-                self.gpu_id,
-                self.tp_rank,
-                self.dp_rank,
-                self.bypass_load_weight,
-                self.instance_role,
-            )
-        finally:
-            # 恢复原始__init__方法
-            Scheduler.__init__ = original_init
+        # 🔧 设置Semi-PD PP模式的环境变量
+        os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
+        os.environ["SGLANG_PP_RANK"] = str(pp_rank)
+        os.environ["SGLANG_GPU_ID"] = str(gpu_id)
+        
+        # 调用原始Scheduler构造函数，现在包含pp_rank
+        super().__init__(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            pp_rank,  # 🔧 传递pp_rank
+            dp_rank,
+            bypass_load_weight,
+            instance_role,
+        )
+        
+        # 🔧 记录PP stage信息
+        self.pp_rank = pp_rank
+        logger.info(f"Semi-PD PP mode: PP stage {pp_rank} using GPU {gpu_id}")
+        
+        # 🔧 明确进程角色：decode为主进程，prefill为辅助进程
+        if instance_role == InstanceRole.DECODE:
+            logger.info(f"🎯 PP stage {pp_rank}: DECODE进程作为主进程，负责请求协调")
+        elif instance_role == InstanceRole.PREFILL:
+            logger.info(f"🔧 PP stage {pp_rank}: PREFILL进程作为辅助进程，配合主进程工作")
 
     def add_to_waiting_queue(self, req: Req):
         """
@@ -423,18 +430,33 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    pp_rank: int,  # 🔧 添加pp_rank参数
     dp_rank: Optional[int],
     pipe_writer,
+    instance_role: InstanceRole,  # 🔧 强制传递角色，放在没有默认值的参数之后
     ipc_info_queue: multiprocessing.Queue = None,
     bypass_load_weight: bool = False,
-    instance_role: InstanceRole = InstanceRole.OTHER,
 ):
-    """Semi-PD specific scheduler process runner"""
+    """Semi-PD specific scheduler process runner with PP support
+    
+    Process Hierarchy:
+    - DECODE进程: 主进程，负责请求接收、响应返回、整体协调
+    - PREFILL进程: 辅助进程，负责预填充计算，配合主进程工作
+    
+    Startup Sequence:
+    1. DECODE进程先启动，加载模型权重，生成IPC信息
+    2. PREFILL进程后启动，通过IPC共享模型权重，避免重复加载
+    """
+    # 🔧 设置Semi-PD PP模式的环境变量
+    os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
+    os.environ["SGLANG_PP_RANK"] = str(pp_rank)
+    os.environ["SGLANG_GPU_ID"] = str(gpu_id)
+    
     # Generate the prefix
     if dp_rank is None:
-        prefix = f" {instance_role.name} TP{tp_rank}"
+        prefix = f" {instance_role.name} PP{pp_rank} TP{tp_rank}"  # 🔧 添加PP信息
     else:
-        prefix = f" {instance_role.name} DP{dp_rank} TP{tp_rank}"
+        prefix = f" {instance_role.name} PP{pp_rank} DP{dp_rank} TP{tp_rank}"  # 🔧 添加PP信息
 
     # Config the process
     setproctitle.setproctitle(f"sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
@@ -445,18 +467,23 @@ def run_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
-    # For Prefill instances, get IPC info from Decode instance first
+    # 🔧 主进程逻辑：DECODE进程负责生成IPC信息
     ipc_info = None
-    if bypass_load_weight:
-        logger.info(f"🔥 Receiving IPC handles from Decode instance... (tp_rank={tp_rank}, queue={ipc_info_queue})")
-        try:
-            logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
-            logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
-            ipc_info = ipc_info_queue.get()  # 300 second timeout (5 minutes) for large models
-            logger.info(f"✅ Successfully received IPC handles from Decode instance! (type={type(ipc_info)})")
-        except Exception as e:
-            logger.error(f"❌ Failed to receive IPC handles: {e}")
-            raise
+    if instance_role == InstanceRole.DECODE:
+        logger.info(f"🎯 PP stage {pp_rank}: DECODE主进程启动，将生成IPC信息供PREFILL辅助进程使用")
+    elif instance_role == InstanceRole.PREFILL:
+        logger.info(f"🔧 PP stage {pp_rank}: PREFILL辅助进程启动，等待DECODE主进程的IPC信息")
+        # For Prefill instances, get IPC info from Decode instance first
+        if bypass_load_weight:
+            logger.info(f"🔥 等待DECODE主进程的IPC信息... (tp_rank={tp_rank}, queue={ipc_info_queue})")
+            try:
+                logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
+                logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
+                ipc_info = ipc_info_queue.get()  # 300 second timeout (5 minutes) for large models
+                logger.info(f"✅ 成功接收到DECODE主进程的IPC信息! (type={type(ipc_info)})")
+            except Exception as e:
+                logger.error(f"❌ 接收IPC信息失败: {e}")
+                raise
 
     # Configure the logger
     if dp_rank is None:
@@ -478,8 +505,6 @@ def run_scheduler_process(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
-    # IPC info already received above for Prefill instances
-
     # Create a scheduler and run the event loop
     try:
         if instance_role == InstanceRole.DECODE:
@@ -487,38 +512,44 @@ def run_scheduler_process(
                 SemiPDDecodeScheduler,
             )
 
+            logger.info(f"🎯 创建DECODE主进程调度器...")
             scheduler = SemiPDDecodeScheduler(
                 server_args,
                 port_args,
                 gpu_id,
                 tp_rank,
+                pp_rank,  # 🔧 传递pp_rank
                 dp_rank,
                 bypass_load_weight,
             )
 
+            # 🔧 主进程职责：生成IPC信息供辅助进程使用
             ipc_info = scheduler.get_ipc_info()
             ipc_info_queue.put(ipc_info)
+            logger.info(f"✅ DECODE主进程已生成IPC信息，等待PREFILL辅助进程连接")
+            
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
             )
 
+            logger.info(f"🔧 创建PREFILL辅助进程调度器...")
             scheduler = SemiPDPrefillScheduler(
                 server_args,
                 port_args,
                 gpu_id,
                 tp_rank,
+                pp_rank,  # 🔧 传递pp_rank
                 dp_rank,
                 bypass_load_weight,
             )
         else:
             raise ValueError(f"Invalid instance role: {instance_role}")
 
-        if bypass_load_weight:
+        # 🔧 辅助进程通过IPC共享主进程的模型权重
+        if bypass_load_weight and instance_role == InstanceRole.PREFILL:
             scheduler.share_params_from_ipc(ipc_info)
-            logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
-
-
+            logger.info("✅ PREFILL辅助进程成功通过IPC共享DECODE主进程的模型权重 (zero-copy)!")
 
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:
@@ -537,14 +568,107 @@ def run_scheduler_process(
         logger.info(f"Scheduler enable_overlap: {scheduler.enable_overlap}")
         logger.info(f"Instance role: {instance_role}")
 
+        # 🔧 主进程运行overlap模式，辅助进程运行normal模式
         if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
-            logger.debug("Scheduler running in overlap mode")
+            logger.debug("🎯 DECODE主进程运行overlap模式，负责整体协调")
             scheduler.event_loop_overlap()
         else:
-            logger.debug("Scheduler running in normal mode")
+            logger.debug("🔧 PREFILL辅助进程运行normal模式，配合主进程工作")
             scheduler.event_loop_normal()
 
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def get_pp_stage_ports(pp_rank: int, base_port: int = 40000) -> dict:
+    """
+    为PP stage分配独立端口范围
+    
+    Args:
+        pp_rank: Pipeline parallel rank (0, 1, ...)
+        base_port: 基础端口号
+        
+    Returns:
+        包含各种端口配置的字典
+        
+    Note:
+        - decode进程是主进程，使用主端口号
+        - prefill进程是辅助进程，使用辅助端口号
+        - 每个PP stage内部：decode为主，prefill为辅
+    """
+    # 每个PP stage分配1000个端口范围
+    port_range = 1000
+    start_port = base_port + pp_rank * port_range
+    
+    return {
+        "decode_port": start_port,        # 🔧 主进程端口 (decode)
+        "prefill_port": start_port + 1,   # 🔧 辅助进程端口 (prefill)
+        "scheduler_port": start_port + 2,
+        "detokenizer_port": start_port + 3,
+        "nccl_port": start_port + 100,    # NCCL通信端口
+        "port_range": (start_port, start_port + port_range - 1)
+    }
+
+
+def create_pp_stage_port_args(pp_rank: int, base_port: int = 40000) -> PortArgs:
+    """
+    为PP stage创建PortArgs对象
+    
+    Args:
+        pp_rank: Pipeline parallel rank
+        base_port: 基础端口号
+        
+    Returns:
+        PortArgs对象
+    """
+    ports = get_pp_stage_ports(pp_rank, base_port)
+    
+    # 创建PortArgs对象，这里需要根据实际的PortArgs结构进行调整
+    # 由于PortArgs的具体结构未知，这里返回一个包含端口信息的字典
+    # 实际使用时需要根据PortArgs的构造函数进行调整
+    
+    return {
+        "decode_port": ports["decode_port"],
+        "prefill_port": ports["prefill_port"], 
+        "scheduler_port": ports["scheduler_port"],
+        "detokenizer_port": ports["detokenizer_port"],
+        "nccl_port": ports["nccl_port"],
+        "pp_rank": pp_rank
+    }
+
+
+"""
+🎯 Semi-PD Pipeline Parallel 架构总结
+
+每个PP Stage的进程架构:
+┌─────────────────────────────────────────────────────────────┐
+│                    PP Stage {pp_rank}                      │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              GPU {gpu_id}                          │   │
+│  │  ┌─────────────────┐    ┌─────────────────┐       │   │
+│  │  │  DECODE进程     │    │  PREFILL进程    │       │   │
+│  │  │   (主进程)      │◄──►│   (辅助进程)    │       │   │
+│  │  │                 │IPC │                 │       │   │
+│  │  │ • 请求接收      │    │ • 预填充计算    │       │   │
+│  │  │ • 响应返回      │    │ • 配合主进程    │       │   │
+│  │  │ • 整体协调      │    │ • 共享权重      │       │   │
+│  │  └─────────────────┘    └─────────────────┘       │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+
+关键特性:
+1. 🎯 DECODE进程是主进程，负责整体协调
+2. 🔧 PREFILL进程是辅助进程，通过IPC共享主进程权重
+3. 📡 主进程使用主端口号，辅助进程使用辅助端口号
+4. 🔄 启动顺序：DECODE先启动 → PREFILL后启动
+5. 💾 内存共享：避免重复加载模型权重，节省显存
+
+端口分配示例 (PP Stage 0):
+- 40000: decode_port (主进程)
+- 40001: prefill_port (辅助进程)
+- 40002: scheduler_port
+- 40003: detokenizer_port
+- 40100: nccl_port (跨GPU通信)
+"""

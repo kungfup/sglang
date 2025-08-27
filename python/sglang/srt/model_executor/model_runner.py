@@ -807,6 +807,13 @@ class ModelRunner:
 
         logger.info("🔍 [ORIGINAL SEMI-PD] Parameter sharing from IPC completed")
 
+    def notify_weights_shared(self):
+        """Notify that weights have been shared via IPC for Semi-PD."""
+        logger.info("🔍 [ORIGINAL SEMI-PD] Weights shared notification received")
+        # 这里可以添加权重共享后的初始化逻辑
+        # 例如：初始化CUDA图、预热缓存等
+        pass
+
     def load_model(self):
         if not self.bypass_load_weight:
             before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
