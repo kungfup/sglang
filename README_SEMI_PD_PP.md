@@ -179,3 +179,80 @@ SGLANG_GPU_ID=<gpu_id>           # 设置GPU ID
 2. **负载均衡**: 实现智能的请求分配策略
 3. **容错机制**: 增强错误恢复和容错能力
 4. **性能优化**: 进一步优化通信和计算性能 
+
+
+**你的架构设计是正确的：**
+- ✅ 每个PP stage都需要一个DECODE进程来加载模型参数和管理KV cache
+- ✅ 通过MPS启动不同的进程，这是正确的做法
+- ✅ DECODE进程就绪后再启动PREFILL进程，这个逻辑也是对的
+
+## 🔍 原生sglang分布式启动机制分析
+
+### 1. **启动流程**
+
+原生sglang的启动流程是这样的：
+
+```
+<code_block_to_apply_changes_from>
+```
+
+### 2. **分布式初始化时机**
+
+**关键发现**：原生sglang的分布式初始化是在`ModelRunner.__init__()`中进行的，而不是在进程启动后！
+
+```python
+# 在 TpModelWorker.__init__() 中
+self.model_runner = ModelRunner(
+    model_path=server_args.model_path,
+    # ... 其他参数
+)
+
+# 在 ModelRunner.__init__() 中
+min_per_gpu_memory = self.init_torch_distributed()  #  这里初始化分布式！
+```
+
+### 3. **分布式初始化参数**
+
+从代码可以看到，原生sglang的分布式初始化参数是：
+
+```python
+init_distributed_environment(
+    backend=backend,
+    world_size=self.tp_size * self.pp_size,  #  总进程数 = TP × PP
+    rank=self.tp_size * self.pp_rank + self.tp_rank,  #  全局rank计算
+    local_rank=self.gpu_id,
+    distributed_init_method=dist_init_method,
+    timeout=self.server_args.dist_timeout,  #  超时设置
+)
+```
+
+### 4. **关键差异分析**
+
+**原生sglang vs 我们的Semi-PD**：
+
+| 方面 | 原生sglang | 我们的Semi-PD |
+|------|------------|---------------|
+| **分布式初始化时机** | 在ModelRunner初始化时 | 在进程启动后 |
+| **进程启动顺序** | 先启动所有进程，再初始化分布式 | 先启动PP0，等待就绪，再启动PP1 |
+| **分布式超时** | 使用`server_args.dist_timeout` | 没有设置超时 |
+| **进程同步** | 通过torch.distributed自动同步 | 通过pipe手动同步 |
+
+### 5. **问题根源**
+
+我们的问题在于：
+
+1. **时机不对**：我们在进程启动后等待就绪，但原生sglang是在ModelRunner初始化时就进行分布式初始化
+2. **同步机制不同**：原生sglang依赖torch.distributed的自动同步，我们依赖手动pipe同步
+3. **超时缺失**：我们没有设置分布式初始化超时，可能导致无限等待
+
+### 6. **正确的修复方向**
+
+应该参考原生sglang的方式：
+
+1. **先启动所有进程**：让所有PP进程都启动
+2. **让每个进程自己初始化分布式**：在ModelRunner初始化时自动进行
+3. **设置合理的超时**：避免无限等待
+4. **依赖torch.distributed的同步**：而不是手动pipe同步
+
+这就是为什么我们的修复没有完全解决问题的原因！我们需要重新设计启动逻辑，让它更接近原生sglang的方式。
+
