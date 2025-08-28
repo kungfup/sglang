@@ -57,7 +57,7 @@ Semi-PD Pipeline Parallel (Semi-PD PP) 是SGLang中Semi-PD调度器的Pipeline P
 ### 1. 主进程设计
 - **DECODE进程是主进程**: 负责请求接收、响应返回、整体协调
 - **PREFILL进程是辅助进程**: 负责预填充计算，配合主进程工作
-- **启动顺序**: DECODE先启动 → PREFILL后启动
+- **启动顺序**: 所有PP stage的DECODE进程同时启动 → 等待就绪 → 所有PP stage的PREFILL进程同时启动
 
 ### 2. 内存共享
 - **避免重复加载**: PREFILL进程通过IPC共享DECODE进程的模型权重
@@ -178,13 +178,7 @@ SGLANG_GPU_ID=<gpu_id>           # 设置GPU ID
 1. **动态PP stage**: 支持运行时动态调整PP stage数量
 2. **负载均衡**: 实现智能的请求分配策略
 3. **容错机制**: 增强错误恢复和容错能力
-4. **性能优化**: 进一步优化通信和计算性能 
-
-
-**你的架构设计是正确的：**
-- ✅ 每个PP stage都需要一个DECODE进程来加载模型参数和管理KV cache
-- ✅ 通过MPS启动不同的进程，这是正确的做法
-- ✅ DECODE进程就绪后再启动PREFILL进程，这个逻辑也是对的
+4. **性能优化**: 进一步优化通信和计算性能
 
 ## 🔍 原生sglang分布式启动机制分析
 
@@ -193,7 +187,7 @@ SGLANG_GPU_ID=<gpu_id>           # 设置GPU ID
 原生sglang的启动流程是这样的：
 
 ```
-<code_block_to_apply_changes_from>
+主进程启动 → 解析命令行参数 → 启动所有PP stage进程 → 每个进程自动初始化分布式 → 所有组件就绪
 ```
 
 ### 2. **分布式初始化时机**
@@ -208,7 +202,7 @@ self.model_runner = ModelRunner(
 )
 
 # 在 ModelRunner.__init__() 中
-min_per_gpu_memory = self.init_torch_distributed()  #  这里初始化分布式！
+min_per_gpu_memory = self.init_torch_distributed()  # 这里初始化分布式！
 ```
 
 ### 3. **分布式初始化参数**
@@ -218,11 +212,11 @@ min_per_gpu_memory = self.init_torch_distributed()  #  这里初始化分布式�
 ```python
 init_distributed_environment(
     backend=backend,
-    world_size=self.tp_size * self.pp_size,  #  总进程数 = TP × PP
-    rank=self.tp_size * self.pp_rank + self.tp_rank,  #  全局rank计算
+    world_size=self.tp_size * self.pp_size,  # 总进程数 = TP × PP
+    rank=self.tp_size * self.pp_rank + self.tp_rank,  # 全局rank计算
     local_rank=self.gpu_id,
     distributed_init_method=dist_init_method,
-    timeout=self.server_args.dist_timeout,  #  超时设置
+    timeout=self.server_args.dist_timeout,  # 超时设置
 )
 ```
 
@@ -255,4 +249,557 @@ init_distributed_environment(
 4. **依赖torch.distributed的同步**：而不是手动pipe同步
 
 这就是为什么我们的修复没有完全解决问题的原因！我们需要重新设计启动逻辑，让它更接近原生sglang的方式。
+
+## 🔍 Semi-PD TP=2 分布式启动机制详解
+
+### 1. **启动流程概览**
+
+```
+主进程 → DECODE Schedulers (TP0, TP1) → PREFILL Schedulers (TP0, TP1)
+   ↓              ↓                                    ↓
+启动控制      模型加载+KV Cache管理              推理服务
+```
+
+### 2. **TP=2时的具体启动时序**
+
+#### **第一阶段：DECODE Schedulers启动**
+```python
+# 设置CUDA MPS为100% SM
+os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(DECODE_ENGINE_SM_PERCENTILE)
+
+for tp_rank in tp_rank_range:  # tp_rank = 0, 1
+    d_proc = mp.Process(
+        target=run_scheduler_process,
+        args=(
+            server_args, port_args, gpu_id, tp_rank, None,
+            d_writer, p_ipc_info_queue, False, InstanceRole.DECODE
+        )
+    )
+    d_proc.start()
+```
+
+**关键点：**
+- 每个TP rank启动一个**DECODE进程**
+- 使用**100%的GPU SM资源**
+- `bypass_load_weight=False`：**完整加载模型权重**
+- 初始化完整的KV Cache和推理环境
+
+#### **第二阶段：等待DECODE就绪**
+```python
+for i, reader in enumerate(d_scheduler_pipe_readers):
+    logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
+    data = reader.recv()
+    assert data["status"] == "ready"
+    scheduler_infos.append(data)
+    server_args.max_total_tokens = data["max_total_num_tokens"]
+```
+
+**关键点：**
+- 主进程等待所有DECODE实例就绪
+- 获取`max_total_num_tokens`等关键信息
+- 确保所有TP rank的配置一致
+
+#### **第三阶段：PREFILL Schedulers启动**
+```python
+# 设置CUDA MPS为80% SM  
+os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(PREFILL_ENGINE_SM_PERCENTILE)
+
+for tp_rank in tp_rank_range:  # tp_rank = 0, 1
+    p_proc = mp.Process(
+        target=run_scheduler_process,
+        args=(
+            server_args, port_args, gpu_id, tp_rank, None,
+            p_writer, p_ipc_info_queue, True, InstanceRole.PREFILL
+        )
+    )
+    p_proc.start()
+```
+
+**关键点：**
+- 每个TP rank启动一个**PREFILL进程**
+- 使用**80%的GPU SM资源**
+- `bypass_load_weight=True`：**跳过权重加载**
+- 通过IPC队列获取DECODE实例的资源信息
+
+### 3. **分布式初始化机制**
+
+#### **NCCL端口分配**
+```python
+# 在 SemiPDPortArgs.init_new() 中
+s_port = SemiPDPortArgs.get_nccl_port(server_args)  
+p_port = SemiPDPortArgs.get_nccl_port(server_args) 
+d_port = SemiPDPortArgs.get_nccl_port(server_args) 
+```
+
+**关键点：**
+- 每个TP rank分配**独立的NCCL端口**
+- 支持**多节点扩展**：`tp_size_per_node = tp_size // nnodes`
+- 每个节点内的TP rank使用连续的GPU ID
+
+#### **IPC队列同步机制**
+```python
+# 为每个TP rank创建独立的IPC队列
+p_ipc_info_queues: List[mp.Queue] = [
+    mp.Queue() for _ in range(tp_size_per_node)
+]
+
+# DECODE实例将资源信息放入队列
+d_proc = mp.Process(
+    target=run_scheduler_process,
+    args=(..., p_ipc_info_queue, ...)  # 传递队列引用
+)
+
+# PREFILL实例从队列获取资源信息
+p_proc = mp.Process(
+    target=run_scheduler_process,
+    args=(..., p_ipc_info_queue, True, ...)  # bypass_load_weight=True
+)
+```
+
+**关键点：**
+- 每个TP rank有**独立的IPC队列**
+- DECODE实例将**模型权重和KV Cache信息**放入队列
+- PREFILL实例通过`bypass_load_weight=True`从队列获取资源
+
+### 4. **Torch Distributed初始化**
+
+#### **在semi_pd_scheduler.py中的初始化**
+```python
+# 创建scheduler时会自动初始化torch distributed
+if instance_role == InstanceRole.DECODE:
+    scheduler = SemiPDDecodeScheduler(
+        server_args, port_args, gpu_id, tp_rank, dp_rank, bypass_load_weight
+    )
+    ipc_info = scheduler.get_ipc_info()
+    ipc_info_queue.put(ipc_info)
+```
+
+**关键点：**
+- 每个DECODE实例在创建时自动初始化**torch.distributed**
+- 使用分配的NCCL端口建立**进程间通信**
+- 支持**tensor parallel**和**data parallel**的混合并行
+
+### 5. **详细启动时序**
+
+```
+T0: 主进程启动
+T1: 配置日志和环境变量
+T2: 准备模型和tokenizer路径
+T3: 分配SemiPDPortArgs (NCCL端口等)
+T4: 创建IPC队列数组 (每个TP rank一个)
+T5: 启动DECODE Schedulers (TP0, TP1) - 100% SM
+T6: 等待所有DECODE实例就绪
+T7: 获取max_total_num_tokens等配置
+T8: 启动PREFILL Schedulers (TP0, TP1) - 80% SM
+T9: 等待所有PREFILL实例就绪
+T10: 启动detokenizer进程
+T11: 启动tokenizer进程
+T12: 所有组件就绪，开始服务请求
+```
+
+### 6. **为什么P和D能在同一GPU上运行？**
+
+#### **CUDA MPS资源隔离**
+- **DECODE实例**：100% SM资源，负责模型推理和KV Cache管理
+- **PREFILL实例**：80% SM资源，负责请求预处理和token生成
+- 通过**CUDA Multi-Process Service**实现SM级别的资源分配
+
+#### **内存共享机制**
+- **模型权重**：DECODE实例加载，PREFILL实例通过IPC共享
+- **KV Cache**：DECODE实例作为唯一管理者
+- **请求队列**：通过ZMQ IPC实现进程间通信
+
+这种设计的**核心优势**是：
+1. **资源隔离**：通过CUDA MPS实现精确的SM资源分配
+2. **内存效率**：避免重复加载模型权重，节省显存
+3. **并发执行**：P和D实例可以同时处理不同的请求
+4. **扩展性**：支持任意TP size的分布式训练
+
+## 🔍 SGLang原生Pipeline并行分布式初始化机制详解
+
+### 1. **Pipeline并行架构概览**
+
+```
+PP Stage 0 (GPU 0) → PP Stage 1 (GPU 1) → ... → PP Stage N (GPU N)
+     ↓                    ↓                        ↓
+  模型层0-10          模型层11-20              模型层21-30
+```
+
+### 2. **分布式初始化时机**
+
+#### **第一阶段：World Group初始化**
+```python
+def init_world_group(ranks: List[int], local_rank: int, backend: str) -> GroupCoordinator:
+    return GroupCoordinator(
+        group_ranks=[ranks],
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=False,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        group_name="world",
+    )
+```
+
+**关键点：**
+- 在**torch.distributed.init_process_group()**之后立即调用
+- 建立**全局进程组**，包含所有参与训练的进程
+- 使用**gloo后端**进行CPU协调，**NCCL后端**进行GPU通信
+
+#### **第二阶段：Model Parallel Groups初始化**
+```python
+def initialize_model_parallel(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    backend: Optional[str] = None,
+) -> None:
+    # 验证world_size = tp_size * pp_size
+    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+        raise RuntimeError(
+            f"world_size ({world_size}) is not equal to "
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+        )
+```
+
+**关键点：**
+- 在**模型加载之前**调用
+- 确保`world_size = tp_size × pp_size`
+- 同时初始化**tensor parallel**和**pipeline parallel**组
+
+### 3. **端口号分配机制**
+
+#### **NCCL端口分配**
+```python
+# 在GroupCoordinator.__init__中
+for ranks in group_ranks:
+    device_group = torch.distributed.new_group(
+        ranks, backend=torch_distributed_backend  # NCCL后端
+    )
+    # CPU协调组使用gloo后端
+    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+```
+
+**端口分配策略：**
+- **NCCL端口**：由torch.distributed自动分配，通常从**29500**开始
+- **ZMQ端口**：在`SemiPDPortArgs`中定义，支持自定义偏移
+- **IPC名称**：每个PP stage有独立的IPC通信名称
+
+#### **Semi-PD Pipeline并行端口配置**
+```python
+@dataclasses.dataclass
+class SemiPDPortArgs:
+    """Port arguments for Semi-PD (Semi-Prefill-Decode) disaggregation"""
+    tokenizer_ipc_name: str
+    s_scheduler_input_ipc_name: str
+    p_scheduler_input_ipc_name: str
+    d_scheduler_input_ipc_name: str
+    detokenizer_ipc_name: str
+    bridge_ipc_name: str
+    rpc_ipc_name: str
+    weight_share_ipc_name: str
+    
+    s_nccl_port: int
+    p_nccl_port: int
+    d_nccl_port: int
+```
+
+**端口分配示例（PP=2, TP=2）：**
+```
+PP0 TP0: s_nccl_port=29500, p_nccl_port=29501, d_nccl_port=29502
+PP0 TP1: s_nccl_port=29503, p_nccl_port=29504, d_nccl_port=29505
+PP1 TP0: s_nccl_port=29506, p_nccl_port=29507, d_nccl_port=29508
+PP1 TP1: s_nccl_port=29509, p_nccl_port=29510, d_nccl_port=29511
+```
+
+### 4. **Pipeline并行组构建**
+
+#### **Pipeline Parallel Groups构建**
+```python
+# Build the pipeline model-parallel groups.
+num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+global _PP
+assert _PP is None, "pipeline model parallel group is already initialized"
+group_ranks = []
+for i in range(num_pipeline_model_parallel_groups):
+    ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+    group_ranks.append(ranks)
+
+_PP = init_model_parallel_group(
+    group_ranks,
+    get_world_group().local_rank,
+    backend,
+    use_custom_allreduce=False,  # Pipeline parallel不需要custom allreduce
+    group_name="pp",
+)
+```
+
+**组构建逻辑：**
+- **PP=2, TP=2**时，总进程数=4
+- **Pipeline组0**：[rank0, rank2] (PP0的TP0和TP1)
+- **Pipeline组1**：[rank1, rank3] (PP1的TP0和TP1)
+- **Tensor组0**：[rank0, rank1] (TP0的PP0和PP1)
+- **Tensor组1**：[rank2, rank3] (TP1的PP0和PP1)
+
+### 5. **详细启动时序**
+
+```
+T0: 主进程启动
+T1: 解析命令行参数 (--pipeline-parallel-size, --tensor-parallel-size)
+T2: 调用torch.distributed.init_process_group()
+T3: 初始化World Group (所有进程的全局组)
+T4: 调用initialize_model_parallel(tp_size, pp_size)
+T5: 构建Tensor Parallel Groups
+T6: 构建Pipeline Parallel Groups
+T7: 分配NCCL端口和IPC名称
+T8: 启动各个PP stage的进程
+T9: 每个PP stage加载对应的模型层
+T10: 建立PP stage间的通信连接
+T11: 所有组件就绪，开始服务请求
+```
+
+### 6. **Pipeline并行的关键特性**
+
+#### **通信模式**
+- **Forward Pass**：数据从PP0流向PP1，最后流向PPN
+- **Backward Pass**：梯度从PPN流向PP1，最后流向PP0
+- **Micro-batching**：支持micro-batch来隐藏通信延迟
+
+#### **约束条件**
+```python
+if self.pp_size > 1:
+    assert (
+        self.disable_overlap_schedule
+        and self.speculative_algorithm is None
+        and not self.enable_mixed_chunk
+    ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+```
+
+**关键限制：**
+- **不支持overlap schedule**
+- **不支持speculative decoding**
+- **不支持mixed chunked prefill**
+- 这些限制是为了确保pipeline并行的正确性
+
+### 7. **Semi-PD适配Pipeline并行的关键点**
+
+#### **IPC队列扩展**
+```python
+# 需要为每个PP stage创建独立的IPC队列
+ipc_queues = {}
+for pp_rank in range(pp_size):
+    for tp_rank in range(tp_size):
+        ipc_queues[(pp_rank, tp_rank)] = mp.Queue()
+```
+
+#### **权重共享机制**
+- 每个PP stage的DECODE进程加载对应的模型层
+- 通过IPC在不同PP stage间共享权重信息
+- 支持跨PP stage的零拷贝参数传递
+
+## 🚀 Semi-PD Pipeline并行实现方案
+
+### 1. **修正后的启动时序**
+
+```
+T0: 主进程启动
+T1: 配置日志和环境变量
+T2: 准备模型和tokenizer路径
+T3: 分配Pipeline并行端口 (每个PP stage独立端口范围)
+T4: 创建IPC队列矩阵 (每个(PP, TP)组合一个队列)
+T5: 同时启动所有PP stage的DECODE进程
+T6: 等待所有DECODE进程就绪 (设置超时)
+T7: 同时启动所有PP stage的PREFILL进程
+T8: 等待所有PREFILL进程就绪 (设置超时)
+T9: 启动其他辅助进程
+T10: 所有组件就绪，开始服务请求
+```
+
+### 2. **分布式初始化修复**
+
+#### **在ModelRunner初始化时进行分布式初始化**
+```python
+class SemiPDModelRunner:
+    def __init__(self, server_args, port_args, pp_rank, tp_rank, pp_size, tp_size):
+        # 关键：在模型加载前初始化分布式
+        self.init_torch_distributed(pp_rank, tp_rank, pp_size, tp_size)
+        
+        # 然后加载模型
+        self.load_model()
+    
+    def init_torch_distributed(self, pp_rank, tp_rank, pp_size, tp_size):
+        # 计算全局rank
+        world_size = pp_size * tp_size
+        global_rank = pp_rank * tp_size + tp_rank
+        
+        # 设置环境变量
+        os.environ['RANK'] = str(global_rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['LOCAL_RANK'] = str(tp_rank)
+        os.environ['PP_RANK'] = str(pp_rank)
+        os.environ['TP_RANK'] = str(tp_rank)
+        
+        # 初始化torch.distributed
+        torch.distributed.init_process_group(
+            backend='nccl',
+            world_size=world_size,
+            rank=global_rank,
+            init_method='env://',
+            timeout=timedelta(seconds=300)  # 设置超时
+        )
+        
+        # 初始化SGLang的并行组
+        from sglang.srt.distributed.parallel_state import initialize_model_parallel
+        initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size
+        )
+```
+
+### 3. **IPC队列矩阵设计**
+
+#### **为每个(PP, TP)组合创建独立队列**
+```python
+class SemiPDPipelinePortManager:
+    def __init__(self, pp_size: int, tp_size: int):
+        self.pp_size = pp_size
+        self.tp_size = tp_size
+        
+        # 为每个(PP, TP)组合创建独立的IPC队列
+        self.ipc_queues = {}
+        for pp_rank in range(pp_size):
+            for tp_rank in range(tp_size):
+                self.ipc_queues[(pp_rank, tp_rank)] = {
+                    'decode_to_prefill': mp.Queue(),
+                    'prefill_to_decode': mp.Queue(),
+                    'weight_share': mp.Queue(),
+                    'cross_stage': mp.Queue()
+                }
+        
+        # 为每个PP stage分配端口范围
+        self.pp_stage_ports = {}
+        for pp_rank in range(pp_size):
+            base_port = 40000 + pp_rank * 100
+            self.pp_stage_ports[pp_rank] = {
+                'decode': base_port + 0,
+                'prefill': base_port + 1,
+                'scheduler': base_port + 2,
+                'detokenizer': base_port + 3,
+                'nccl': base_port + 100
+            }
+```
+
+### 4. **Pipeline并行通信实现**
+
+#### **跨PP stage的通信机制**
+```python
+class SemiPDPipelineScheduler:
+    def __init__(self, pp_rank, tp_rank, pp_size, tp_size):
+        self.pp_rank = pp_rank
+        self.tp_rank = tp_rank
+        self.pp_size = pp_size
+        self.tp_size = tp_size
+        
+        # 获取下一个PP stage的rank
+        self.next_pp_rank = (pp_rank + 1) % pp_size
+        self.prev_pp_rank = (pp_rank - 1) % pp_size
+    
+    def forward_pass(self, input_tensor):
+        """Pipeline并行的前向传播"""
+        if self.pp_rank == 0:
+            # 第一个stage：处理输入
+            output = self.process_input(input_tensor)
+        else:
+            # 中间stage：接收上一个stage的输出
+            output = self.receive_from_prev_stage()
+            output = self.process_intermediate(output)
+        
+        if self.pp_rank < self.pp_size - 1:
+            # 不是最后一个stage：发送给下一个stage
+            self.send_to_next_stage(output)
+        
+        return output
+    
+    def backward_pass(self, grad_tensor):
+        """Pipeline并行的反向传播"""
+        if self.pp_rank == self.pp_size - 1:
+            # 最后一个stage：处理梯度
+            grad = self.process_gradient(grad_tensor)
+        else:
+            # 中间stage：接收下一个stage的梯度
+            grad = self.receive_from_next_stage()
+            grad = self.process_intermediate_gradient(grad)
+        
+        if self.pp_rank > 0:
+            # 不是第一个stage：发送给上一个stage
+            self.send_to_prev_stage(grad)
+        
+        return grad
+```
+
+### 5. **启动脚本实现**
+
+#### **Pipeline并行的启动脚本**
+```python
+# launch_semipd_pipeline.py
+def main():
+    pp_size = 2
+    tp_size = 2
+    
+    # 分配端口
+    port_manager = SemiPDPipelinePortManager(pp_size, tp_size)
+    
+    # 启动所有PP stage的进程
+    launch_all_pp_stages(pp_size, tp_size, port_manager)
+    
+    # 等待所有进程就绪
+    wait_for_all_processes_ready(pp_size, tp_size)
+    
+    print("🎉 Semi-PD Pipeline Parallel 启动完成！")
+
+def launch_all_pp_stages(pp_size: int, tp_size: int, port_manager):
+    """启动所有PP stage的进程"""
+    # 第一阶段：启动所有DECODE进程
+    decode_processes = {}
+    for pp_rank in range(pp_size):
+        for tp_rank in range(tp_size):
+            proc = mp.Process(
+                target=run_decode_process,
+                args=(pp_rank, tp_rank, pp_size, tp_size, port_manager)
+            )
+            proc.start()
+            decode_processes[(pp_rank, tp_rank)] = proc
+    
+    # 等待所有DECODE进程就绪
+    wait_for_decode_processes_ready(decode_processes, timeout=300)
+    
+    # 第二阶段：启动所有PREFILL进程
+    prefill_processes = {}
+    for pp_rank in range(pp_size):
+        for tp_rank in range(tp_size):
+            proc = mp.Process(
+                target=run_prefill_process,
+                args=(pp_rank, tp_rank, pp_size, tp_size, port_manager)
+            )
+            proc.start()
+            prefill_processes[(pp_rank, tp_rank)] = proc
+    
+    # 等待所有PREFILL进程就绪
+    wait_for_prefill_processes_ready(prefill_processes, timeout=300)
+```
+
+## 🎯 总结
+
+通过以上分析和修复方案，Semi-PD Pipeline并行的关键改进点包括：
+
+1. **启动时序修正**：从串行启动改为并行启动所有PP stage
+2. **分布式初始化时机**：在ModelRunner初始化时进行，而不是进程启动后
+3. **超时机制**：设置合理的分布式初始化超时，避免无限等待
+4. **IPC队列扩展**：为每个(PP, TP)组合创建独立的通信队列
+5. **通信机制**：实现跨PP stage的NCCL通信和同PP stage的IPC通信
+
+这样修改后，Semi-PD就能正确支持Pipeline并行，实现与SGLang原生Pipeline并行相同的功能和性能！
 
