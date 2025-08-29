@@ -907,11 +907,12 @@ def _launch_semi_pd_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
-                        pp_rank,  # 现在传递正确的pp_rank
+                        None,  # dp_rank=None for DECODE instances
                         d_writer,
                         p_ipc_info_queue,
                         False,  # bypass_load_weight=False - D instances load weights
                         InstanceRole.DECODE,
+                        pp_rank,  # 🔧 正确传递pp_rank参数
                     ),
                 )
                 with memory_saver_adapter.configure_subprocess():
@@ -977,11 +978,12 @@ def _launch_semi_pd_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
-                        pp_rank,  # 现在传递正确的pp_rank
+                        None,  # dp_rank=None for PREFILL instances
                         p_writer,
                         p_ipc_info_queue,
                         True,  # bypass_load_weight=True - P instances share weights
                         InstanceRole.PREFILL,
+                        pp_rank,  # 🔧 正确传递pp_rank参数
                     ),
                 )
                 with memory_saver_adapter.configure_subprocess():

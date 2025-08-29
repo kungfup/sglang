@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.distributed.parallel_state import get_tp_group
 
 logger = logging.getLogger(__name__)
 
@@ -142,11 +143,22 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
+        # 🔧 Semi-PD模式: 每个PP stage独立，使用tp_rank作为索引
+        if hasattr(server_args, 'enable_semi_pd') and server_args.enable_semi_pd:
+            broadcast_rank = tp_rank
+            # 在Semi-PD模式下，使用TP组而不是world组
+            broadcast_group = get_tp_group().cpu_group
+            broadcast_src = get_tp_group().ranks[0]
+        else:
+            broadcast_rank = self.tp_size * self.pp_rank + tp_rank
+            broadcast_group = self.world_group.cpu_group
+            broadcast_src = self.world_group.ranks[0]
+            
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
+            broadcast_rank,
+            broadcast_group,
+            src=broadcast_src,
         )[0]
         set_random_seed(self.random_seed)
 

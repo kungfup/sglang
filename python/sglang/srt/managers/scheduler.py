@@ -1132,13 +1132,21 @@ class Scheduler(
         else:
             if self.attn_tp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.pp_rank - 1) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
-                )
+                # 🔧 修复 Semi-PD 模式下的 rank 计算问题
+                # 在 Semi-PD 模式下，每个 PP stage 都是独立的进程组
+                # 不需要跨 PP stage 的点对点通信
+                if hasattr(self, 'server_args') and hasattr(self.server_args, 'enable_semi_pd') and self.server_args.enable_semi_pd:
+                    # Semi-PD 模式：直接返回空列表，避免分布式通信
+                    recv_reqs = []
+                else:
+                    # 原始模式：使用点对点通信
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.pp_rank - 1) * self.tp_size + dp_offset,
+                        self.pp_rank * self.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
 
