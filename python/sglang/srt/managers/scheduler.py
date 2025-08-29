@@ -224,6 +224,10 @@ class Scheduler(
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
+        logger.info(f"[SCHEDULER] 开始初始化调度器")
+        logger.info(f"[SCHEDULER] 进程信息: gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}, dp_rank={dp_rank}")
+        logger.info(f"[SCHEDULER] 实例角色: {instance_role}")
+        
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -254,33 +258,26 @@ class Scheduler(
                 self.dp_size,
             )
         )
+        
+        logger.info(f"[SCHEDULER] 配置信息: tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}")
+        logger.info(f"[SCHEDULER] 注意力配置: attn_tp_rank={self.attn_tp_rank}, attn_tp_size={self.attn_tp_size}, attn_dp_rank={self.attn_dp_rank}")
+        logger.info(f"[SCHEDULER] 调度策略: schedule_policy={self.schedule_policy}, enable_overlap={self.enable_overlap}")
 
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
         
-        # Semi-PD Pipeline Parallel: 初始化IPC权重共享
+        # Semi-PD: 设置实例角色
         self.instance_role = instance_role
         if self.server_args.enable_semi_pd:
-            assert isinstance(port_args, SemiPDPortArgs)
-            if instance_role == InstanceRole.PREFILL:
-                # PREFILL进程需要连接到DECODE进程的IPC权重共享端口
-                self.weight_share_socket = get_zmq_socket(
-                    context, zmq.REQ, port_args.weight_share_ipc_name, False
-                )
-                logger.info(f"[PREFILL-PP{pp_rank}] Initialized weight sharing IPC socket: {port_args.weight_share_ipc_name}")
-            elif instance_role == InstanceRole.DECODE:
-                # DECODE进程需要绑定IPC权重共享端口作为服务器
-                self.weight_share_socket = get_zmq_socket(
-                    context, zmq.REP, port_args.weight_share_ipc_name, True
-                )
-                logger.info(f"[DECODE-PP{pp_rank}] Initialized weight sharing IPC server socket: {port_args.weight_share_ipc_name}")
-            else:
-                self.weight_share_socket = None
+            logger.info(f"[SCHEDULER] Semi-PD模式: 实例角色 {instance_role}")
+            # 原始的 Semi-PD 实现中没有权重共享 IPC，使用内存共享
+            self.weight_share_socket = None
         else:
             self.weight_share_socket = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
+            logger.info(f"[SCHEDULER] 当前进程是PP rank 0且注意力TP rank 0，初始化通信socket")
             if self.server_args.enable_semi_pd:
                 assert isinstance(port_args, SemiPDPortArgs)
                 if instance_role == InstanceRole.PREFILL:
@@ -330,16 +327,20 @@ class Scheduler(
                     ]
                 )
         else:
+            logger.info(f"[SCHEDULER] 当前进程不是PP rank 0或注意力TP rank 0，跳过通信socket初始化")
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
+        logger.info(f"[SCHEDULER] 开始初始化tokenizer")
         self.init_tokenizer()
+        logger.info(f"[SCHEDULER] tokenizer初始化完成")
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
+            logger.info(f"[SCHEDULER] 初始化推理解析器: {self.server_args.reasoning_parser}")
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
@@ -356,31 +357,38 @@ class Scheduler(
         if self.server_args.enable_semi_pd:
             if self.enable_overlap and instance_role == InstanceRole.DECODE:
                 TpWorkerClass = TpModelWorkerClient
+                logger.info(f"[SCHEDULER] Semi-PD模式: 使用TpModelWorkerClient (DECODE + overlap)")
             else:
                 TpWorkerClass = TpModelWorker
+                logger.info(f"[SCHEDULER] Semi-PD模式: 使用TpModelWorker")
         else:
             TpWorkerClass = (
                 TpModelWorkerClient if self.enable_overlap else TpModelWorker
             )
+            logger.info(f"[SCHEDULER] 标准模式: 使用{TpWorkerClass.__name__}")
 
         # NCCL port
         if self.server_args.enable_semi_pd:
             assert isinstance(port_args, SemiPDPortArgs)
             if instance_role == InstanceRole.PREFILL:
                 nccl_port = port_args.p_nccl_port
+                logger.info(f"[SCHEDULER] Semi-PD PREFILL模式: 使用NCCL端口 {nccl_port}")
             elif instance_role == InstanceRole.DECODE:
                 nccl_port = port_args.d_nccl_port
+                logger.info(f"[SCHEDULER] Semi-PD DECODE模式: 使用NCCL端口 {nccl_port}")
             else:
                 raise ValueError(f"Invalid instance role: {instance_role}")
         else:
             nccl_port = port_args.nccl_port
+            logger.info(f"[SCHEDULER] 标准模式: 使用NCCL端口 {nccl_port}")
 
         # Semi-PD Pipeline Parallel: PREFILL进程通过IPC共享DECODE进程的权重
         if self.server_args.enable_semi_pd and instance_role == InstanceRole.PREFILL:
             # PREFILL进程不加载权重，通过IPC共享
             bypass_load_weight = True
-            logger.info(f"[PREFILL-PP{pp_rank}] Bypassing weight loading, will share from DECODE process via IPC")
+            logger.info(f"[SCHEDULER] Semi-PD PREFILL模式: 跳过权重加载，将通过IPC共享")
 
+        logger.info(f"[SCHEDULER] 开始创建TP worker")
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -391,6 +399,7 @@ class Scheduler(
             bypass_load_weight=bypass_load_weight,
             instance_role=instance_role,
         )
+        logger.info(f"[SCHEDULER] TP worker创建完成")
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
@@ -400,6 +409,7 @@ class Scheduler(
 
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+            logger.info(f"[SCHEDULER] 创建EAGLE draft worker")
             self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
@@ -410,8 +420,10 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+            logger.info(f"[SCHEDULER] 跳过draft worker创建 (spec_algorithm={self.spec_algorithm})")
 
         # Get token and memory info from the model worker
+        logger.info(f"[SCHEDULER] 获取worker信息")
         (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -425,6 +437,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        
+        logger.info(f"[SCHEDULER] Worker信息: max_total_num_tokens={self.max_total_num_tokens}, max_prefill_tokens={self.max_prefill_tokens}")
+        logger.info(f"[SCHEDULER] Worker信息: max_running_requests={self.max_running_requests}, max_req_len={self.max_req_len}, max_req_input_len={self.max_req_input_len}")
+        logger.info(f"[SCHEDULER] Worker信息: device={self.device}, random_seed={self.random_seed}")
+        
         if global_server_args_dict["max_micro_batch_size"] is None:
             global_server_args_dict["max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
@@ -436,6 +453,9 @@ class Scheduler(
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        
+        logger.info(f"[SCHEDULER] 分布式组信息: tp_group.world_size={self.tp_group.world_size}, pp_group.world_size={self.pp_group.world_size}")
+        logger.info(f"[SCHEDULER] 分布式组信息: world_group.world_size={self.world_group.world_size}")
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
@@ -456,7 +476,9 @@ class Scheduler(
             )
 
         # Init memory pool and cache
+        logger.info(f"[SCHEDULER] 开始初始化内存池和缓存")
         self.init_memory_pool_and_cache()
+        logger.info(f"[SCHEDULER] 内存池和缓存初始化完成")
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -586,6 +608,8 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+            
+        logger.info(f"[SCHEDULER] 调度器初始化完成")
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -2828,31 +2852,47 @@ def run_scheduler_process(
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
 
+    logger.info(f"[SCHEDULER_PROC] 开始启动调度器进程")
+    logger.info(f"[SCHEDULER_PROC] 进程信息: gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}, dp_rank={dp_rank}")
+    logger.info(f"[SCHEDULER_PROC] 配置信息: tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, dp_size={server_args.dp_size}")
+    logger.info(f"[SCHEDULER_PROC] 当前进程PID={os.getpid()}, 父进程PID={os.getppid()}")
+
     # Config the process
     kill_itself_when_parent_died()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
+    
+    logger.info(f"[SCHEDULER_PROC] 设置进程标题: sglang::scheduler{prefix.replace(' ', '_')}")
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+        logger.info(f"[SCHEDULER_PROC] 从环境变量设置dp_rank={dp_rank}")
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    
+    logger.info(f"[SCHEDULER_PROC] 日志配置完成，前缀={prefix}")
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+        logger.info(f"[SCHEDULER_PROC] 设置CPU亲和性: tp_size={server_args.tp_size}, nnodes={server_args.nnodes}, gpu_id={gpu_id}")
 
     embedding_cache_size = 100
     if "SGLANG_VLM_CACHE_SIZE_MB" in os.environ:
         embedding_cache_size = int(os.environ["SGLANG_VLM_CACHE_SIZE_MB"])
     init_embedding_cache(embedding_cache_size * 1024 * 1024)
+    logger.info(f"[SCHEDULER_PROC] 初始化嵌入缓存: {embedding_cache_size} MB")
+    
     # Create a scheduler and run the event loop
     try:
+        logger.info(f"[SCHEDULER_PROC] 开始创建调度器")
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
+        logger.info(f"[SCHEDULER_PROC] 调度器创建完成")
+        
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2860,33 +2900,42 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
+        logger.info(f"[SCHEDULER_PROC] 发送就绪状态到父进程")
+        
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+        logger.info(f"[SCHEDULER_PROC] 分离模式: {disaggregation_mode}")
 
         # Semi-PD Pipeline Parallel: 优先使用Pipeline并行
         if server_args.pp_size > 1:
             if server_args.enable_semi_pd:
-                logger.info(f"[{scheduler.instance_role.name}-PP{pp_rank}] Starting Semi-PD Pipeline Parallel mode")
+                logger.info(f"[SCHEDULER_PROC] [{scheduler.instance_role.name}-PP{pp_rank}] 启动Semi-PD Pipeline Parallel模式")
                 scheduler.event_loop_pp()
             else:
-                logger.info(f"[PP{pp_rank}] Starting standard Pipeline Parallel mode")
+                logger.info(f"[SCHEDULER_PROC] [PP{pp_rank}] 启动标准Pipeline Parallel模式")
                 scheduler.event_loop_pp()
         elif disaggregation_mode == DisaggregationMode.NULL:
             if scheduler.enable_overlap:
+                logger.info(f"[SCHEDULER_PROC] 启动重叠调度模式")
                 scheduler.event_loop_overlap()
             else:
+                logger.info(f"[SCHEDULER_PROC] 启动标准调度模式")
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
             if scheduler.enable_overlap:
+                logger.info(f"[SCHEDULER_PROC] 启动重叠调度分离预填充模式")
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
+                logger.info(f"[SCHEDULER_PROC] 启动标准调度分离预填充模式")
                 scheduler.event_loop_normal_disagg_prefill()
         elif disaggregation_mode == DisaggregationMode.DECODE:
             if scheduler.enable_overlap:
+                logger.info(f"[SCHEDULER_PROC] 启动重叠调度分离解码模式")
                 scheduler.event_loop_overlap_disagg_decode()
             else:
+                logger.info(f"[SCHEDULER_PROC] 启动标准调度分离解码模式")
                 scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error(f"[SCHEDULER_PROC] 调度器遇到异常: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

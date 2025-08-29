@@ -25,4 +25,17 @@ class DeviceConfig:
         if device == "meta":
             self.device = None  # meta设备不需要具体设备ID
         else:
-            self.device = torch.device(self.device_type)
+            # 尝试从parallel_state获取正确的设备信息
+            try:
+                from sglang.srt.distributed.parallel_state import get_group_coordinator
+                coordinator = get_group_coordinator()
+                if coordinator and hasattr(coordinator, 'device'):
+                    self.device = coordinator.device
+                    logger.info(f"[DEVICE_CONFIG] 从GroupCoordinator获取设备: {self.device}")
+                else:
+                    self.device = torch.device(self.device_type)
+                    logger.info(f"[DEVICE_CONFIG] 使用默认设备类型: {self.device}")
+            except Exception as e:
+                # 如果无法获取GroupCoordinator，使用默认设备类型
+                self.device = torch.device(self.device_type)
+                logger.info(f"[DEVICE_CONFIG] 无法获取GroupCoordinator，使用默认设备: {self.device}, 错误: {e}")

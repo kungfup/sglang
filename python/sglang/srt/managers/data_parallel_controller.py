@@ -571,9 +571,10 @@ def run_data_parallel_controller_process(
                     tp_rank,
                     dp_rank,
                     writer_decode,
-                    InstanceRole.DECODE,
                     d_ipc_info_queue,
                     True,
+                    InstanceRole.DECODE,
+                    0,  # pp_rank=0 for single PP stage
                 ),
             )
             proc.start()
@@ -596,9 +597,10 @@ def run_data_parallel_controller_process(
                     tp_rank,
                     dp_rank,
                     writer_prefill,
-                    InstanceRole.PREFILL,
                     p_ipc_info_queue,
                     True,
+                    InstanceRole.PREFILL,
+                    0,  # pp_rank=0 for single PP stage
                 ),
             )
 

@@ -109,7 +109,12 @@ class SemiPDScheduler(Scheduler):
         os.environ["SGLANG_PP_RANK"] = str(pp_rank)
         os.environ["SGLANG_GPU_ID"] = str(gpu_id)
         
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SemiPDScheduler初始化开始")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 环境变量设置完成")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}")
+        
         # 调用原始Scheduler构造函数，现在包含pp_rank
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 调用父类Scheduler构造函数...")
         super().__init__(
             server_args,
             port_args,
@@ -123,13 +128,17 @@ class SemiPDScheduler(Scheduler):
         
         # 🔧 记录PP stage信息
         self.pp_rank = pp_rank
-        logger.info(f"Semi-PD PP mode: PP stage {pp_rank} using GPU {gpu_id}")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Semi-PD PP模式: PP stage {pp_rank} using GPU {gpu_id}")
         
         # 🔧 明确进程角色：decode为主进程，prefill为辅助进程
         if instance_role == InstanceRole.DECODE:
-            logger.info(f"🎯 PP stage {pp_rank}: DECODE进程作为主进程，负责请求协调")
+            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE进程作为主进程，负责请求协调")
+            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 职责包括: 请求接收、响应返回、整体协调、KV Cache管理")
         elif instance_role == InstanceRole.PREFILL:
-            logger.info(f"🔧 PP stage {pp_rank}: PREFILL进程作为辅助进程，配合主进程工作")
+            logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PREFILL进程作为辅助进程，配合主进程工作")
+            logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 职责包括: 预填充计算、共享主进程权重、配合主进程")
+        
+        logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SemiPDScheduler初始化完成")
 
     def add_to_waiting_queue(self, req: Req):
         """
@@ -430,12 +439,12 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
-    pp_rank: int,  # 🔧 添加pp_rank参数
     dp_rank: Optional[int],
     pipe_writer,
-    instance_role: InstanceRole,  # 🔧 强制传递角色，放在没有默认值的参数之后
-    ipc_info_queue: multiprocessing.Queue = None,
-    bypass_load_weight: bool = False,
+    ipc_info_queue: multiprocessing.Queue,
+    bypass_load_weight: bool,
+    instance_role: InstanceRole,
+    pp_rank: int = 0,  # 🔧 添加pp_rank参数，设置默认值
 ):
     """Semi-PD specific scheduler process runner with PP support
     
@@ -452,6 +461,12 @@ def run_scheduler_process(
     os.environ["SGLANG_PP_RANK"] = str(pp_rank)
     os.environ["SGLANG_GPU_ID"] = str(gpu_id)
     
+    # 🔧 SEMI-PD TP=2 详细初始化日志
+    logger.info(f"🚀 [SEMI_PD_TP2] ========== Semi-PD TP=2 进程启动 ==========")
+    logger.info(f"🚀 [SEMI_PD_TP2] 进程信息: instance_role={instance_role.name}, pp_rank={pp_rank}, tp_rank={tp_rank}, gpu_id={gpu_id}")
+    logger.info(f"🚀 [SEMI_PD_TP2] 配置信息: tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, dp_size={server_args.dp_size}")
+    logger.info(f"🚀 [SEMI_PD_TP2] 环境变量设置: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}")
+    
     # Generate the prefix
     if dp_rank is None:
         prefix = f" {instance_role.name} PP{pp_rank} TP{tp_rank}"  # 🔧 添加PP信息
@@ -462,27 +477,33 @@ def run_scheduler_process(
     setproctitle.setproctitle(f"sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
+    
+    logger.info(f"🚀 [SEMI_PD_TP2] 进程标题设置: sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
+    logger.info(f"🚀 [SEMI_PD_TP2] 父进程PID: {parent_process.pid if parent_process else 'None'}")
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+        logger.info(f"🚀 [SEMI_PD_TP2] 从环境变量获取dp_rank: {dp_rank}")
 
     # 🔧 主进程逻辑：DECODE进程负责生成IPC信息
     ipc_info = None
     if instance_role == InstanceRole.DECODE:
-        logger.info(f"🎯 PP stage {pp_rank}: DECODE主进程启动，将生成IPC信息供PREFILL辅助进程使用")
+        logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程启动，将生成IPC信息供PREFILL辅助进程使用")
+        logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 负责请求接收、响应返回、整体协调")
     elif instance_role == InstanceRole.PREFILL:
-        logger.info(f"🔧 PP stage {pp_rank}: PREFILL辅助进程启动，等待DECODE主进程的IPC信息")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PREFILL辅助进程启动，等待DECODE主进程的IPC信息")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 负责预填充计算，配合主进程工作")
         # For Prefill instances, get IPC info from Decode instance first
         if bypass_load_weight:
-            logger.info(f"🔥 等待DECODE主进程的IPC信息... (tp_rank={tp_rank}, queue={ipc_info_queue})")
+            logger.info(f"🔥 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 等待DECODE主进程的IPC信息... (queue={ipc_info_queue})")
             try:
-                logger.info(f"🔍 Queue empty status: {ipc_info_queue.empty()}")
-                logger.info(f"🔍 About to call ipc_info_queue.get() with 300s timeout...")
+                logger.info(f"🔍 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Queue empty status: {ipc_info_queue.empty()}")
+                logger.info(f"🔍 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: About to call ipc_info_queue.get() with 300s timeout...")
                 ipc_info = ipc_info_queue.get()  # 300 second timeout (5 minutes) for large models
-                logger.info(f"✅ 成功接收到DECODE主进程的IPC信息! (type={type(ipc_info)})")
+                logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 成功接收到DECODE主进程的IPC信息! (type={type(ipc_info)})")
             except Exception as e:
-                logger.error(f"❌ 接收IPC信息失败: {e}")
+                logger.error(f"❌ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 接收IPC信息失败: {e}")
                 raise
 
     # Configure the logger
@@ -493,17 +514,20 @@ def run_scheduler_process(
             server_args, prefix=f" {instance_role.name} DP{dp_rank} TP{tp_rank}"
         )
     suppress_other_loggers()
+    
+    logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 日志配置完成")
 
     from sglang.semi_pd.utils import get_device_sm_count
 
     real_sm = get_device_sm_count(gpu_id)
     mps_percentage = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "100")
-    logger.info(f"🔥 Available SMs: {real_sm}, MPS allocation: {mps_percentage}%")
-    logger.info(f"✅ CUDA MPS successfully configured for {instance_role.name} instance")
+    logger.info(f"🔥 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Available SMs: {real_sm}, MPS allocation: {mps_percentage}%")
+    logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: CUDA MPS successfully configured for {instance_role.name} instance")
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+        logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: CPU亲和性设置完成")
 
     # Create a scheduler and run the event loop
     try:
@@ -512,7 +536,7 @@ def run_scheduler_process(
                 SemiPDDecodeScheduler,
             )
 
-            logger.info(f"🎯 创建DECODE主进程调度器...")
+            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 创建DECODE主进程调度器...")
             scheduler = SemiPDDecodeScheduler(
                 server_args,
                 port_args,
@@ -524,16 +548,17 @@ def run_scheduler_process(
             )
 
             # 🔧 主进程职责：生成IPC信息供辅助进程使用
+            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 生成IPC信息供PREFILL辅助进程使用...")
             ipc_info = scheduler.get_ipc_info()
             ipc_info_queue.put(ipc_info)
-            logger.info(f"✅ DECODE主进程已生成IPC信息，等待PREFILL辅助进程连接")
+            logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程已生成IPC信息，等待PREFILL辅助进程连接")
             
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
             )
 
-            logger.info(f"🔧 创建PREFILL辅助进程调度器...")
+            logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 创建PREFILL辅助进程调度器...")
             scheduler = SemiPDPrefillScheduler(
                 server_args,
                 port_args,
@@ -548,13 +573,18 @@ def run_scheduler_process(
 
         # 🔧 辅助进程通过IPC共享主进程的模型权重
         if bypass_load_weight and instance_role == InstanceRole.PREFILL:
+            logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 通过IPC共享DECODE主进程的模型权重...")
             scheduler.share_params_from_ipc(ipc_info)
-            logger.info("✅ PREFILL辅助进程成功通过IPC共享DECODE主进程的模型权重 (zero-copy)!")
+            logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PREFILL辅助进程成功通过IPC共享DECODE主进程的模型权重 (zero-copy)!")
 
+        logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 初始化注意力后端...")
         scheduler.init_attention_backend()
+        
         if instance_role == InstanceRole.DECODE:
+            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程初始化CUDA图...")
             scheduler.init_cuda_graphs()
 
+        logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 发送就绪状态到父进程...")
         pipe_writer.send(
             {
                 "status": "ready",
@@ -563,22 +593,21 @@ def run_scheduler_process(
             }
         )
 
-        logger.info("Scheduler initialized")
-        logger.info(f"Scheduler disaggregation_mode: {scheduler.disaggregation_mode}")
-        logger.info(f"Scheduler enable_overlap: {scheduler.enable_overlap}")
-        logger.info(f"Instance role: {instance_role}")
+        logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 调度器初始化完成")
+        logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Scheduler disaggregation_mode: {scheduler.disaggregation_mode}")
+        logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Scheduler enable_overlap: {scheduler.enable_overlap}")
+        logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Instance role: {instance_role}")
 
-        # 🔧 主进程运行overlap模式，辅助进程运行normal模式
         if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
-            logger.debug("🎯 DECODE主进程运行overlap模式，负责整体协调")
+            logger.debug("Scheduler running in overlap mode")
             scheduler.event_loop_overlap()
         else:
-            logger.debug("🔧 PREFILL辅助进程运行normal模式，配合主进程工作")
+            logger.debug("Scheduler running in normal mode")
             scheduler.event_loop_normal()
 
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error(f"❌ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
 
 

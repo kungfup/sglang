@@ -378,7 +378,12 @@ class DefaultModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
         bypass_load_weight: bool = False,
     ) -> nn.Module:
-        target_device = torch.device(device_config.device)
+        # Semi-PD模式下的设备处理
+        if device_config.device is None:
+            # 对于meta设备，使用meta设备
+            target_device = torch.device("meta")
+        else:
+            target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -428,7 +433,12 @@ class LayeredModelLoader(DefaultModelLoader):
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         torchao_config = global_server_args_dict.get("torchao_config")
-        target_device = torch.device(device_config.device)
+        # Semi-PD模式下的设备处理
+        if device_config.device is None:
+            # 对于meta设备，使用meta设备
+            target_device = torch.device("meta")
+        else:
+            target_device = torch.device(device_config.device)
 
         with set_default_torch_dtype(model_config.dtype):
             # Create model on meta device

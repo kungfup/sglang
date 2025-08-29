@@ -217,13 +217,22 @@ class GroupCoordinator:
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
+        
+        logger.info(f"[GROUP_COORD] ========== 组协调器初始化开始 ==========")
+        logger.info(f"[GROUP_COORD] 组名称: {self.unique_name}")
+        logger.info(f"[GROUP_COORD] group_ranks={group_ranks}, local_rank={local_rank}")
+        logger.info(f"[GROUP_COORD] backend={torch_distributed_backend}, group_name={group_name}")
+        logger.info(f"[GROUP_COORD] Semi-PD模式: {os.environ.get('SGLANG_ENABLE_SEMI_PD', 'false')}")
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        
+        logger.info(f"[GROUP_COORD] 当前进程rank={self.rank}, local_rank={self.local_rank}")
 
         for ranks in group_ranks:
+            logger.info(f"[GROUP_COORD] 为ranks={ranks}创建设备组和CPU组")
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
@@ -236,6 +245,7 @@ class GroupCoordinator:
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+                logger.info(f"[GROUP_COORD] 当前进程属于组ranks={ranks}, rank_in_group={self.rank_in_group}, world_size={self.world_size}")
 
         assert self.cpu_group is not None
         assert self.device_group is not None
@@ -243,19 +253,22 @@ class GroupCoordinator:
         # Semi-PD PP模式下的设备分配
         if is_cuda_alike():
             # 检查是否是Semi-PD PP模式
-            import os
             if os.getenv("SGLANG_ENABLE_SEMI_PD", "").lower() in ("1", "true"):
                 # 在Semi-PD PP模式下，每个PP stage使用不同的GPU
                 # 通过环境变量SGLANG_PP_RANK来设置设备ID
                 pp_rank = int(os.getenv("SGLANG_PP_RANK", "0"))
                 gpu_id = int(os.getenv("SGLANG_GPU_ID", str(pp_rank)))
                 self.device = torch.device(f"cuda:{gpu_id}")
-                logger.info(f"Semi-PD PP mode: PP stage {pp_rank} using GPU {gpu_id}")
+                logger.info(f"[GROUP_COORD] Semi-PD PP模式: PP stage {pp_rank} 使用GPU {gpu_id}")
+                logger.info(f"[GROUP_COORD] 设备分配: {self.device}")
             else:
                 # 原有逻辑：使用local_rank
                 self.device = torch.device(f"cuda:{local_rank}")
+                logger.info(f"[GROUP_COORD] 标准模式: 使用local_rank={local_rank}作为GPU ID")
+                logger.info(f"[GROUP_COORD] 设备分配: {self.device}")
         else:
             self.device = torch.device("cpu")
+            logger.info(f"[GROUP_COORD] 使用CPU设备: {self.device}")
 
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
@@ -264,6 +277,11 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        
+        logger.info(f"[GROUP_COORD] ========== 通信配置 ==========")
+        logger.info(f"[GROUP_COORD] use_pynccl={use_pynccl}, use_pymscclpp={use_pymscclpp}, use_custom_allreduce={use_custom_allreduce}")
+        logger.info(f"[GROUP_COORD] use_hpu_communicator={use_hpu_communicator}, use_xpu_communicator={use_xpu_communicator}, use_npu_communicator={use_npu_communicator}")
+        logger.info(f"[GROUP_COORD] use_message_queue_broadcaster={use_message_queue_broadcaster}")
 
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -275,6 +293,7 @@ class GroupCoordinator:
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化PyNcclCommunicator")
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -286,6 +305,7 @@ class GroupCoordinator:
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化PyMscclppCommunicator")
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -295,6 +315,7 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
+                logger.info(f"[GROUP_COORD] 初始化CustomAllreduce")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
@@ -311,6 +332,7 @@ class GroupCoordinator:
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化HpuCommunicator")
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
@@ -319,6 +341,7 @@ class GroupCoordinator:
 
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化XpuCommunicator")
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
         from sglang.srt.distributed.device_communicators.npu_communicator import (
@@ -327,6 +350,7 @@ class GroupCoordinator:
 
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化NpuCommunicator")
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -335,9 +359,12 @@ class GroupCoordinator:
 
         self.mq_broadcaster: Optional[MessageQueue] = None
         if use_message_queue_broadcaster and self.world_size > 1:
+            logger.info(f"[GROUP_COORD] 初始化MessageQueue广播器")
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+            
+        logger.info(f"[GROUP_COORD] ========== 组协调器 {self.unique_name} 初始化完成 ==========")
 
     @property
     def first_rank(self):
@@ -1121,6 +1148,16 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: Optional[int] = None,
 ):
+    logger.info(f"[DIST_INIT] ========== 分布式环境初始化开始 ==========")
+    logger.info(f"[DIST_INIT] world_size={world_size}, rank={rank}, local_rank={local_rank}")
+    logger.info(f"[DIST_INIT] distributed_init_method={distributed_init_method}, backend={backend}")
+    logger.info(f"[DIST_INIT] timeout={timeout}")
+    logger.info(f"[DIST_INIT] 当前进程PID={os.getpid()}")
+    logger.info(f"[DIST_INIT] 环境变量CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}")
+    logger.info(f"[DIST_INIT] 环境变量SGLANG_ENABLE_SEMI_PD={os.environ.get('SGLANG_ENABLE_SEMI_PD', 'N/A')}")
+    logger.info(f"[DIST_INIT] 环境变量SGLANG_PP_RANK={os.environ.get('SGLANG_PP_RANK', 'N/A')}")
+    logger.info(f"[DIST_INIT] 环境变量SGLANG_GPU_ID={os.environ.get('SGLANG_GPU_ID', 'N/A')}")
+    
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
@@ -1130,6 +1167,7 @@ def init_distributed_environment(
         backend,
     )
     if not torch.distributed.is_initialized():
+        logger.info(f"[DIST_INIT] PyTorch分布式环境尚未初始化，开始初始化...")
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment"
@@ -1138,8 +1176,12 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
+            logger.info(f"[DIST_INIT] 设置超时时间: {timeout}")
 
         # this backend is used for WORLD
+        logger.info(f"[DIST_INIT] ========== 调用torch.distributed.init_process_group ==========")
+        logger.info(f"[DIST_INIT] 参数: backend={backend}, init_method={distributed_init_method}, world_size={world_size}, rank={rank}")
+        
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -1147,6 +1189,13 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+        logger.info(f"[DIST_INIT] ✅ PyTorch分布式环境初始化完成")
+        logger.info(f"[DIST_INIT] torch.distributed.is_initialized() = {torch.distributed.is_initialized()}")
+        logger.info(f"[DIST_INIT] torch.distributed.get_world_size() = {torch.distributed.get_world_size()}")
+        logger.info(f"[DIST_INIT] torch.distributed.get_rank() = {torch.distributed.get_rank()}")
+    else:
+        logger.info(f"[DIST_INIT] PyTorch分布式环境已经初始化，跳过初始化步骤")
+        logger.info(f"[DIST_INIT] 当前world_size={torch.distributed.get_world_size()}, rank={torch.distributed.get_rank()}")
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -1156,16 +1205,29 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            logger.info(f"[DIST_INIT] 从环境变量LOCAL_RANK获取local_rank={local_rank}")
         else:
             local_rank = rank
+            logger.info(f"[DIST_INIT] 使用rank作为local_rank={local_rank}")
+    else:
+        logger.info(f"[DIST_INIT] 使用传入的local_rank={local_rank}")
+    
     global _WORLD
     if _WORLD is None:
+        logger.info(f"[DIST_INIT] ========== 创建WORLD组 ==========")
         ranks = list(range(torch.distributed.get_world_size()))
+        logger.info(f"[DIST_INIT] WORLD组ranks={ranks}")
         _WORLD = init_world_group(ranks, local_rank, backend)
+        logger.info(f"[DIST_INIT] ✅ WORLD组创建完成: world_size={_WORLD.world_size}, rank={_WORLD.rank}, local_rank={_WORLD.local_rank}")
+        logger.info(f"[DIST_INIT] WORLD组设备: {_WORLD.device}")
     else:
+        logger.info(f"[DIST_INIT] WORLD组已存在，检查world_size一致性")
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+        logger.info(f"[DIST_INIT] ✅ WORLD组world_size检查通过: {_WORLD.world_size}")
+    
+    logger.info(f"[DIST_INIT] ========== 分布式环境初始化完成 ==========")
 
 
 def initialize_model_parallel(
@@ -1195,12 +1257,20 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    logger.info(f"[MODEL_PARALLEL] ========== 模型并行初始化开始 ==========")
+    logger.info(f"[MODEL_PARALLEL] tensor_model_parallel_size={tensor_model_parallel_size}")
+    logger.info(f"[MODEL_PARALLEL] pipeline_model_parallel_size={pipeline_model_parallel_size}")
+    logger.info(f"[MODEL_PARALLEL] Semi-PD模式: {os.environ.get('SGLANG_ENABLE_SEMI_PD', 'false')}")
+    
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    logger.info(f"[MODEL_PARALLEL] world_size={world_size}, backend={backend}")
+    logger.info(f"[MODEL_PARALLEL] 当前rank={torch.distributed.get_rank()}")
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+        logger.error(f"[MODEL_PARALLEL] 配置错误: world_size({world_size}) != tensor_model_parallel_size({tensor_model_parallel_size}) * pipeline_model_parallel_size({pipeline_model_parallel_size})")
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
@@ -1212,13 +1282,18 @@ def initialize_model_parallel(
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = []
+    logger.info(f"[MODEL_PARALLEL] ========== 创建TP组 ==========")
+    logger.info(f"[MODEL_PARALLEL] 将创建{num_tensor_model_parallel_groups}个TP组，每组{tensor_model_parallel_size}个进程")
+    
     for i in range(num_tensor_model_parallel_groups):
         ranks = list(
             range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         )
         group_ranks.append(ranks)
+        logger.info(f"[MODEL_PARALLEL] 创建TP组 {i}: ranks={ranks}")
 
     # message queue broadcaster is only used in tensor model parallel group
+    logger.info(f"[MODEL_PARALLEL] 初始化TP组，使用message_queue_broadcaster={get_bool_env_var('SGLANG_USE_MESSAGE_QUEUE_BROADCASTER', 'true')}")
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1228,23 +1303,33 @@ def initialize_model_parallel(
         ),
         group_name="tp",
     )
+    logger.info(f"[MODEL_PARALLEL] ✅ TP组初始化完成: world_size={_TP.world_size}, rank_in_group={_TP.rank_in_group}")
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = []
+    logger.info(f"[MODEL_PARALLEL] ========== 创建PP组 ==========")
+    logger.info(f"[MODEL_PARALLEL] 将创建{num_pipeline_model_parallel_groups}个PP组，每组{pipeline_model_parallel_size}个进程")
+    
     for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+        ranks = list(
+            range(i * pipeline_model_parallel_size, (i + 1) * pipeline_model_parallel_size)
+        )
         group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
+        logger.info(f"[MODEL_PARALLEL] 创建PP组 {i}: ranks={ranks}")
+
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce=False,
+        use_message_queue_broadcaster=False,
         group_name="pp",
     )
+    logger.info(f"[MODEL_PARALLEL] ✅ PP组初始化完成: world_size={_PP.world_size}, rank_in_group={_PP.rank_in_group}")
+    
+    logger.info(f"[MODEL_PARALLEL] ========== 模型并行初始化完成 ==========")
 
 
 def ensure_model_parallel_initialized(
