@@ -470,14 +470,16 @@ class ModelRunner:
             logger.warning(
                 f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
             )
-            raise
+            # Fallback to local rank
+            torch.get_device_module(self.device).set_device(self.local_rank)
 
+        # Set the distributed backend
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            backend = "xccl"
+            backend = "ccl"
         elif self.device == "hpu":
-            backend = "hccl"
+            backend = "hpu"
         elif self.device == "cpu":
             backend = "gloo"
         elif self.device == "npu":
@@ -511,17 +513,12 @@ class ModelRunner:
             # Only initialize the distributed environment on the target model worker.
             logger.info(f"[TORCH_DIST] ========== 开始初始化分布式环境 (非draft worker) ==========")
             
-            # 🔧 SEMI-PD PP模式：每个PP stage有独立的分布式组
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化分布式环境
-                world_size = self.tp_size  # 只考虑当前PP stage内的TP进程
-                rank = self.tp_rank        # 在当前PP stage内的rank
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: world_size={world_size} (仅当前PP stage), rank={rank} (当前TP rank)")
-            else:
-                # 标准模式：所有PP stage共享一个分布式组
-                world_size = self.tp_size * self.pp_size
-                rank = self.tp_size * self.pp_rank + self.tp_rank
-                logger.info(f"[TORCH_DIST] 标准模式: world_size={world_size}, rank={rank}")
+            # 🔧 SEMI-PD PP模式：完全对齐SGLang原生Pipeline并行
+            # 所有PP stage共享一个分布式组，不是每个stage独立
+            world_size = self.tp_size * self.pp_size
+            rank = self.tp_size * self.pp_rank + self.tp_rank
+            logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 对齐SGLang原生，world_size={world_size} (tp_size*pp_size), rank={rank} (tp_size*pp_rank + tp_rank)")
+            logger.info(f"[TORCH_DIST] 当前进程: PP{self.pp_rank}-TP{self.tp_rank}, 全局rank={rank}")
             
             logger.info(f"[TORCH_DIST] local_rank={self.gpu_id}, timeout={self.server_args.dist_timeout}")
             
@@ -537,21 +534,12 @@ class ModelRunner:
             
             logger.info(f"[TORCH_DIST] ========== 开始初始化模型并行 ==========")
             
-            # 🔧 SEMI-PD PP模式：每个PP stage独立初始化模型并行
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 独立初始化当前PP stage")
-                initialize_model_parallel(
-                    tensor_model_parallel_size=self.tp_size,
-                    pipeline_model_parallel_size=1,  # 当前PP stage内部视为单PP
-                )
-            else:
-                # 标准模式：所有PP stage共享模型并行组
-                logger.info(f"[TORCH_DIST] 标准模式: 共享PP stage模型并行组")
-                initialize_model_parallel(
-                    tensor_model_parallel_size=self.tp_size,
-                    pipeline_model_parallel_size=self.pp_size,
-                )
+            # 🔧 SEMI-PD PP模式：完全对齐SGLang原生，创建跨stage的PP组
+            logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 创建跨stage的PP组，完全对齐SGLang原生")
+            initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_size,
+                pipeline_model_parallel_size=self.pp_size,  # 使用完整的pp_size，不是1
+            )
             
             logger.info(f"[TORCH_DIST] ✅ 模型并行初始化完成")
             
@@ -560,29 +548,16 @@ class ModelRunner:
             logger.info(f"[TORCH_DIST] tp_rank={self.tp_rank}, tp_size={self.tp_size}, dp_size={self.server_args.dp_size}")
             logger.info(f"[TORCH_DIST] moe_dense_tp_size={self.server_args.moe_dense_tp_size}, pp_size={self.server_args.pp_size}")
             
-            # 🔧 SEMI-PD PP模式：每个PP stage独立初始化DP注意力
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 独立初始化当前PP stage的DP注意力")
-                initialize_dp_attention(
-                    enable_dp_attention=self.server_args.enable_dp_attention,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    dp_size=self.server_args.dp_size,
-                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                    pp_size=1,  # 当前PP stage内部视为单PP
-                )
-            else:
-                # 标准模式：所有PP stage共享DP注意力组
-                logger.info(f"[TORCH_DIST] 标准模式: 共享PP stage DP注意力组")
-                initialize_dp_attention(
-                    enable_dp_attention=self.server_args.enable_dp_attention,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    dp_size=self.server_args.dp_size,
-                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                    pp_size=self.server_args.pp_size,
-                )
+            # 🔧 SEMI-PD PP模式：完全对齐SGLang原生，使用完整的pp_size
+            logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 使用完整的pp_size创建跨stage的DP注意力组")
+            initialize_dp_attention(
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
+                pp_size=self.server_args.pp_size,  # 使用完整的pp_size，不是1
+            )
             
             logger.info(f"[TORCH_DIST] ✅ DP注意力初始化完成")
         else:
@@ -626,13 +601,15 @@ class ModelRunner:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                        f"GPU {self.gpu_id} has significantly less memory than other GPUs "
+                        f"({local_gpu_memory:.2f} GB vs {min_per_gpu_memory:.2f} GB). "
+                        "This may cause out-of-memory errors during tensor parallelism."
                     )
                 else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-                        f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+                    raise RuntimeError(
+                        f"GPU {self.gpu_id} has significantly less memory than other GPUs "
+                        f"({local_gpu_memory:.2f} GB vs {min_per_gpu_memory:.2f} GB). "
+                        "This may cause out-of-memory errors during tensor parallelism."
                     )
 
         logger.info(
