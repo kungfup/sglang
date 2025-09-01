@@ -60,11 +60,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         self.enable_overlap = False
         self.chunked_rid = None
-        
-        # 🔧 CRITICAL: PREFILL调度器不应该处理tokenized请求
-        # 但是我们不能修改_request_dispatcher的映射，因为TypeBasedDispatcher会抛出异常
-        # 我们将在handle方法中优雅地处理这些请求
-        logger.info(f"[PREFILL-PP{self.pp_rank}] 🔧 PREFILL调度器已配置，将忽略tokenized请求")
 
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
@@ -77,42 +72,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         else:
             self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
-
-    def handle_generate_request(self, recv_req):
-        """
-        🔧 PREFILL调度器重写此方法，优雅地忽略tokenized请求
-        PREFILL调度器不应该处理来自用户的tokenized请求，只处理来自DECODE的握手消息
-        
-        关键：我们不能抛出异常，因为这会破坏TypeBasedDispatcher的调用链
-        我们返回None，让调用者知道这个请求被忽略了
-        """
-        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-        if isinstance(recv_req, TokenizedGenerateReqInput):
-            logger.debug(f"[PREFILL-PP{self.pp_rank}] 🔧 忽略tokenized请求 {recv_req.rid}，PREFILL调度器只处理握手消息")
-            # 🔧 返回None表示请求被忽略，而不是抛出异常
-            # 这样TypeBasedDispatcher不会失败，调用者可以继续处理
-            return None
-        else:
-            # 对于其他类型的请求，调用父类方法
-            return super().handle_generate_request(recv_req)
-
-    def handle_embedding_request(self, recv_req):
-        """
-        🔧 PREFILL调度器重写此方法，优雅地忽略tokenized请求
-        PREFILL调度器不应该处理来自用户的tokenized请求，只处理来自DECODE的握手消息
-        
-        关键：我们不能抛出异常，因为这会破坏TypeBasedDispatcher的调用链
-        我们返回None，让调用者知道这个请求被忽略了
-        """
-        from sglang.srt.managers.io_struct import TokenizedEmbeddingReqInput
-        if isinstance(recv_req, TokenizedEmbeddingReqInput):
-            logger.debug(f"[PREFILL-PP{self.pp_rank}] 🔧 忽略tokenized请求 {recv_req.rid}，PREFILL调度器只处理握手消息")
-            # 🔧 返回None表示请求被忽略，而不是抛出异常
-            # 这样TypeBasedDispatcher不会失败，调用者可以继续处理
-            return None
-        else:
-            # 对于其他类型的请求，调用父类方法
-            return super().handle_embedding_request(recv_req)
 
     def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
         """
@@ -187,7 +146,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         """
         # 🔧 SEMI-PD IDLE MODE: 当没有等待请求时，直接返回None进入Idle模式
         if not self.waiting_queue:
-            logger.debug(f"[PREFILL-PP{self.pp_rank}] No waiting requests, entering Idle mode")
+            logger.debug("[PREFILL] No waiting requests, entering Idle mode")
             return None
 
         resp = None
@@ -202,10 +161,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 candidates.append(r.rid)
 
             req = GetNextPrefillBatchInput(rids=candidates)
-            logger.debug(f"[PREFILL-PP{self.pp_rank}] Send request to D worker: {req}")
+            logger.debug(f"Send request to D worker: {req}")
             self.send_to_d_instance.send_pyobj(req)
             resp = self.bridge_socket.recv_pyobj()
-            logger.debug(f"[PREFILL-PP{self.pp_rank}] Recv response from D worker: {resp}")
+            logger.debug(f"Recv response from D worker: {resp}")
             assert isinstance(
                 resp, GetNextPrefillBatchOutput
             ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
@@ -245,7 +204,8 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             next_token_ids=result.next_token_ids.tolist(),
             next_token_logits=next_token_logits,
         )
+
         self.send_to_d_instance.send_pyobj(req)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        logger.info(f"[PREFILL-PP{self.pp_rank}] Ignore flush cache request")
+        logger.info("Ignore flush cache request")
