@@ -87,15 +87,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             
             # 🔧 同PP stage内的IPC通信（与PREFILL进程）
             self.bridge_socket = get_zmq_socket(
-                context, zmq.PUSH, port_args.bridge_ipc_name, False
+                context, zmq.PUSH, self.port_args.bridge_ipc_name, False
             )
             self.send_to_p_instance = get_zmq_socket(
-                context, zmq.PUSH, port_args.p_scheduler_input_ipc_name, False
+                context, zmq.PUSH, self.port_args.p_scheduler_input_ipc_name, False
             )
             
             # 🔧 PP stage间通信：与下一个stage的DECODE进程通信
             # 使用SGLang原生的NCCL通信机制，不需要额外的socket
-            if hasattr(port_args, 'next_stage_decode_port') and port_args.next_stage_decode_port:
+            if hasattr(self.port_args, 'next_stage_decode_port') and self.port_args.next_stage_decode_port:
                 logger.info(f"🔗 PP{pp_rank} DECODE: 将使用SGLang原生NCCL与下一个stage的DECODE进程通信")
             else:
                 logger.info(f"🔗 PP{pp_rank} DECODE: 这是最后一个stage，无需连接下一个stage")
@@ -381,7 +381,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             logger.debug(f"[DECODE-PP{self.pp_rank}] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
 
             # 🔧 如果有下一个stage，需要协调PP stage间的通信
-            if hasattr(port_args, 'next_stage_decode_port') and port_args.next_stage_decode_port:
+            if hasattr(self.port_args, 'next_stage_decode_port') and self.port_args.next_stage_decode_port:
                 logger.debug(f"[DECODE-PP{self.pp_rank}] 🔗 协调与下一个stage的通信")
                 # 🔧 使用SGLang原生的NCCL通信机制
                 # SGLang已经实现了PP stage间的通信，我们直接使用即可

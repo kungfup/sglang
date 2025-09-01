@@ -569,12 +569,12 @@ def run_data_parallel_controller_process(
                     rank_port_args,
                     gpu_id,
                     tp_rank,
-                    0,  # pp_rank=0 for single PP stage
                     dp_rank,
                     writer_decode,
                     d_ipc_info_queue,
                     True,
                     InstanceRole.DECODE,
+                    0,  # pp_rank=0 for single PP stage
                 ),
             )
             proc.start()
@@ -595,12 +595,12 @@ def run_data_parallel_controller_process(
                     rank_port_args,
                     gpu_id,
                     tp_rank,
-                    0,  # pp_rank=0 for single PP stage
                     dp_rank,
                     writer_prefill,
                     p_ipc_info_queue,
                     True,
                     InstanceRole.PREFILL,
+                    0,  # pp_rank=0 for single PP stage
                 ),
             )
 

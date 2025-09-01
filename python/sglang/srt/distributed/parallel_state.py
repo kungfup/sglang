@@ -1306,8 +1306,6 @@ def initialize_model_parallel(
     logger.info(f"[MODEL_PARALLEL] ✅ TP组初始化完成: world_size={_TP.world_size}, rank_in_group={_TP.rank_in_group}")
 
     # Build the pipeline model-parallel groups.
-    # 🔧 SEMI-PD模式：完全对齐SGLang原生Pipeline并行
-    # 所有PP stage共享一个分布式组，不是每个stage独立
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
@@ -1315,21 +1313,18 @@ def initialize_model_parallel(
     logger.info(f"[MODEL_PARALLEL] ========== 创建PP组 ==========")
     logger.info(f"[MODEL_PARALLEL] 将创建{num_pipeline_model_parallel_groups}个PP组，每组{pipeline_model_parallel_size}个进程")
     
-    # 🔧 使用SGLang原生的PP组创建逻辑：跨步分组策略
-    # 例如：PP组0=[0,2,4,6], PP组1=[1,3,5,7]
     for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+        ranks = list(
+            range(i * pipeline_model_parallel_size, (i + 1) * pipeline_model_parallel_size)
+        )
         group_ranks.append(ranks)
         logger.info(f"[MODEL_PARALLEL] 创建PP组 {i}: ranks={ranks}")
 
-    # pipeline parallel does not need custom allreduce
-    logger.info(f"[MODEL_PARALLEL] 初始化PP组，禁用自定义allreduce")
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce=False,  # PP组不需要自定义allreduce
-        use_message_queue_broadcaster=False,  # PP组不需要message queue广播器
+        use_message_queue_broadcaster=False,
         group_name="pp",
     )
     logger.info(f"[MODEL_PARALLEL] ✅ PP组初始化完成: world_size={_PP.world_size}, rank_in_group={_PP.rank_in_group}")

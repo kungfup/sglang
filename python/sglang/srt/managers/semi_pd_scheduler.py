@@ -126,6 +126,9 @@ class SemiPDScheduler(Scheduler):
             instance_role,
         )
         
+        # 🔧 保存port_args参数供子类使用
+        self.port_args = port_args
+        
         # 🔧 记录PP stage信息
         self.pp_rank = pp_rank
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Semi-PD PP模式: PP stage {pp_rank} using GPU {gpu_id}")
