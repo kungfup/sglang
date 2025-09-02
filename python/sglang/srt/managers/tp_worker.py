@@ -68,6 +68,7 @@ class TpModelWorker:
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.pp_size = server_args.pp_size  # 🔧 修复：添加pp_size属性
 
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
@@ -143,16 +144,19 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        # 🔧 Semi-PD模式: 每个PP stage独立，使用tp_rank作为索引
+        # 🔧 Semi-PD模式: 所有PP stage共享同一个分布式环境，使用world组进行广播
         if hasattr(server_args, 'enable_semi_pd') and server_args.enable_semi_pd:
-            broadcast_rank = tp_rank
-            # 在Semi-PD模式下，使用TP组而不是world组
-            broadcast_group = get_tp_group().cpu_group
-            broadcast_src = get_tp_group().ranks[0]
+            # 🔧 Semi-PD模式: 所有PP stage都使用world组进行广播
+            broadcast_rank = self.tp_size * self.pp_rank + tp_rank
+            broadcast_group = self.world_group.cpu_group
+            broadcast_src = self.world_group.ranks[0]
+            logger.info(f"[TP_WORKER] 🔧 Semi-PD模式: 使用world组进行random_seed广播")
+            logger.info(f"[TP_WORKER] 🔧 Semi-PD模式: broadcast_rank={broadcast_rank}, broadcast_src={broadcast_src}")
         else:
             broadcast_rank = self.tp_size * self.pp_rank + tp_rank
             broadcast_group = self.world_group.cpu_group
             broadcast_src = self.world_group.ranks[0]
+            logger.info(f"[TP_WORKER] 标准模式: 使用world组进行random_seed广播")
             
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],

@@ -404,17 +404,22 @@ class Qwen2ForCausalLM(nn.Module):
 
         # perform weight tying for PP
         if self.pp_group.world_size > 1 and config.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
-                )
+            # 🔧 修复：在Semi-PD模式下，跳过meta tensor的分布式通信
+            if hasattr(self.model.embed_tokens.weight, 'device') and self.model.embed_tokens.weight.device.type != 'meta':
+                if self.pp_group.is_first_rank:
+                    self.pp_group.send(
+                        self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                    )
+                else:
+                    emb_token_weight = self.pp_group.recv(
+                        size=(config.vocab_size, config.hidden_size),
+                        dtype=next(self.model.parameters()).dtype,
+                        src=self.pp_group.first_rank,
+                    )
+                    self.lm_head.weight.copy_(emb_token_weight)
             else:
-                emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
-                    dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
+                # 🔧 Semi-PD模式：meta tensor跳过分布式通信，等待后续IPC共享
+                pass
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

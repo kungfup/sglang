@@ -145,15 +145,76 @@ def _initialize_model(
     load_config: LoadConfig,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
+    import os
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    # 🔧 检查pipeline并行环境变量
+    pp_rank = int(os.getenv("SGLANG_PP_RANK", "0"))
+    pp_size = int(os.getenv("SGLANG_PP_SIZE", "1"))
+    enable_semi_pd = os.getenv("SGLANG_ENABLE_SEMI_PD", "0") == "1"
+    
+    logger.info(f"🔧 [MODEL_LOADER] Pipeline并行配置检查:")
+    logger.info(f"  📊 SGLANG_PP_RANK: {pp_rank}")
+    logger.info(f"  📊 SGLANG_PP_SIZE: {pp_size}")
+    logger.info(f"  📊 SGLANG_ENABLE_SEMI_PD: {enable_semi_pd}")
+    
+    if pp_size > 1:
+        logger.info(f"🔧 [MODEL_LOADER] 检测到Pipeline并行模式 (PP_SIZE={pp_size})")
+        logger.info(f"  📊 当前PP stage: {pp_rank}")
+        logger.info(f"  📊 总PP stages: {pp_size}")
+        
+        if enable_semi_pd:
+            logger.info(f"🔧 [MODEL_LOADER] Semi-PD模式已启用，将根据PP_RANK分配层")
+        else:
+            logger.warning(f"⚠️ [MODEL_LOADER] Semi-PD模式未启用，但检测到PP_SIZE>1")
+            logger.warning(f"  📊 这可能导致内存问题，因为每个PP stage都会创建完整模型")
+    
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
-    return model_class(
+    
+    logger.info(f"🔧 [MODEL_LOADER] 开始初始化模型: {model_class.__name__}")
+    logger.info(f"  📊 模型配置: {type(model_config.hf_config).__name__}")
+    logger.info(f"  📊 量化配置: {quant_config}")
+    
+    # 🔧 关键：调用模型构造函数，这里应该触发原生的pipeline并行层分配
+    model = model_class(
         config=model_config.hf_config,
         quant_config=quant_config,
     )
+    
+    logger.info(f"🔧 [MODEL_LOADER] 模型初始化完成: {type(model).__name__}")
+    
+    # 🔧 检查模型的层分配情况
+    if pp_size > 1:
+        total_layers = 0
+        actual_layers = 0
+        
+        # 检查模型是否有start_layer和end_layer属性（这是pipeline并行的标志）
+        if hasattr(model, 'model') and hasattr(model.model, 'start_layer') and hasattr(model.model, 'end_layer'):
+            start_layer = model.model.start_layer
+            end_layer = model.model.end_layer
+            actual_layers = end_layer - start_layer
+            total_layers = model.config.num_hidden_layers
+            
+            logger.info(f"🔧 [MODEL_LOADER] 模型层分析:")
+            logger.info(f"  📊 总层数: {total_layers}")
+            logger.info(f"  📊 当前PP stage层数: {actual_layers} (layers {start_layer}-{end_layer})")
+            
+            if actual_layers > 0:
+                logger.info(f"✅ [MODEL_LOADER] 模型层已正确分配PP rank，pipeline并行工作正常")
+            else:
+                logger.warning(f"⚠️ [MODEL_LOADER] 警告：当前PP stage没有分配到任何层")
+        else:
+            logger.warning(f"⚠️ [MODEL_LOADER] 警告：模型没有pipeline并行属性(start_layer/end_layer)")
+            logger.warning(f"  📊 这可能导致内存问题：每个PP stage都会创建完整模型")
+            logger.warning(f"  📊 建议检查模型类是否正确实现了pipeline并行")
+    
+    return model
 
 
 class BaseModelLoader(ABC):
@@ -378,24 +439,59 @@ class DefaultModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
         bypass_load_weight: bool = False,
     ) -> nn.Module:
+        import os
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        # 🔧 Semi-PD和Pipeline并行配置检查
+        pp_rank = int(os.getenv("SGLANG_PP_RANK", "0"))
+        pp_size = int(os.getenv("SGLANG_PP_SIZE", "1"))
+        enable_semi_pd = os.getenv("SGLANG_ENABLE_SEMI_PD", "0") == "1"
+        gpu_id = int(os.getenv("SGLANG_GPU_ID", "0"))
+        
+        logger.info(f"🔧 [DEFAULT_LOADER] Semi-PD模型加载配置:")
+        logger.info(f"  📊 PP_RANK: {pp_rank}, PP_SIZE: {pp_size}")
+        logger.info(f"  📊 GPU_ID: {gpu_id}")
+        logger.info(f"  📊 SGLANG_ENABLE_SEMI_PD: {enable_semi_pd}")
+        logger.info(f"  📊 bypass_load_weight: {bypass_load_weight}")
+        
+        if bypass_load_weight:
+            logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 启用bypass_load_weight模式")
+            logger.info(f"  📊 将跳过权重加载，但模型结构仍会创建")
+            if pp_size > 1:
+                logger.warning(f"⚠️ [DEFAULT_LOADER] PP{pp_rank}: 警告：PP_SIZE>1但bypass_load_weight=True")
+                logger.warning(f"  📊 这可能导致内存问题：每个PP stage都会创建完整模型结构")
+                logger.warning(f"  📊 建议检查原生的pipeline并行机制是否正确工作")
+        
         # Semi-PD模式下的设备处理
         if device_config.device is None:
             # 对于meta设备，使用meta设备
             target_device = torch.device("meta")
+            logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 使用meta设备进行模型初始化")
         else:
             target_device = torch.device(device_config.device)
+            logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 使用设备: {target_device}")
+        
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 开始初始化模型结构...")
                 model = _initialize_model(
                     model_config,
                     self.load_config,
                 )
+                logger.info(f"✅ [DEFAULT_LOADER] PP{pp_rank}: 模型结构初始化完成")
 
             if not bypass_load_weight:
+                logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 开始加载模型权重...")
                 self.load_weights_and_postprocess(
                     model, self._get_all_weights(model_config, model), target_device
                 )
+                logger.info(f"✅ [DEFAULT_LOADER] PP{pp_rank}: 模型权重加载完成")
+            else:
+                logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 跳过权重加载 (bypass_load_weight=True)")
 
+        logger.info(f"🔧 [DEFAULT_LOADER] PP{pp_rank}: 模型加载完成，设置为eval模式")
         return model.eval()
 
     @staticmethod

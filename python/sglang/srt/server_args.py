@@ -1793,22 +1793,43 @@ class SemiPDPortArgs:
 
     @staticmethod
     def init_new(server_args, pp_rank: int = 0, dp_rank: Optional[int] = None) -> "SemiPDPortArgs":
-        # 为每个PP stage分配独立的端口范围
-        port_base = 40000 + pp_rank * 1000  # 每个PP stage使用1000个端口范围
+        # 🔧 关键修复：在Semi-PD + TP模式下，所有进程使用相同的NCCL端口
+        # 这样才能建立统一的分布式环境，实现真正的pipeline并行
         
-        s_port = port_base + random.randint(0, 999)
-        p_port = port_base + random.randint(0, 999) 
-        d_port = port_base + random.randint(0, 999)
-        
-        # 确保端口可用
-        while not is_port_available(s_port):
-            s_port = port_base + random.randint(0, 999)
-        while not is_port_available(p_port):
-            p_port = port_base + random.randint(0, 999)
-        while not is_port_available(d_port):
-            d_port = port_base + random.randint(0, 999)
-
         if not server_args.enable_dp_attention:
+            # 🔧 为每个PP stage分配独立的IPC端口，但共享NCCL端口
+            port_base = 40000 + pp_rank * 1000  # 每个PP stage使用1000个端口范围
+            
+            # IPC端口：每个PP stage独立
+            s_port = port_base + random.randint(0, 999)
+            p_port = port_base + random.randint(0, 999) 
+            d_port = port_base + random.randint(0, 999)
+            
+            # 🔧 关键：所有PP stage使用完全相同的NCCL端口，建立统一的分布式环境
+            # 使用固定的NCCL端口，确保所有PP stage能通信
+            if pp_rank == 0:
+                # PP stage 0：选择基础NCCL端口
+                nccl_port = 40000 + random.randint(100, 199)
+                # 将选择的NCCL端口保存到环境变量，供其他PP stage使用
+                os.environ["SGLANG_SHARED_NCCL_PORT"] = str(nccl_port)
+            else:
+                # 其他PP stage：使用与PP stage 0相同的NCCL端口
+                if "SGLANG_SHARED_NCCL_PORT" in os.environ:
+                    nccl_port = int(os.environ["SGLANG_SHARED_NCCL_PORT"])
+                else:
+                    # 如果没有环境变量，使用默认端口
+                    nccl_port = 40000 + random.randint(100, 199)
+            
+            # 确保端口可用
+            while not is_port_available(s_port):
+                s_port = port_base + random.randint(0, 999)
+            while not is_port_available(p_port):
+                p_port = port_base + random.randint(0, 999)
+            while not is_port_available(d_port):
+                d_port = port_base + random.randint(0, 999)
+            while not is_port_available(nccl_port):
+                nccl_port = 40000 + random.randint(100, 199)
+
             # Create unified IPC addresses - all processes use the same addresses
             # Generate unique prefix based on server port and pp_rank to avoid conflicts
             ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_pp{pp_rank}"
@@ -1821,9 +1842,9 @@ class SemiPDPortArgs:
                 detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
                 bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
                 rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
-                s_nccl_port=s_port,
-                p_nccl_port=p_port,
-                d_nccl_port=d_port,
+                s_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
+                p_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
+                d_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
                 pp_rank=pp_rank,
                 gpu_id=pp_rank,  # 每个PP stage使用不同的GPU
             )

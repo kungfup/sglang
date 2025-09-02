@@ -23,6 +23,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
@@ -61,7 +62,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler import run_scheduler_process as run_original_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
@@ -678,44 +679,82 @@ def _launch_subprocesses(
         )
         scheduler_pipe_readers = []
 
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
+        # 🔧 SEMI-PD FIX: 修复分布式环境初始化
+        if server_args.enable_semi_pd:
+            # Semi-PD模式：PP0和PP1的DECODE进程共享同一个分布式环境
+            # 关键：所有PP stage的DECODE进程使用相同的world_size和rank
+            nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+            tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+            
+            # 🔑 关键修复：DECODE进程的分布式环境
+            # PP0-DECODE: rank=0, world_size=pp_size
+            # PP1-DECODE: rank=1, world_size=pp_size  
+            # 这样它们可以通信，而不是每个PP stage独立
+            for pp_rank in range(server_args.pp_size):
+                for tp_rank in range(tp_size_per_node):
+                    reader, writer = mp.Pipe(duplex=False)
+                    gpu_id = (
+                        server_args.base_gpu_id
+                        + (pp_rank * tp_size_per_node)
+                        + (tp_rank * server_args.gpu_id_step)
+                    )
+                    proc = mp.Process(
+                        target=run_original_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
-        )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
+                    scheduler_procs.append(proc)
+                    scheduler_pipe_readers.append(reader)
+        else:
+            # 原版SGLang的pipeline并行逻辑
+            nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+            tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+            tp_rank_range = range(
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            )
 
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                reader, writer = mp.Pipe(duplex=False)
-                gpu_id = (
-                    server_args.base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-                )
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        pp_rank,
-                        None,
-                        writer,
-                    ),
-                )
+            pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+            pp_rank_range = range(
+                pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+                pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+            )
 
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
-                scheduler_procs.append(proc)
-                scheduler_pipe_readers.append(reader)
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    reader, writer = mp.Pipe(duplex=False)
+                    gpu_id = (
+                        server_args.base_gpu_id
+                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    )
+                    proc = mp.Process(
+                        target=run_original_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
+                    scheduler_procs.append(proc)
+                    scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
@@ -856,6 +895,23 @@ def _launch_semi_pd_subprocesses(
             logger.info(f"  🔌 Decode NCCL Port: {port_args.d_nccl_port}")
         
         logger.info(f"🔧 [SEMI-PD] Port allocation completed for {len(port_args_per_pp)} PP stages")
+
+        # 🔧 关键修复：为Semi-PD + TP模式分配独立的分布式初始化端口
+        # DECODE和PREFILL进程使用不同的分布式初始化端口，但共享相同的NCCL端口
+        if server_args.enable_semi_pd:
+            import random
+            # 🔧 修复：DECODE和PREFILL进程使用不同的分布式初始化端口
+            # 这样可以避免端口冲突，但共享相同的NCCL端口进行通信
+            decode_dist_port = 40000 + random.randint(100, 199)
+            prefill_dist_port = 40000 + random.randint(200, 299)  # 🔧 使用不同的端口范围
+            
+            os.environ["SGLANG_DECODE_DIST_PORT"] = str(decode_dist_port)
+            os.environ["SGLANG_PREFILL_DIST_PORT"] = str(prefill_dist_port)
+            logger.info(f"🔧 [SEMI-PD] DECODE进程分布式端口: {decode_dist_port}")
+            logger.info(f"🔧 [SEMI-PD] PREFILL进程分布式端口: {prefill_dist_port}")
+            logger.info(f"🔧 [SEMI-PD] DECODE和PREFILL进程使用独立的分布式初始化端口")
+            logger.info(f"🔧 [SEMI-PD] DECODE分布式环境: tcp://127.0.0.1:{decode_dist_port}")
+            logger.info(f"🔧 [SEMI-PD] PREFILL分布式环境: tcp://127.0.0.1:{prefill_dist_port}")
 
         # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(

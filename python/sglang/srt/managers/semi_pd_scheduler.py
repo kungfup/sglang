@@ -463,12 +463,30 @@ def run_scheduler_process(
     os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
     os.environ["SGLANG_PP_RANK"] = str(pp_rank)
     os.environ["SGLANG_GPU_ID"] = str(gpu_id)
+    # 🔧 添加PP_SIZE环境变量，确保原生pipeline并行机制能正确工作
+    os.environ["SGLANG_PP_SIZE"] = str(server_args.pp_size)
+    
+    # 🔧 验证环境变量设置
+    logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 环境变量设置验证")
+    logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_ENABLE_SEMI_PD={os.environ.get('SGLANG_ENABLE_SEMI_PD')}")
+    logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_PP_RANK={os.environ.get('SGLANG_PP_RANK')}")
+    logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_GPU_ID={os.environ.get('SGLANG_GPU_ID')}")
+    logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_PP_SIZE={os.environ.get('SGLANG_PP_SIZE')}")
+    
+    # 🔧 检查pipeline并行配置
+    if server_args.pp_size > 1:
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 检测到Pipeline并行模式")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 当前PP stage: {pp_rank}/{server_args.pp_size}")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 期望行为：只创建分配给PP{pp_rank}的层")
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 关键：检查模型类是否正确实现了pipeline并行层分配")
+    else:
+        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 单PP模式，将创建完整模型")
     
     # 🔧 SEMI-PD TP=2 详细初始化日志
     logger.info(f"🚀 [SEMI_PD_TP2] ========== Semi-PD TP=2 进程启动 ==========")
     logger.info(f"🚀 [SEMI_PD_TP2] 进程信息: instance_role={instance_role.name}, pp_rank={pp_rank}, tp_rank={tp_rank}, gpu_id={gpu_id}")
     logger.info(f"🚀 [SEMI_PD_TP2] 配置信息: tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, dp_size={server_args.dp_size}")
-    logger.info(f"🚀 [SEMI_PD_TP2] 环境变量设置: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}")
+    logger.info(f"🚀 [SEMI_PD_TP2] 环境变量设置: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}, SGLANG_PP_SIZE={server_args.pp_size}")
     
     # Generate the prefix
     if dp_rank is None:

@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from functools import reduce
@@ -458,14 +459,12 @@ class ModelRunner:
                 self.mem_fraction_static *= 0.85
 
     def init_torch_distributed(self):
-        logger.info(f"[TORCH_DIST] ========== PyTorch分布式初始化开始 ==========")
-        logger.info(f"[TORCH_DIST] 设备={self.device}, gpu_id={self.gpu_id}, tp_rank={self.tp_rank}, pp_rank={self.pp_rank}")
-        logger.info(f"[TORCH_DIST] tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}")
-        logger.info(f"[TORCH_DIST] 总进程数: {self.tp_size * self.pp_size}, 当前rank: {self.tp_size * self.pp_rank + self.tp_rank}")
+        logger.info("Init torch distributed begin.")
+        logger.info(f"🔧 [SEMI-PD] 分布式环境初始化开始 - 实例角色: {self.instance_role.name}")
+        logger.info(f"🔧 [SEMI-PD] 分布式配置: tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}")
 
         try:
             torch.get_device_module(self.device).set_device(self.gpu_id)
-            logger.info(f"[TORCH_DIST] 成功设置设备: {self.device}:{self.gpu_id}")
         except Exception:
             logger.warning(
                 f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
@@ -482,48 +481,48 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
-            
-        logger.info(f"[TORCH_DIST] 选择后端: {backend}")
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(f"[TORCH_DIST] 初始化前可用GPU内存: {before_avail_memory:.2f} GB")
-        
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
-            logger.info(f"[TORCH_DIST] 禁用P2P访问检查")
 
         if self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
-            
-        logger.info(f"[TORCH_DIST] 分布式初始化方法: {dist_init_method}")
-        logger.info(f"[TORCH_DIST] NCCL端口: {self.dist_port}")
-        logger.info(f"[TORCH_DIST] Semi-PD模式: {os.environ.get('SGLANG_ENABLE_SEMI_PD', 'false')}")
-        
+            # 🔧 关键修复：在Semi-PD + TP模式下，根据实例角色使用不同的分布式初始化地址
+            if self.server_args.enable_semi_pd:
+                # 🔧 根据实例角色使用不同的分布式端口
+                if hasattr(self, 'instance_role') and self.instance_role == InstanceRole.PREFILL:
+                    # PREFILL进程使用PREFILL专用端口
+                    if "SGLANG_PREFILL_DIST_PORT" in os.environ:
+                        dist_port = int(os.environ["SGLANG_PREFILL_DIST_PORT"])
+                        logger.info(f"🔧 [SEMI-PD] PREFILL进程使用专用分布式端口: {dist_port}")
+                    else:
+                        dist_port = self.dist_port
+                        logger.warning(f"🔧 [SEMI-PD] 未找到PREFILL分布式端口，使用默认端口: {dist_port}")
+                else:
+                    # DECODE进程使用DECODE专用端口
+                    if "SGLANG_DECODE_DIST_PORT" in os.environ:
+                        dist_port = int(os.environ["SGLANG_DECODE_DIST_PORT"])
+                        logger.info(f"🔧 [SEMI-PD] DECODE进程使用专用分布式端口: {dist_port}")
+                    else:
+                        dist_port = self.dist_port
+                        logger.warning(f"🔧 [SEMI-PD] 未找到DECODE分布式端口，使用默认端口: {dist_port}")
+                dist_init_method = f"tcp://127.0.0.1:{dist_port}"
+            else:
+                dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        
-        logger.info(f"[TORCH_DIST] 自定义allreduce: {not self.server_args.disable_custom_all_reduce}")
-        logger.info(f"[TORCH_DIST] MSCclpp allreduce: {self.server_args.enable_mscclpp}")
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
-            logger.info(f"[TORCH_DIST] ========== 开始初始化分布式环境 (非draft worker) ==========")
+            # 🔧 关键修复：在Semi-PD + TP模式下，DECODE和PREFILL进程使用相同的world_size
+            world_size = self.tp_size * self.pp_size
+            rank = self.tp_size * self.pp_rank + self.tp_rank
             
-            # 🔧 SEMI-PD PP模式：每个PP stage有独立的分布式组
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化分布式环境
-                world_size = self.tp_size  # 只考虑当前PP stage内的TP进程
-                rank = self.tp_rank        # 在当前PP stage内的rank
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: world_size={world_size} (仅当前PP stage), rank={rank} (当前TP rank)")
-            else:
-                # 标准模式：所有PP stage共享一个分布式组
-                world_size = self.tp_size * self.pp_size
-                rank = self.tp_size * self.pp_rank + self.tp_rank
-                logger.info(f"[TORCH_DIST] 标准模式: world_size={world_size}, rank={rank}")
-            
-            logger.info(f"[TORCH_DIST] local_rank={self.gpu_id}, timeout={self.server_args.dist_timeout}")
+            logger.info(f"🔧 [SEMI-PD] 初始化分布式环境: backend={backend}, world_size={world_size}")
+            logger.info(f"🔧 [SEMI-PD] 当前rank: {rank}, local_rank={self.gpu_id}")
+            logger.info(f"🔧 [SEMI-PD] 分布式初始化地址: {dist_init_method}")
             
             init_distributed_environment(
                 backend=backend,
@@ -533,60 +532,22 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            logger.info(f"[TORCH_DIST] ✅ 分布式环境初始化完成")
             
-            logger.info(f"[TORCH_DIST] ========== 开始初始化模型并行 ==========")
+            logger.info(f"🔧 [SEMI-PD] 初始化模型并行: tensor_parallel_size={self.tp_size}, pipeline_parallel_size={self.pp_size}")
+            initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_size,
+                pipeline_model_parallel_size=self.pp_size,
+            )
             
-            # 🔧 SEMI-PD PP模式：每个PP stage独立初始化模型并行
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 独立初始化当前PP stage")
-                initialize_model_parallel(
-                    tensor_model_parallel_size=self.tp_size,
-                    pipeline_model_parallel_size=1,  # 当前PP stage内部视为单PP
-                )
-            else:
-                # 标准模式：所有PP stage共享模型并行组
-                logger.info(f"[TORCH_DIST] 标准模式: 共享PP stage模型并行组")
-                initialize_model_parallel(
-                    tensor_model_parallel_size=self.tp_size,
-                    pipeline_model_parallel_size=self.pp_size,
-                )
-            
-            logger.info(f"[TORCH_DIST] ✅ 模型并行初始化完成")
-            
-            logger.info(f"[TORCH_DIST] ========== 开始初始化DP注意力 ==========")
-            logger.info(f"[TORCH_DIST] enable_dp_attention={self.server_args.enable_dp_attention}")
-            logger.info(f"[TORCH_DIST] tp_rank={self.tp_rank}, tp_size={self.tp_size}, dp_size={self.server_args.dp_size}")
-            logger.info(f"[TORCH_DIST] moe_dense_tp_size={self.server_args.moe_dense_tp_size}, pp_size={self.server_args.pp_size}")
-            
-            # 🔧 SEMI-PD PP模式：每个PP stage独立初始化DP注意力
-            if self.server_args.enable_semi_pd and self.pp_size > 1:
-                # 在Semi-PD PP模式下，每个PP stage独立初始化
-                logger.info(f"[TORCH_DIST] 🔧 Semi-PD PP模式: 独立初始化当前PP stage的DP注意力")
-                initialize_dp_attention(
-                    enable_dp_attention=self.server_args.enable_dp_attention,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    dp_size=self.server_args.dp_size,
-                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                    pp_size=1,  # 当前PP stage内部视为单PP
-                )
-            else:
-                # 标准模式：所有PP stage共享DP注意力组
-                logger.info(f"[TORCH_DIST] 标准模式: 共享PP stage DP注意力组")
-                initialize_dp_attention(
-                    enable_dp_attention=self.server_args.enable_dp_attention,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    dp_size=self.server_args.dp_size,
-                    moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                    pp_size=self.server_args.pp_size,
-                )
-            
-            logger.info(f"[TORCH_DIST] ✅ DP注意力初始化完成")
-        else:
-            logger.info(f"[TORCH_DIST] 跳过分布式初始化 (draft worker)")
+            logger.info(f"🔧 [SEMI-PD] 初始化DP attention: enable_dp_attention={self.server_args.enable_dp_attention}")
+            initialize_dp_attention(
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
+                pp_size=self.server_args.pp_size,
+            )
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
@@ -594,34 +555,11 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
-        logger.info(f"[TORCH_DIST] 分布式初始化后最小GPU内存: {min_per_gpu_memory:.2f} GB")
-        
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
-        
-        logger.info(f"[TORCH_DIST] ========== 分布式组信息 ==========")
-        logger.info(f"[TORCH_DIST] TP组: world_size={self.tp_group.world_size}, rank_in_group={self.tp_group.rank_in_group}")
-        if self.attention_tp_group:
-            logger.info(f"[TORCH_DIST] 注意力TP组: world_size={self.attention_tp_group.world_size}, rank_in_group={self.attention_tp_group.rank_in_group}")
-        
-        # 获取PP组信息
-        try:
-            pp_group = get_pp_group()
-            logger.info(f"[TORCH_DIST] PP组: world_size={pp_group.world_size}, rank_in_group={pp_group.rank_in_group}")
-        except:
-            logger.info(f"[TORCH_DIST] PP组: 未初始化")
-        
-        # 获取WORLD组信息
-        try:
-            world_group = get_world_group()
-            logger.info(f"[TORCH_DIST] WORLD组: world_size={world_group.world_size}, rank_in_group={world_group.rank_in_group}")
-        except:
-            logger.info(f"[TORCH_DIST] WORLD组: 未初始化")
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(f"[TORCH_DIST] 本地GPU内存: {local_gpu_memory:.2f} GB")
-        
         if self.tp_size > 1:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
@@ -636,8 +574,9 @@ class ModelRunner:
                     )
 
         logger.info(
-            f"[TORCH_DIST] PyTorch分布式初始化完成. 内存使用={(before_avail_memory - local_gpu_memory):.2f} GB"
+            f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        logger.info(f"🔧 [SEMI-PD] 分布式环境初始化完成 - 可用内存: {min_per_gpu_memory:.2f} GB")
         return min_per_gpu_memory
 
     def get_ipc_info(self) -> IPCInfo:
