@@ -190,22 +190,3 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         return ret
 
-    def process_batch_result_prefill(
-        self,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done=None,
-    ):
-        next_token_logits = None
-        if result.logits_output is not None:
-            next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
-
-        req = BatchProcessPrefillResultReq(
-            next_token_ids=result.next_token_ids.tolist(),
-            next_token_logits=next_token_logits,
-        )
-
-        self.send_to_d_instance.send_pyobj(req)
-
-    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        logger.info("Ignore flush cache request")

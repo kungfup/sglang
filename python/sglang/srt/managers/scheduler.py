@@ -1896,14 +1896,25 @@ class Scheduler(
                 self.tp_worker.set_hicache_consumer(
                     model_worker_batch.hicache_consumer_index
                 )
+                # 🔍 [DEBUG] 添加PP相关的调试日志
+                logger.info(f"🔍 [PP_DEBUG] PP group info:")
+                logger.info(f"🔍 [PP_DEBUG]   pp_group.rank: {self.pp_group.rank}")
+                logger.info(f"🔍 [PP_DEBUG]   pp_group.world_size: {self.pp_group.world_size}")
+                logger.info(f"🔍 [PP_DEBUG]   pp_group.is_last_rank: {self.pp_group.is_last_rank}")
+                logger.info(f"🔍 [PP_DEBUG]   pp_group.last_rank: {self.pp_group.last_rank}")
+                
                 if self.pp_group.is_last_rank:
+                    logger.info(f"🔍 [PP_DEBUG] This is the LAST PP rank, should get next_token_ids")
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+                    logger.info(f"🔍 [PP_DEBUG] Got results: next_token_ids type={type(next_token_ids)}, shape={getattr(next_token_ids, 'shape', 'N/A')}")
                 else:
+                    logger.info(f"🔍 [PP_DEBUG] This is NOT the last PP rank, will get hidden states")
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+                    logger.info(f"🔍 [PP_DEBUG] Got hidden states: type={type(pp_hidden_states_proxy_tensors)}")
                 bid = model_worker_batch.bid
             else:
                 (
@@ -1935,19 +1946,35 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
+            # 🔍 [DEBUG] 添加结果构造的调试日志
+            logger.info(f"🔍 [PP_DEBUG] Constructing GenerationBatchResult:")
+            logger.info(f"�� [PP_DEBUG]   is_last_rank: {self.pp_group.is_last_rank}")
+            
+            logits_output_result = logits_output if self.pp_group.is_last_rank else None
+            next_token_ids_result = next_token_ids if self.pp_group.is_last_rank else None
+            
+            logger.info(f"🔍 [PP_DEBUG]   logits_output_result: {logits_output_result is not None}")
+            logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result: {next_token_ids_result is not None}")
+            
+            if next_token_ids_result is not None:
+                logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result type: {type(next_token_ids_result)}")
+                logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result shape: {getattr(next_token_ids_result, 'shape', 'N/A')}")
+            
             ret = GenerationBatchResult(
-                logits_output=logits_output if self.pp_group.is_last_rank else None,
+                logits_output=logits_output_result,
                 pp_hidden_states_proxy_tensors=(
                     pp_hidden_states_proxy_tensors
                     if not self.pp_group.is_last_rank
                     else None
                 ),
-                next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
+                next_token_ids=next_token_ids_result,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+            
+            logger.info(f"🔍 [PP_DEBUG] Final result.next_token_ids: {ret.next_token_ids is not None}")
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)

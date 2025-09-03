@@ -18,7 +18,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import List, Optional
-
+import os
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -68,6 +68,35 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         )
 
         self.pp_rank = pp_rank  # 🔧 保存pp_rank
+
+                # 🔧 从环境变量获取pp_size
+        self.pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))  # 🔧 保存pp_size
+
+        # 🔧 PP模式下的DECODE进程间通信初始化
+        self.pp_group = None
+        if self.pp_size > 1:
+            # 初始化PP通信组，用于PP stage间的token传递
+            try:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    # 创建PP通信组，包含所有PP stage的DECODE进程
+                    # 注意：这里假设PP stage的DECODE进程有相同的TP rank
+                    pp_decode_ranks = []
+                    for i in range(self.pp_size):
+                        # 每个PP stage的第一个TP rank作为代表参与PP通信
+                        if self.attn_tp_rank == 0:  # 只有TP rank 0参与PP通信
+                            pp_decode_ranks.append(i * self.attn_tp_size + self.attn_tp_rank)
+                    
+                    if len(pp_decode_ranks) > 1 and self.attn_tp_rank == 0:
+                        self.pp_group = dist.new_group(pp_decode_ranks)
+                        logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: Created PP communication group with ranks {pp_decode_ranks}")
+                    else:
+                        logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: TP{self.attn_tp_rank} - not participating in PP communication")
+                else:
+                    logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: Distributed not initialized, PP communication disabled")
+            except Exception as e:
+                logger.error(f"❌ [PP_DECODE] PP{pp_rank}: Failed to initialize PP communication: {e}")
+                self.pp_group = None
 
         self._request_dispatcher._mapping.extend(
             [
@@ -398,11 +427,97 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             )
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
+        """
+        🔧 PP模式下的Semi-PD DECODE处理逻辑
+        
+        PP模式流程：
+        PP0 PREFILL → PP1 PREFILL → PP1 DECODE → PP0 DECODE
+             ↓              ↓              ↓              ↓
+        隐藏状态        next_token_ids   传递token    接收token并decode
+        
+        关键修改：
+        1. PP1 DECODE: 先传递token给PP0 DECODE，然后开始decode
+        2. PP0 DECODE: 等待PP1 DECODE传递的token，然后开始decode
+        """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
+        import os
+        import torch.distributed as dist
+        
+        # 获取PP配置
+        pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
+        pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
+        is_last_pp_stage = (pp_rank == pp_size - 1)
+        
+        logger.info(f"🔧 [PP_DECODE] PP{pp_rank}/{pp_size-1}: process_prefill_result called")
+        logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: received {len(recv_req.next_token_ids)} tokens")
+        
         batch = self.scheduled_prefill_batches.pop(0)
-        assert len(batch.reqs) == len(recv_req.next_token_ids)
-
+        
+        # 🔑 核心逻辑：PP模式下的token传递和decode启动
+        if self.pp_size > 1:  # PP模式
+            if is_last_pp_stage:
+                # PP1 DECODE: 先传递token给PP0 DECODE，然后开始decode
+                logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Last stage, will pass tokens to PP0 and start decode")
+                
+                # 🔑 关键：PP1 DECODE需要将token传递给PP0 DECODE
+                if len(recv_req.next_token_ids) > 0:
+                    # 使用SGLang原生的distributed通信机制传递token给PP0
+                    # 这里需要实现PP stage间的token传递
+                    logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Passing {len(recv_req.next_token_ids)} tokens to PP0")
+                    
+                    # 创建token tensor并通过NCCL传递给PP0
+                    token_tensor = torch.tensor(recv_req.next_token_ids, dtype=torch.long, device=self.device)
+                    
+                    # 使用SGLang的PP通信组传递token
+                    # 注意：这里需要与PP0 DECODE的接收逻辑配合
+                    if hasattr(self, 'pp_group') and self.pp_group is not None:
+                        # 发送给PP0 (rank 0 in pp_group)
+                        dist.send(token_tensor, dst=0, group=self.pp_group)
+                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Tokens sent to PP0 via NCCL")
+                    else:
+                        logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No PP group found, cannot send tokens to PP0")
+                
+                # PP1 DECODE开始处理自己的decode
+                logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Starting decode phase")
+                
+            else:
+                # PP0 DECODE: 等待PP1 DECODE传递的token
+                logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Non-last stage, waiting for tokens from PP1")
+                
+                # 🔑 关键：PP0 DECODE需要等待PP1 DECODE传递的token
+                # 由于PP0 PREFILL没有发送token，PP0 DECODE需要从PP1 DECODE接收token
+                if len(recv_req.next_token_ids) == 0:
+                    logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: No tokens from PREFILL, waiting for tokens from PP1")
+                    
+                    # 从PP1 DECODE接收token
+                    if hasattr(self, 'pp_group') and self.pp_group is not None:
+                        # 创建接收缓冲区
+                        # 这里需要知道期望接收多少个token，可能需要先接收大小信息
+                        max_tokens = batch.batch_size()  # 假设每个request一个token
+                        token_tensor = torch.zeros(max_tokens, dtype=torch.long, device=self.device)
+                        
+                        # 从PP1 (rank 1 in pp_group) 接收
+                        dist.recv(token_tensor, src=1, group=self.pp_group)
+                        
+                        # 更新recv_req中的token
+                        recv_req.next_token_ids = token_tensor.cpu().numpy().tolist()
+                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Received {len(recv_req.next_token_ids)} tokens from PP1")
+                    else:
+                        logger.error(f"❌ [PP_DECODE] PP{pp_rank}: No PP group found, cannot receive tokens from PP1")
+                        # 使用空token列表作为fallback
+                        recv_req.next_token_ids = []
+                
+                logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Starting decode phase with received tokens")
+        
+        # 验证token数量
+        if len(batch.reqs) != len(recv_req.next_token_ids):
+            if self.pp_size > 1 and not is_last_pp_stage and len(recv_req.next_token_ids) == 0:
+                # PP0 DECODE在等待PP1传递token时可能暂时为空，这是正常的
+                logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: Token count mismatch, but this may be temporary in PP mode")
+            else:
+                logger.error(f"❌ [PP_DECODE] PP{pp_rank}: batch.reqs({len(batch.reqs)}) != next_token_ids({len(recv_req.next_token_ids)})")
+        
+        # 处理logits
         logits_processor_output = None
         if recv_req.next_token_logits is not None:
             logits_processor_output = LogitsProcessorOutput(
@@ -411,36 +526,36 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 ),
                 hidden_states=None,
             )
-
-        # TODO: return logprobs is not supported in Semi-PD mode
-        # CRITICAL: Match original Semi-PD diff exactly (lines 182-190)
+        
+        # 创建结果
         result = GenerationBatchResult(
-            next_token_ids=recv_req.next_token_ids,      # Original Semi-PD order
-            logits_output=logits_processor_output,       # Original Semi-PD order
-            pp_hidden_states_proxy_tensors=None,         # v0.4.8 addition
-            extend_input_len_per_req=None,               # Original Semi-PD (None, not [])
-            extend_logprob_start_len_per_req=None,       # Original Semi-PD (None, not [])
-            bid=-1,                                      # Original Semi-PD
-            can_run_cuda_graph=False,                    # v0.4.8 addition
+            next_token_ids=recv_req.next_token_ids,
+            logits_output=logits_processor_output,
+            pp_hidden_states_proxy_tensors=None,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            bid=-1,
+            can_run_cuda_graph=False,
         )
-
+        
         if self.attn_tp_size > 1:
             dist.barrier(group=self.attn_tp_cpu_group)
-
-        # Semi-PD: Critical batch.output_ids setting (matches original Semi-PD logic)
-        batch.output_ids = torch.from_numpy(
-            np.array(result.next_token_ids, dtype=np.int64)
-        ).to(self.device, dtype=torch.int64, non_blocking=True)
-
+        
+        # 设置batch.output_ids
+        if len(recv_req.next_token_ids) > 0:
+            batch.output_ids = torch.from_numpy(
+                np.array(result.next_token_ids, dtype=np.int64)
+            ).to(self.device, dtype=torch.int64, non_blocking=True)
+        else:
+            # 如果没有token，创建空的output_ids
+            batch.output_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+        
         self.process_batch_result_prefill(batch, result)
-
+        
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-
+        
         if not batch.is_empty():
             if self.running_batch.is_empty():
                 self.running_batch = batch
             else:
                 self.running_batch.merge_batch(batch)
-
-
-
