@@ -424,12 +424,7 @@ class Qwen2ForCausalLM(nn.Module):
                     )
                     self.lm_head.weight.copy_(emb_token_weight)
             else:
-                # 修复日志信息：区分DECODE和PREFILL进程
-                instance_role = os.getenv('SGLANG_INSTANCE_ROLE', 'UNKNOWN')
-                if instance_role == 'PREFILL':
-                    logger.info(f"🔧 [MODEL_LOADER] PREFILL进程：跳过PP权重绑定通信（避免Meta tensor错误）")
-                else:
-                    logger.info(f"🔧 [MODEL_LOADER] {instance_role}进程：跳过PP权重绑定通信（避免Meta tensor错误）")
+                logger.info(f"🔧 [MODEL_LOADER] PREFILL进程：跳过PP权重绑定通信（避免Meta tensor错误）")
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

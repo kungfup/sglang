@@ -193,26 +193,42 @@ def _initialize_model(
     if pp_size > 1:
         total_layers = 0
         actual_layers = 0
+        missing_layers = 0
         
-        # 检查模型是否有start_layer和end_layer属性（这是pipeline并行的标志）
-        if hasattr(model, 'model') and hasattr(model.model, 'start_layer') and hasattr(model.model, 'end_layer'):
-            start_layer = model.model.start_layer
-            end_layer = model.model.end_layer
-            actual_layers = end_layer - start_layer
-            total_layers = model.config.num_hidden_layers
+        # 检查模型是否有正确的PP层分配
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            layers_module = model.model.layers
+            total_layers = len(layers_module)
+            
+            # 统计实际层和缺失层
+            for i, layer in enumerate(layers_module):
+                from sglang.srt.layers.utils import PPMissingLayer
+                if isinstance(layer, PPMissingLayer):
+                    missing_layers += 1
+                else:
+                    actual_layers += 1
+            
+            # 检查是否有start_layer和end_layer属性
+            start_layer = getattr(model.model, 'start_layer', None)
+            end_layer = getattr(model.model, 'end_layer', None)
             
             logger.info(f"🔧 [MODEL_LOADER] 模型层分析:")
             logger.info(f"  📊 总层数: {total_layers}")
-            logger.info(f"  📊 当前PP stage层数: {actual_layers} (layers {start_layer}-{end_layer})")
+            logger.info(f"  📊 实际层数: {actual_layers}")
+            logger.info(f"  📊 缺失层数: {missing_layers}")
+            logger.info(f"  📊 PP范围: start={start_layer}, end={end_layer}")
             
-            if actual_layers > 0:
+            if actual_layers == 0 and pp_size > 1:
+                logger.warning(f"⚠️ [MODEL_LOADER] 警告：检测到PP_SIZE>1但模型层未正确分配PP rank")
+                logger.warning(f"  📊 这可能导致内存问题：每个PP stage都会创建完整模型")
+                logger.warning(f"  📊 建议检查模型类是否正确实现了pipeline并行")
+            elif actual_layers > 0 and actual_layers < total_layers:
                 logger.info(f"✅ [MODEL_LOADER] 模型层已正确分配PP rank，pipeline并行工作正常")
-            else:
-                logger.warning(f"⚠️ [MODEL_LOADER] 警告：当前PP stage没有分配到任何层")
+                logger.info(f"  📊 当前PP stage负责层 {start_layer}-{end_layer-1} (共{actual_layers}层)")
+            elif actual_layers == total_layers:
+                logger.warning(f"⚠️ [MODEL_LOADER] 警告：所有层都在当前PP stage，可能没有正确分割")
         else:
-            logger.warning(f"⚠️ [MODEL_LOADER] 警告：模型没有pipeline并行属性(start_layer/end_layer)")
-            logger.warning(f"  📊 这可能导致内存问题：每个PP stage都会创建完整模型")
-            logger.warning(f"  📊 建议检查模型类是否正确实现了pipeline并行")
+            logger.warning(f"⚠️ [MODEL_LOADER] 无法找到模型层结构，跳过层分析")
     
     return model
 

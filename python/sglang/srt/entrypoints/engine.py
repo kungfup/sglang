@@ -900,16 +900,34 @@ def _launch_semi_pd_subprocesses(
         # DECODE和PREFILL进程使用不同的分布式初始化端口，但共享相同的NCCL端口
         if server_args.enable_semi_pd:
             import random
-            # 🔧 修复：DECODE和PREFILL进程使用不同的分布式初始化端口
-            # 这样可以避免端口冲突，但共享相同的NCCL端口进行通信
-            decode_dist_port = 40000 + random.randint(100, 199)
-            prefill_dist_port = 40000 + random.randint(200, 299)  # 🔧 使用不同的端口范围
+            # 🔧 修复：Semi-PD + PP模式下的分布式环境配置
+            if server_args.pp_size > 1:
+                # PP模式：DECODE和PREFILL使用不同端口，但PP stage间使用相同NCCL端口
+                base_dist_port = 40000 + random.randint(100, 199)
+                
+                # DECODE和PREFILL使用不同的分布式初始化端口，避免端口冲突
+                decode_dist_port = base_dist_port
+                prefill_dist_port = base_dist_port + 100  # 错开100个端口
+                
+                # 每个PP stage使用独立的NCCL端口
+                base_nccl_port = 40000 + random.randint(200, 299)
+                for pp_rank in range(server_args.pp_size):
+                    pp_nccl_port = base_nccl_port + pp_rank * 10
+                    logger.info(f"🔧 [SEMI-PD+PP] PP{pp_rank} NCCL端口: {pp_nccl_port}")
+                
+                logger.info(f"🔧 [SEMI-PD+PP] DECODE进程分布式端口: {decode_dist_port}")
+                logger.info(f"🔧 [SEMI-PD+PP] PREFILL进程分布式端口: {prefill_dist_port}")
+                logger.info(f"🔧 [SEMI-PD+PP] PP模式：DECODE和PREFILL使用独立端口，PP stage间使用相同NCCL端口")
+            else:
+                # TP模式：DECODE和PREFILL进程使用不同的分布式初始化端口
+                decode_dist_port = 40000 + random.randint(100, 199)
+                prefill_dist_port = 40000 + random.randint(200, 299)
+                logger.info(f"🔧 [SEMI-PD] DECODE和PREFILL进程使用独立的分布式初始化端口")
             
             os.environ["SGLANG_DECODE_DIST_PORT"] = str(decode_dist_port)
             os.environ["SGLANG_PREFILL_DIST_PORT"] = str(prefill_dist_port)
             logger.info(f"🔧 [SEMI-PD] DECODE进程分布式端口: {decode_dist_port}")
             logger.info(f"🔧 [SEMI-PD] PREFILL进程分布式端口: {prefill_dist_port}")
-            logger.info(f"🔧 [SEMI-PD] DECODE和PREFILL进程使用独立的分布式初始化端口")
             logger.info(f"🔧 [SEMI-PD] DECODE分布式环境: tcp://127.0.0.1:{decode_dist_port}")
             logger.info(f"🔧 [SEMI-PD] PREFILL分布式环境: tcp://127.0.0.1:{prefill_dist_port}")
 
