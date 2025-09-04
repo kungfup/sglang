@@ -104,15 +104,34 @@ class SemiPDScheduler(Scheduler):
         bypass_load_weight: bool = False,
         instance_role: InstanceRole = InstanceRole.OTHER,
     ):
-        # 🔧 设置Semi-PD PP模式的环境变量
-        os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
+        # 🔧 根据配置决定是否启用Semi-PD
+        # 获取TP和PP大小信息
+        tp_size = getattr(server_args, "tp_size", 1)
+        pp_size = getattr(server_args, "pp_size", 1)
+        
+        # 根据设计逻辑设置环境变量：
+        # TP=2时：使用Semi-PD，不依赖PP组通信，使用IPC机制
+        # PP=2时：使用原生流水线并行，依赖PP组通信
+        if tp_size > 1 and pp_size == 1:
+            # TP=2, PP=1: Semi-PD模式
+            os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
+            logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Semi-PD模式激活 (TP={tp_size}, PP={pp_size})")
+        elif pp_size > 1:
+            # PP=2: 原生流水线并行模式
+            # 在PP stage内部可能使用Semi-PD，但stage间使用原生PP通信
+            if tp_size > 1:
+                os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
+                logger.info(f"🔧 [HYBRID_MODE] PP{pp_rank} TP{tp_rank}: 混合模式 - PP stage内Semi-PD + stage间原生PP (TP={tp_size}, PP={pp_size})")
+            else:
+                logger.info(f"🔧 [NATIVE_PP2] PP{pp_rank} TP{tp_rank}: 纯原生流水线并行模式 (TP={tp_size}, PP={pp_size})")
+        else:
+            # 单GPU模式
+            logger.info(f"🔧 [SINGLE_GPU] PP{pp_rank} TP{tp_rank}: 单GPU模式 (TP={tp_size}, PP={pp_size})")
+        
+        # 设置PP相关环境变量
         os.environ["SGLANG_PP_RANK"] = str(pp_rank)
+        os.environ["SGLANG_PP_SIZE"] = str(pp_size)
         os.environ["SGLANG_GPU_ID"] = str(gpu_id)
-        
-        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SemiPDScheduler初始化开始")
-        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 环境变量设置完成")
-        logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}")
-        
         # 调用原始Scheduler构造函数，现在包含pp_rank
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 调用父类Scheduler构造函数...")
         super().__init__(

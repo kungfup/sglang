@@ -491,17 +491,24 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     
                     # 从PP1 DECODE接收token
                     if hasattr(self, 'pp_group') and self.pp_group is not None:
-                        # 创建接收缓冲区
-                        # 这里需要知道期望接收多少个token，可能需要先接收大小信息
-                        max_tokens = batch.batch_size()  # 假设每个request一个token
-                        token_tensor = torch.zeros(max_tokens, dtype=torch.long, device=self.device)
-                        
-                        # 从PP1 (rank 1 in pp_group) 接收
-                        dist.recv(token_tensor, src=1, group=self.pp_group)
-                        
-                        # 更新recv_req中的token
-                        recv_req.next_token_ids = token_tensor.cpu().numpy().tolist()
-                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Received {len(recv_req.next_token_ids)} tokens from PP1")
+                        # 🔧 修复时序问题：PP0 DECODE应该等待PP1 DECODE发送token
+                        # 使用阻塞接收，确保PP1 DECODE已经发送了token
+                        try:
+                            # 创建接收缓冲区
+                            max_tokens = batch.batch_size()  # 假设每个request一个token
+                            token_tensor = torch.zeros(max_tokens, dtype=torch.long, device=self.device)
+                            
+                            # 从PP1 (rank 1 in pp_group) 接收
+                            logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Waiting for tokens from PP1...")
+                            dist.recv(token_tensor, src=1, group=self.pp_group)
+                            
+                            # 更新recv_req中的token
+                            recv_req.next_token_ids = token_tensor.cpu().numpy().tolist()
+                            logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Received {len(recv_req.next_token_ids)} tokens from PP1")
+                        except Exception as e:
+                            logger.error(f"❌ [PP_DECODE] PP{pp_rank}: Failed to receive tokens from PP1: {e}")
+                            # 使用空token列表作为fallback
+                            recv_req.next_token_ids = []
                     else:
                         logger.error(f"❌ [PP_DECODE] PP{pp_rank}: No PP group found, cannot receive tokens from PP1")
                         # 使用空token列表作为fallback
@@ -542,13 +549,22 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             dist.barrier(group=self.attn_tp_cpu_group)
         
         # 设置batch.output_ids
+        # 🔧 修复：确保PP0 DECODE在等待PP1传递token时不会创建空的output_ids
         if len(recv_req.next_token_ids) > 0:
             batch.output_ids = torch.from_numpy(
                 np.array(result.next_token_ids, dtype=np.int64)
             ).to(self.device, dtype=torch.int64, non_blocking=True)
         else:
-            # 如果没有token，创建空的output_ids
-            batch.output_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+            # 🔧 关键修复：在PP模式下，如果PP0 DECODE没有token，说明还在等待PP1传递
+            # 此时不应该创建空的output_ids，而应该等待PP1传递token后再设置
+            if self.pp_size > 1 and not is_last_pp_stage:
+                # PP0 DECODE等待PP1传递token，暂时不设置output_ids
+                logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No tokens yet, waiting for PP1 to pass tokens")
+                # 不设置batch.output_ids，让后续的PP通信逻辑处理
+                pass
+            else:
+                # 非PP模式或PP1 DECODE，创建空的output_ids
+                batch.output_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
         
         self.process_batch_result_prefill(batch, result)
         

@@ -454,7 +454,7 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
         
-        logger.info(f"[SCHEDULER] 分布式组信息: tp_group.world_size={self.tp_group.world_size}, pp_group.world_size={self.pp_group.world_size}")
+        logger.info(f"[SCHEDULER] 分布式组信息: tp_group.world_size={self.tp_group.world_size}, pp_group.world_size={self.pp_group.world_size if self.pp_group is not None else 'None'}")
         logger.info(f"[SCHEDULER] 分布式组信息: world_group.world_size={self.world_group.world_size}")
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -1001,7 +1001,7 @@ class Scheduler(
                     result = self.run_batch(self.cur_batch)
 
                 # (last rank) send the outputs to the next step
-                if self.pp_group.is_last_rank:
+                if self.pp_group is not None and self.pp_group.is_last_rank:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
@@ -1071,7 +1071,7 @@ class Scheduler(
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
-                if not self.pp_group.is_last_rank:
+                if self.pp_group is not None and not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         bids[mb_id] = result.bid
                     # carry the outputs to the next stage
@@ -1897,13 +1897,34 @@ class Scheduler(
                     model_worker_batch.hicache_consumer_index
                 )
                 # 🔍 [DEBUG] 添加PP相关的调试日志
-                logger.info(f"🔍 [PP_DEBUG] PP group info:")
-                logger.info(f"🔍 [PP_DEBUG]   pp_group.rank: {self.pp_group.rank}")
-                logger.info(f"🔍 [PP_DEBUG]   pp_group.world_size: {self.pp_group.world_size}")
-                logger.info(f"🔍 [PP_DEBUG]   pp_group.is_last_rank: {self.pp_group.is_last_rank}")
-                logger.info(f"🔍 [PP_DEBUG]   pp_group.last_rank: {self.pp_group.last_rank}")
+                if self.pp_group is not None:
+                    logger.info(f"🔍 [PP_DEBUG] PP group info:")
+                    logger.info(f"🔍 [PP_DEBUG]   pp_group.rank: {self.pp_group.rank}")
+                    logger.info(f"🔍 [PP_DEBUG]   pp_group.world_size: {self.pp_group.world_size}")
+                    logger.info(f"🔍 [PP_DEBUG]   pp_group.is_last_rank: {self.pp_group.is_last_rank}")
+                    logger.info(f"🔍 [PP_DEBUG]   pp_group.last_rank: {self.pp_group.last_rank}")
+                else:
+                    logger.info(f"🔍 [PP_DEBUG] PP group is None (Semi-PD mode)")
                 
-                if self.pp_group.is_last_rank:
+                # 🔧 修复：Semi-PD TP模式下的PP stage判断逻辑
+                import os
+                pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
+                is_last_pp_stage = False
+                
+                if pp_size == 1:
+                    # Semi-PD TP模式 (PP=1)：DECODE进程就是最后一个PP stage
+                    is_last_pp_stage = True
+                    logger.info(f"🔧 [PP_DEBUG] Semi-PD TP mode (PP=1): DECODE is the last PP stage")
+                elif self.pp_group is not None:
+                    # 原生PP模式 (PP>1)：使用pp_group判断
+                    is_last_pp_stage = self.pp_group.is_last_rank
+                    logger.info(f"🔧 [PP_DEBUG] Native PP mode: is_last_pp_stage={is_last_pp_stage}")
+                else:
+                    # 异常情况：PP>1但pp_group为None
+                    logger.warning(f"⚠️ [PP_DEBUG] PP={pp_size} but pp_group is None, assuming last stage")
+                    is_last_pp_stage = True
+                
+                if is_last_pp_stage:
                     logger.info(f"🔍 [PP_DEBUG] This is the LAST PP rank, should get next_token_ids")
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -1929,7 +1950,8 @@ class Scheduler(
                 self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
-            if self.pp_group.is_last_rank:
+            # 🔧 修复：使用统一的is_last_pp_stage判断
+            if is_last_pp_stage:
                 batch.output_ids = next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
@@ -1948,10 +1970,12 @@ class Scheduler(
 
             # 🔍 [DEBUG] 添加结果构造的调试日志
             logger.info(f"🔍 [PP_DEBUG] Constructing GenerationBatchResult:")
-            logger.info(f"�� [PP_DEBUG]   is_last_rank: {self.pp_group.is_last_rank}")
+            logger.info(f"�� [PP_DEBUG]   is_last_rank: {is_last_pp_stage}")
             
-            logits_output_result = logits_output if self.pp_group.is_last_rank else None
-            next_token_ids_result = next_token_ids if self.pp_group.is_last_rank else None
+            # 🔧 [SEMI-PD FIX] 修复Semi-PD模式下的结果构造逻辑
+            # 统一使用is_last_pp_stage判断，无论是Semi-PD还是原生PP模式
+            logits_output_result = logits_output if is_last_pp_stage else None
+            next_token_ids_result = next_token_ids if is_last_pp_stage else None
             
             logger.info(f"🔍 [PP_DEBUG]   logits_output_result: {logits_output_result is not None}")
             logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result: {next_token_ids_result is not None}")
@@ -1964,7 +1988,7 @@ class Scheduler(
                 logits_output=logits_output_result,
                 pp_hidden_states_proxy_tensors=(
                     pp_hidden_states_proxy_tensors
-                    if not self.pp_group.is_last_rank
+                    if not is_last_pp_stage
                     else None
                 ),
                 next_token_ids=next_token_ids_result,

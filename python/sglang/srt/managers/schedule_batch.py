@@ -1567,8 +1567,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     self.output_ids.to(torch.int64)
                 )
-
         # Update fields
+        
         self.input_ids = self.output_ids
         self.output_ids = None
 

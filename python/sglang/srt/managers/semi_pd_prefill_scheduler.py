@@ -190,3 +190,68 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         return ret
 
+    def process_batch_result_prefill(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done=None,
+    ):
+        # 🔍 [DEBUG] 添加详细的调试日志
+        logger.info(f"🔍 [PREFILL_DEBUG] process_batch_result_prefill called")
+        logger.info(f"🔍 [PREFILL_DEBUG] batch type: {type(batch)}")
+        logger.info(f"🔍 [PREFILL_DEBUG] batch info: reqs={len(batch.reqs) if hasattr(batch, 'reqs') else 'N/A'}")
+        logger.info(f"🔍 [PREFILL_DEBUG] result type: {type(result)}")
+        logger.info(f"🔍 [PREFILL_DEBUG] result is None: {result is None}")
+        
+        if result is not None:
+            logger.info(f"🔍 [PREFILL_DEBUG] result attributes: {dir(result)}")
+            logger.info(f"🔍 [PREFILL_DEBUG] result.next_token_ids type: {type(getattr(result, 'next_token_ids', None))}")
+            logger.info(f"🔍 [PREFILL_DEBUG] result.next_token_ids is None: {getattr(result, 'next_token_ids', None) is None}")
+            logger.info(f"🔍 [PREFILL_DEBUG] result.logits_output: {getattr(result, 'logits_output', None)}")
+            
+            # 检查是否有其他可能的token ID字段
+            for attr in dir(result):
+                if 'token' in attr.lower():
+                    logger.info(f"🔍 [PREFILL_DEBUG] found token-related attr: {attr} = {getattr(result, attr, None)}")
+        else:
+            logger.error(f"❌ [PREFILL_DEBUG] result is None! This is the root cause of the error")
+        
+        next_token_logits = None
+        if result.logits_output is not None:
+            next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
+
+        # 🔍 [DEBUG] 检查 next_token_ids 是否为空
+        if result.next_token_ids is None:
+            logger.info(f"✅ [PREFILL_DEBUG] result.next_token_ids is None - this is expected for non-last PP stages")
+            logger.info(f"✅ [PREFILL_DEBUG] In PP mode, only the last PP stage should have next_token_ids")
+            logger.info(f"✅ [PREFILL_DEBUG] This PREFILL process will send empty next_token_ids to DECODE process")
+            # 在PP模式下，非最后一个stage的next_token_ids为None是正常的
+            # 我们仍然需要发送结果给DECODE进程，但next_token_ids为空列表
+            import os
+            pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
+            pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
+            is_last_pp_stage = (pp_rank == pp_size - 1)
+            
+            if is_last_pp_stage:
+                logger.error(f"❌ [PREFILL_DEBUG] This is the last PP stage but next_token_ids is None!")
+                logger.error(f"❌ [PREFILL_DEBUG] This indicates a serious PP communication issue")
+                next_token_ids_list = []
+            else:
+                logger.info(f"✅ [PREFILL_DEBUG] This is PP stage {pp_rank}/{pp_size-1}, sending empty next_token_ids")
+                # 对于非最后一个PP stage，发送空的next_token_ids列表
+                next_token_ids_list = []
+        else:
+            next_token_ids_list = result.next_token_ids.tolist()
+            logger.info(f"✅ [PREFILL_DEBUG] next_token_ids successfully converted: {next_token_ids_list}")
+
+        req = BatchProcessPrefillResultReq(
+            next_token_ids=next_token_ids_list,
+            next_token_logits=next_token_logits,
+        )
+
+        logger.info(f"🔍 [PREFILL_DEBUG] sending request to D instance: {req}")
+        self.send_to_d_instance.send_pyobj(req)
+        logger.info(f"✅ [PREFILL_DEBUG] request sent successfully")
+
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        logger.info("Ignore flush cache request")

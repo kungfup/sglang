@@ -12,6 +12,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
+# 导入InstanceRole枚举
+try:
+    from sglang.srt.managers.scheduler import InstanceRole
+except ImportError:
+    # 如果无法导入，定义一个简单的枚举
+    from enum import Enum
+    class InstanceRole(Enum):
+        PREFILL = "PREFILL"
+        DECODE = "DECODE"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -65,10 +75,56 @@ class SchedulerOutputProcessorMixin:
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
-                # Move next_token_ids and logprobs to cpu
-                # Semi-PD
-                if not isinstance(next_token_ids, list):
-                    next_token_ids = next_token_ids.tolist()
+                # Semi-PD + Pipeline Parallel handling
+                # 使用instance_role来判断是否应该处理next_token_ids
+                if (hasattr(self, 'server_args') and 
+                    getattr(self.server_args, 'enable_semi_pd', False) and
+                    hasattr(self, 'instance_role')):
+                    
+                    # 检查是否是Pipeline并行模式
+                    import os
+                    pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))
+                    
+                    if pp_size > 1:
+                        # Pipeline并行模式
+                        if self.instance_role == InstanceRole.PREFILL:
+                            # PREFILL角色：检查是否是最后一个PP stage
+                            pp_rank = int(os.environ.get("SGLANG_PP_RANK", 0))
+                            is_last_pp_stage = (pp_rank == pp_size - 1)
+                            
+                            if not is_last_pp_stage:
+                                # 非最后一个PP stage的PREFILL：只产生隐藏状态，不处理token
+                                logger.info(f"🔧 [PP_PREFILL] PP{pp_rank}/{pp_size-1}: PREFILL非最后PP stage，跳过token处理，只产生隐藏状态")
+                                
+                                # 对于非最后PP stage，我们需要设置一个空的next_token_ids来避免后续处理错误
+                                next_token_ids = [0] * len(batch.reqs)  # 设置默认值
+                                
+                                # 继续执行后续逻辑，但跳过stream_output
+                                self.skip_stream_for_pp = True
+                            else:
+                                # 最后一个PP stage的PREFILL：需要生成最终token
+                                logger.info(f"🔧 [PP_PREFILL] PP{pp_rank}/{pp_size-1}: PREFILL最后PP stage，处理最终token")
+                                if next_token_ids is not None and not isinstance(next_token_ids, list):
+                                    next_token_ids = next_token_ids.tolist()
+                                self.skip_stream_for_pp = False
+                        else:
+                            # DECODE角色：正常处理
+                            logger.info(f"🔧 [PP_PREFILL] DECODE角色，正常处理token")
+                            if next_token_ids is not None and not isinstance(next_token_ids, list):
+                                next_token_ids = next_token_ids.tolist()
+                            self.skip_stream_for_pp = False
+                    else:
+                        # 非Pipeline并行模式：正常处理
+                        if next_token_ids is not None and not isinstance(next_token_ids, list):
+                            next_token_ids = next_token_ids.tolist()
+                        self.skip_stream_for_pp = False
+                else:
+                    # 非Semi-PD模式：正常处理
+                    if next_token_ids is not None and not isinstance(next_token_ids, list):
+                        next_token_ids = next_token_ids.tolist()
+                    self.skip_stream_for_pp = False
+                
+                # 处理logprobs
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
                         logits_output.next_token_logprobs = (
@@ -192,7 +248,11 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        # 检查是否需要跳过stream_output（Pipeline并行的非最后PP stage）
+        if hasattr(self, 'skip_stream_for_pp') and self.skip_stream_for_pp:
+            logger.info(f"🔧 [PP_PREFILL] 跳过stream_output，这是非最后PP stage的PREFILL")
+        else:
+            self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
         self: Scheduler,
