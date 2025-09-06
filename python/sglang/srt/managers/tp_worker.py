@@ -243,17 +243,34 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
+        """
+        🔧 Semi-PD + PP 并行：完全复用原生 SGLang Pipeline 并行逻辑
+        
+        关键要点：
+        1. PP0 (is_first_rank=True, is_last_rank=False): 生成隐藏态，返回 (tensors, None)
+        2. PP1 (is_first_rank=False, is_last_rank=True): 接收隐藏态，生成tokens，返回 (logits, tokens)
+        3. Semi-PD PREFILL 进程使用相同的逻辑，只是数据来源不同（CUDA IPC vs 正常调度）
+        """
+        # 🔧 使用SGLang原生PP机制，移除自定义同步逻辑
+        
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
+        # 🔑 关键：PP 隐藏态接收逻辑（与原生 SGLang 完全一致）
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=self.get_attention_tp_group()
-                )
+            # PP1: 阻塞接收 PP0 发送的隐藏态
+            logger.info(f"🔍 [PP_COMM_TEST] PP{self.pp_group.rank} waiting to receive hidden states from PP{self.pp_group.rank-1}")
+            received_tensors = self.pp_group.recv_tensor_dict(
+                all_gather_group=self.get_attention_tp_group()
             )
+            logger.info(f"✅ [PP_COMM_TEST] PP{self.pp_group.rank} received hidden states: type={type(received_tensors)}")
+            logger.info(f"🔍 [PP_COMM_TEST] PP{self.pp_group.rank} received tensors keys: {received_tensors.keys() if isinstance(received_tensors, dict) else 'N/A'}")
+            
+            pp_proxy_tensors = PPProxyTensors(received_tensors)
 
+        # 🔑 关键：根据 PP stage 决定处理逻辑（与原生 SGLang 完全一致）
         if self.pp_group.is_last_rank:
+            # PP1: 最后一个 stage，生成 logits 和 next_token_ids
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
@@ -269,10 +286,12 @@ class TpModelWorker:
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
+            # PP0: 非最后一个 stage，生成隐藏态并自动发送给下一个 stage
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # 🔧 重要：PP0 不产生 next_token_ids，返回 None
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

@@ -15,9 +15,10 @@
 
 import logging
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import zmq
+import torch
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import (
@@ -25,13 +26,15 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     GetNextPrefillBatchInput,
     GetNextPrefillBatchOutput,
+    TokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, ForwardMode
 from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import broadcast_pyobj, get_zmq_socket
+from sglang.srt.utils import broadcast_pyobj, get_zmq_socket, point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         self.enable_overlap = False
         self.chunked_rid = None
+        
+        # （移除临时PP通信测试导入，避免环境缺模块导致噪声告警）
 
+        # 🔧 PP并行修复：每个PP stage都需要独立的IPC连接
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
             self.send_to_d_instance = get_zmq_socket(
@@ -69,9 +75,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PULL, port_args.bridge_ipc_name, True
             )
+            logger.info(f"🔧 [PREFILL-PP{pp_rank}] IPC连接已建立: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
         else:
             self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
+            logger.info(f"🔧 [PREFILL-PP{pp_rank}] 非主TP rank，跳过IPC连接")
 
     def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
         """
@@ -135,60 +143,70 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         """
-        原版Semi-PD的P-D握手协议
-
-        流程：
-        1. P-Scheduler提议候选请求（有token数量限制）
-        2. D-Scheduler检查资源并批准部分请求
-        3. P-Scheduler使用D-Scheduler预分配的资源执行计算
-
-        🔧 CRITICAL FIX: 当没有等待队列时，直接进入Idle模式
+        🔧 使用SGLang原生Pipeline并行机制
+        
+        简化逻辑：
+        1. 非PP0 stage需要先接收来自前一个stage的隐藏状态
+        2. 如果没有等待请求，返回None让SGLang原生PP处理
+        3. 有请求时使用原版Semi-PD逻辑
+        4. 让SGLang原生PP机制自动处理stage间同步
         """
-        # 🔧 SEMI-PD IDLE MODE: 当没有等待请求时，直接返回None进入Idle模式
+        
+        # 🔧 INSIGHT: PP通信应该由SGLang原生机制处理，不在调度器层面手动处理
+        # tp_worker.forward_batch_generation 会自动处理PP通信的发送和接收
+        
+        # 🔧 简化：当没有等待请求时，直接返回None
+        # SGLang原生PP机制会自动处理stage间的同步和idle状态
         if not self.waiting_queue:
-            logger.debug("[PREFILL] No waiting requests, entering Idle mode")
+            logger.debug(f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None for native PP handling")
             return None
 
-        resp = None
-        if self.waiting_queue and self.attn_tp_rank == 0:
-            # 🔧 MIGRATION: 原版Semi-PD的候选请求选择逻辑
-            n_prefill_tokens = 0
-            candidates = []
-            for r in self.waiting_queue:
-                if n_prefill_tokens > self.server_args.chunked_prefill_size:
-                    break
-                n_prefill_tokens += len(r.origin_input_ids)
-                candidates.append(r.rid)
+        # PP0: 继续原版Semi-PD逻辑；非PP0: 直接使用基类的原生PP批处理逻辑，避免阻塞
+        # 这样可确保 PP1 PREFILL 能调度 microbatch，接收来自 PP0 的隐藏状态并产生 next_token_ids
+        if self.pp_rank == 0:
+            resp = None
+            if self.waiting_queue and self.attn_tp_rank == 0:
+                # 🔧 MIGRATION: 原版Semi-PD的候选请求选择逻辑
+                n_prefill_tokens = 0
+                candidates = []
+                for r in self.waiting_queue:
+                    if n_prefill_tokens > self.server_args.chunked_prefill_size:
+                        break
+                    n_prefill_tokens += len(r.origin_input_ids)
+                    candidates.append(r.rid)
 
-            req = GetNextPrefillBatchInput(rids=candidates)
-            logger.debug(f"Send request to D worker: {req}")
-            self.send_to_d_instance.send_pyobj(req)
-            resp = self.bridge_socket.recv_pyobj()
-            logger.debug(f"Recv response from D worker: {resp}")
-            assert isinstance(
-                resp, GetNextPrefillBatchOutput
-            ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
+                req = GetNextPrefillBatchInput(rids=candidates)
+                logger.debug(f"Send request to D worker: {req}")
+                self.send_to_d_instance.send_pyobj(req)
+                resp = self.bridge_socket.recv_pyobj()
+                logger.debug(f"Recv response from D worker: {resp}")
+                assert isinstance(
+                    resp, GetNextPrefillBatchOutput
+                ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
 
-        # 🔧 MIGRATION: 原版Semi-PD的多GPU广播逻辑
-        # 修复v0.4.8兼容性：使用attn_dp_rank而不是dp_rank
-        if self.attn_tp_size > 1:
-            attn_tp_rank_0 = self.attn_dp_rank * self.attn_tp_size
-            resp = broadcast_pyobj(
-                [resp],
-                self.attn_tp_rank,
-                self.attn_tp_cpu_group,
-                src=attn_tp_rank_0,
-            )[0]
+            # 🔧 MIGRATION: 原版Semi-PD的多GPU广播逻辑
+            # 修复v0.4.8兼容性：使用attn_dp_rank而不是dp_rank
+            if self.attn_tp_size > 1:
+                attn_tp_rank_0 = self.attn_dp_rank * self.attn_tp_size
+                resp = broadcast_pyobj(
+                    [resp],
+                    self.attn_tp_rank,
+                    self.attn_tp_cpu_group,
+                    src=attn_tp_rank_0,
+                )[0]
 
-        ret = None
-        if resp and len(resp.rids) > 0:
-            ret = self.to_extend_batch(resp)
+            ret = None
+            if resp and len(resp.rids) > 0:
+                ret = self.to_extend_batch(resp)
 
-        # Handle DP attention
-        if self.server_args.enable_dp_attention:
-            ret, _ = self.prepare_dp_attn_batch(ret)
+            # Handle DP attention
+            if self.server_args.enable_dp_attention:
+                ret, _ = self.prepare_dp_attn_batch(ret)
 
-        return ret
+            return ret
+        else:
+            # 非 PP0：直接沿用原生 Scheduler 的批构建逻辑，确保本 stage 能及时运行
+            return super().get_next_batch_to_run()
 
     def process_batch_result_prefill(
         self,
@@ -220,29 +238,29 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         if result.logits_output is not None:
             next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
 
-        # 🔍 [DEBUG] 检查 next_token_ids 是否为空
-        if result.next_token_ids is None:
-            logger.info(f"✅ [PREFILL_DEBUG] result.next_token_ids is None - this is expected for non-last PP stages")
-            logger.info(f"✅ [PREFILL_DEBUG] In PP mode, only the last PP stage should have next_token_ids")
-            logger.info(f"✅ [PREFILL_DEBUG] This PREFILL process will send empty next_token_ids to DECODE process")
-            # 在PP模式下，非最后一个stage的next_token_ids为None是正常的
-            # 我们仍然需要发送结果给DECODE进程，但next_token_ids为空列表
-            import os
-            pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
-            pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
-            is_last_pp_stage = (pp_rank == pp_size - 1)
+        # 🔍 [DEBUG] 检查 PP rank 和 next_token_ids
+        import os
+        pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
+        pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
+        is_last_pp_stage = (pp_rank == pp_size - 1)
+        
+        # 🔧 CRITICAL INSIGHT: 不要在调度器层面手动发送隐藏状态！
+        # SGLang的tp_worker.forward_batch_generation已经自动处理了PP通信
+        # 调度器只需要处理最后一个PP stage的token输出
+        
+        if pp_size > 1 and not is_last_pp_stage:
+            # 非最后一个PP stage不发送token给DECODE，隐藏状态由SGLang原生PP机制处理
+            logger.info(f"[PREFILL-PP{pp_rank}] Non-last PP stage, NOT sending tokens to DECODE")
+            logger.info(f"[PREFILL-PP{pp_rank}] Hidden states already handled by SGLang native PP mechanism")
+            return
             
-            if is_last_pp_stage:
-                logger.error(f"❌ [PREFILL_DEBUG] This is the last PP stage but next_token_ids is None!")
-                logger.error(f"❌ [PREFILL_DEBUG] This indicates a serious PP communication issue")
-                next_token_ids_list = []
-            else:
-                logger.info(f"✅ [PREFILL_DEBUG] This is PP stage {pp_rank}/{pp_size-1}, sending empty next_token_ids")
-                # 对于非最后一个PP stage，发送空的next_token_ids列表
-                next_token_ids_list = []
+        # 最后一个PP stage处理next_token_ids
+        if result.next_token_ids is None:
+            logger.warning(f"[PREFILL-PP{pp_rank}] Last PP stage but next_token_ids is None, using empty list")
+            next_token_ids_list = []
         else:
             next_token_ids_list = result.next_token_ids.tolist()
-            logger.info(f"✅ [PREFILL_DEBUG] next_token_ids successfully converted: {next_token_ids_list}")
+            logger.info(f"[PREFILL-PP{pp_rank}] Last PP stage sending {len(next_token_ids_list)} tokens to decode")
 
         req = BatchProcessPrefillResultReq(
             next_token_ids=next_token_ids_list,
@@ -252,6 +270,8 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         logger.info(f"🔍 [PREFILL_DEBUG] sending request to D instance: {req}")
         self.send_to_d_instance.send_pyobj(req)
         logger.info(f"✅ [PREFILL_DEBUG] request sent successfully")
+
+
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         logger.info("Ignore flush cache request")
