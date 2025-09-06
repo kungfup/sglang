@@ -78,6 +78,19 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 context, zmq.PULL, port_args.bridge_ipc_name, True
             )
             logger.info(f"🔧 [PREFILL-PP{pp_rank}] IPC连接已建立: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
+            # 可选：为直连PP0 DECODE准备常驻socket（仅当提供了环境变量且当前非PP0）
+            self.send_to_pp0_d_instance = None
+            try:
+                pp0_ipc = os.environ.get("SGLANG_PP0_D_SCHEDULER_IPC")
+                if pp0_ipc and pp_rank != 0:
+                    self.send_to_pp0_d_instance = get_zmq_socket(
+                        context, zmq.PUSH, pp0_ipc, False
+                    )
+                    logger.info(
+                        f"🔧 [PREFILL-PP{pp_rank}] 建立到PP0 DECODE的直连IPC: {pp0_ipc}"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ [PREFILL-PP{pp_rank}] 建立PP0直连IPC失败: {e}")
         else:
             # 🔑 关键修复：非主TP rank也需要IPC连接（在PP模式下）
             # 但只有在PP模式下才这样做，避免影响纯TP模式
@@ -92,6 +105,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     context, zmq.PULL, port_args.bridge_ipc_name, True
                 )
                 logger.info(f"🔧 [PREFILL-PP{pp_rank}] PP模式：非主TP rank也建立IPC连接: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
+                self.send_to_pp0_d_instance = None
             else:
                 # 纯TP模式：只有主TP rank需要IPC连接
                 self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
@@ -300,3 +314,36 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         logger.info("Ignore flush cache request")
+
+    def run_batch(self, batch: ScheduleBatch):
+        """Ensure PREFILL(last PP stage)立即触发与同 stage DECODE 的交接。
+
+        原生 event_loop_pp 只在“接收下一microbatch输出”时调用process_batch_result，
+        对于被解耦的 PREFILL 进程，在最后一段需要立刻把token通过IPC交付DECODE，
+        所以这里在父类run_batch返回后调用process_batch_result_prefill。
+        """
+        ret = super().run_batch(batch)
+        try:
+            from sglang.semi_pd.utils import InstanceRole as _IR
+            if (
+                getattr(self.server_args, 'enable_semi_pd', False)
+                and getattr(self, 'instance_role', None) == _IR.PREFILL
+                and batch is not None
+                and hasattr(batch, 'forward_mode')
+                and batch.forward_mode.is_extend()
+            ):
+                # 判断是否最后PP段
+                is_last = False
+                if hasattr(self, 'pp_group') and self.pp_group is not None:
+                    is_last = self.pp_group.is_last_rank
+                else:
+                    pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
+                    pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
+                    is_last = (pp_rank == pp_size - 1)
+
+                if is_last:
+                    logger.info("🧩 [PREFILL_HOOK] last PP stage detected, triggering IPC handoff")
+                    self.process_batch_result_prefill(batch, ret)
+        except Exception:
+            logger.exception("[PREFILL_HOOK] failed; fallback without IPC handoff")
+        return ret

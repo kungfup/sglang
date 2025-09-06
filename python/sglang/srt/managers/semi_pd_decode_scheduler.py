@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
+from collections import deque
 import threading
 import time
 from types import SimpleNamespace
@@ -36,7 +37,12 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
-from sglang.srt.utils import broadcast_pyobj, get_bool_env_var, get_zmq_socket
+from sglang.srt.utils import (
+    broadcast_pyobj,
+    get_bool_env_var,
+    get_zmq_socket,
+    point_to_point_pyobj,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # For requests that has been sent to the prefill scheduler but not yet finished.
         self.scheduled_prefill_batches: List[ScheduleBatch] = []
 
+        # Pending tokens produced by last PP stage PREFILL and handed to DECODE via IPC.
+        # They will be sent cross-stage by the native PP event loop when this DECODE
+        # stage reaches the last-rank send point, without doing extra GPU compute.
+        self._pending_token_ids = deque()
+        self._pending_token_logits = deque()
+        # Ready-to-run decode batches produced from prefill results via IPC.
+        # We fetch from this queue in get_next_batch_to_run to drive event_loop_pp.
+        self._ready_decode_batches = deque()
+
         # 🔧 PP stage间通信：DECODE进程需要与下一个stage的DECODE进程通信
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
@@ -107,6 +122,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.send_to_p_instance = get_zmq_socket(
                 context, zmq.PUSH, self.port_args.p_scheduler_input_ipc_name, False
             )
+            # PP!=0 的 DECODE 需要从本 stage 的 PREFILL 拉取消息（GetNextPrefillBatchInput / BatchProcessPrefillResultReq）
+            if self.pp_rank != 0:
+                self.recv_from_p_instance = get_zmq_socket(
+                    context, zmq.PULL, self.port_args.d_scheduler_input_ipc_name, True
+                )
+            else:
+                self.recv_from_p_instance = None
             
             # 🔧 PP stage间通信：与下一个stage的DECODE进程通信
             # 使用SGLang原生的NCCL通信机制，不需要额外的socket
@@ -204,7 +226,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         return ret
 
-    def get_new_batch_prefill(self, rids: List[str]) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(self, rids: Optional[List[str]] = None) -> Optional[ScheduleBatch]:
         """
         Semi-PD changes:
           - keep scheduled prefill batches in scheduled_prefill_batches
@@ -257,7 +279,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         logger.info(f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
         for req in self.waiting_queue:
             # Semi-PD
-            if req.rid not in rids:
+            if rids is not None and req.rid not in rids:
                 logger.debug(f"[DECODE-PP{self.pp_rank}] Skipping req.rid={req.rid} (not in rids)")
                 continue
 
@@ -454,9 +476,92 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         self.process_batch_result_prefill(batch, result)
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
+        # Instead of merging into running_batch (which gets overwritten by event_loop_pp's slot),
+        # enqueue this batch so get_next_batch_to_run can surface it for the current microbatch.
         if not batch.is_empty():
-            if self.running_batch.is_empty():
-                self.running_batch = batch
-            else:
-                self.running_batch.merge_batch(batch)
+            self._ready_decode_batches.append(batch)
+
+        # Semi-PD: 在最后一个PP段，记录token，交由event_loop_pp的“最后段发送”统一回传给PP0。
+        if (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and hasattr(self, 'pp_rank')
+            and hasattr(self, 'pp_size')
+            and self.pp_rank == self.pp_size - 1
+        ):
+            self._pending_token_ids.append(recv_req.next_token_ids or [])
+            self._pending_token_logits.append(recv_req.next_token_logits)
+
+    def run_batch(self, batch: ScheduleBatch):
+        """Override: for last PP stage DECODE in Semi-PD, reuse pending tokens.
+
+        This avoids re-running GPU decode at the last stage. The native event loop
+        will then send these tokens via PP group to stage 0 as usual.
+        """
+        try:
+            if (
+                self.is_generation
+                and getattr(self.server_args, 'enable_semi_pd', False)
+                and self.pp_group is not None
+                and self.pp_group.is_last_rank
+                and len(self._pending_token_ids) > 0
+            ):
+                from sglang.srt.managers.scheduler import GenerationBatchResult
+                from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+                import numpy as np
+                import torch
+
+                next_token_ids = self._pending_token_ids.popleft()
+                next_token_logits = self._pending_token_logits.popleft()
+
+                logits_processor_output = None
+                if next_token_logits is not None:
+                    logits_processor_output = LogitsProcessorOutput(
+                        next_token_logits=torch.from_numpy(next_token_logits).to(
+                            self.device, dtype=torch.float16, non_blocking=True
+                        ),
+                        hidden_states=None,
+                    )
+
+                if next_token_ids:
+                    batch.output_ids = torch.as_tensor(
+                        np.array(next_token_ids, dtype=np.int64),
+                        device=self.device,
+                        dtype=torch.int64,
+                    )
+
+                return GenerationBatchResult(
+                    logits_output=logits_processor_output,
+                    pp_hidden_states_proxy_tensors=None,
+                    next_token_ids=next_token_ids,
+                    extend_input_len_per_req=None,
+                    extend_logprob_start_len_per_req=None,
+                    bid=-1,
+                    can_run_cuda_graph=False,
+                )
+        except Exception:
+            logger.exception("[PP_DECODE] pending-token fastpath failed; fallback to default run")
+        # fallback to the default run
+        return super().run_batch(batch)
+
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # If event_loop_pp reset running_batch to an empty slot, but we have a
+        # ready decode batch prepared by process_prefill_result, move it in.
+        if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
+            if len(self._ready_decode_batches) > 0:
+                self.running_batch = self._ready_decode_batches.popleft()
+        return super().get_next_batch_to_run()
+
+    def recv_requests(self):
+        """Extend parent's recv to also poll local PULL from PREFILL on non-PP0 stages."""
+        recv_reqs = super().recv_requests()
+        if getattr(self, 'recv_from_p_instance', None) is not None and self.attn_tp_rank == 0:
+            while True:
+                try:
+                    obj = self.recv_from_p_instance.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                if recv_reqs is None:
+                    recv_reqs = []
+                recv_reqs.append(obj)
+        return recv_reqs
         # 其余跨 stage 的张量/令牌交接全部回归 event_loop_pp 处理

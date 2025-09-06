@@ -1001,7 +1001,15 @@ class Scheduler(
                     result = self.run_batch(self.cur_batch)
 
                 # (last rank) send the outputs to the next step
-                if self.pp_group is not None and self.pp_group.is_last_rank:
+                # Semi-PD: PREFILL实例不负责跨stage回送token，交由DECODE实例通过控制面/NCCL处理
+                allow_last_rank_token_send = True
+                try:
+                    from sglang.semi_pd.utils import InstanceRole as _IR
+                    if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == _IR.PREFILL:
+                        allow_last_rank_token_send = False
+                except Exception:
+                    pass
+                if self.pp_group is not None and self.pp_group.is_last_rank and allow_last_rank_token_send:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
@@ -1127,6 +1135,7 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                # Semi-PD: 不再从CPU控制面接收token回送，完全复用原生PP事件循环
             else:
                 recv_reqs = None
         else:
