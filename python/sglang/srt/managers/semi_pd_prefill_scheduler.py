@@ -62,7 +62,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             InstanceRole.PREFILL,
         )
 
-        self.enable_overlap = False
+        # Do not force-disable overlap; follow server args
         self.chunked_rid = None
         
         # （移除临时PP通信测试导入，避免环境缺模块导致噪声告警）
@@ -77,7 +77,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PULL, port_args.bridge_ipc_name, True
             )
-            logger.info(f"🔧 [PREFILL-PP{pp_rank}] IPC连接已建立: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
+            logger.debug(f"🔧 [PREFILL-PP{pp_rank}] IPC连接已建立: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
             # 可选：为直连PP0 DECODE准备常驻socket（仅当提供了环境变量且当前非PP0）
             self.send_to_pp0_d_instance = None
             try:
@@ -104,7 +104,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 self.bridge_socket = get_zmq_socket(
                     context, zmq.PULL, port_args.bridge_ipc_name, True
                 )
-                logger.info(f"🔧 [PREFILL-PP{pp_rank}] PP模式：非主TP rank也建立IPC连接: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
+                logger.debug(f"🔧 [PREFILL-PP{pp_rank}] PP模式：非主TP rank也建立IPC连接: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
                 self.send_to_pp0_d_instance = None
             else:
                 # 纯TP模式：只有主TP rank需要IPC连接
@@ -257,36 +257,40 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
         is_last_pp_stage = (pp_rank == pp_size - 1)
         
-        logger.info(f"🔧 [PP_PREFILL] PP{pp_rank}/{pp_size-1}: process_batch_result_prefill called")
-        logger.info(f"🔧 [PP_PREFILL] result type: {type(result)}, batch reqs: {len(batch.reqs) if hasattr(batch, 'reqs') else 'N/A'}")
+        logger.debug(f"🔧 [PP_PREFILL] PP{pp_rank}/{pp_size-1}: process_batch_result_prefill called")
+        logger.debug(f"🔧 [PP_PREFILL] result type: {type(result)}, batch reqs: {len(batch.reqs) if hasattr(batch, 'reqs') else 'N/A'}")
         
         # 🔑 核心逻辑：根据PP stage决定处理方式
         if pp_size > 1:  # PP模式
             if is_last_pp_stage:
                 # PP1 PREFILL: 产生next_token_ids，发送给PP1 DECODE
                 if result.next_token_ids is None:
-                    logger.error(f"❌ [PP_PREFILL] PP{pp_rank}: Last PP stage but next_token_ids is None!")
+                    logger.debug(f"❌ [PP_PREFILL] PP{pp_rank}: Last PP stage but next_token_ids is None!")
                     next_token_ids_list = []
                 else:
                     next_token_ids_list = result.next_token_ids.tolist()
-                    logger.info(f"✅ [PP_PREFILL] PP{pp_rank}: Sending {len(next_token_ids_list)} tokens to DECODE")
+                    logger.debug(f"✅ [PP_PREFILL] PP{pp_rank}: Sending {len(next_token_ids_list)} tokens to DECODE")
                 
                 # 处理logits
                 next_token_logits = None
-                if result.logits_output is not None:
-                    next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
+                # 仅在需要返回logprob时传输logits，减少不必要拷贝
+                try:
+                    if getattr(batch, 'return_logprob', False) and result.logits_output is not None:
+                        next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
+                except Exception:
+                    pass
                 
                 # 发送结果给同stage的DECODE进程
                 req = BatchProcessPrefillResultReq(
                     next_token_ids=next_token_ids_list,
                     next_token_logits=next_token_logits,
                 )
-                logger.info(f"🔧 [PP_PREFILL] PP{pp_rank}: Sending tokens to PP{pp_rank} DECODE")
+                logger.debug(f"🔧 [PP_PREFILL] PP{pp_rank}: Sending tokens to PP{pp_rank} DECODE")
                 self.send_to_d_instance.send_pyobj(req)
                 
             else:
                 # PP0 PREFILL: 不发送token给DECODE，但必须执行父类逻辑以推进状态机
-                logger.info(
+                logger.debug(
                     f"✅ [PP_PREFILL] PP{pp_rank}: Non-last PP stage, delegate to parent processor"
                 )
                 super().process_batch_result_prefill(batch, result, launch_done)
@@ -307,7 +311,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 next_token_ids=next_token_ids_list,
                 next_token_logits=next_token_logits,
             )
-            logger.info(f"🔧 [PP_PREFILL] Non-PP mode: Sending tokens to DECODE")
+            logger.debug(f"🔧 [PP_PREFILL] Non-PP mode: Sending tokens to DECODE")
             self.send_to_d_instance.send_pyobj(req)
 
 
@@ -342,7 +346,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     is_last = (pp_rank == pp_size - 1)
 
                 if is_last:
-                    logger.info("🧩 [PREFILL_HOOK] last PP stage detected, triggering IPC handoff")
+                    logger.debug("🧩 [PREFILL_HOOK] last PP stage detected, triggering IPC handoff")
                     self.process_batch_result_prefill(batch, ret)
         except Exception:
             logger.exception("[PREFILL_HOOK] failed; fallback without IPC handoff")

@@ -470,9 +470,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         )
 
         if recv_req.next_token_ids:
-            batch.output_ids = torch.from_numpy(
-                np.array(recv_req.next_token_ids, dtype=np.int64)
-            ).to(self.device, dtype=torch.int64, non_blocking=True)
+            # Build tensor directly from list to avoid extra numpy hop
+            batch.output_ids = torch.tensor(
+                recv_req.next_token_ids, device=self.device, dtype=torch.int64
+            )
 
         self.process_batch_result_prefill(batch, result)
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
@@ -523,10 +524,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     )
 
                 if next_token_ids:
-                    batch.output_ids = torch.as_tensor(
-                        np.array(next_token_ids, dtype=np.int64),
-                        device=self.device,
-                        dtype=torch.int64,
+                    batch.output_ids = torch.tensor(
+                        next_token_ids, device=self.device, dtype=torch.int64
                     )
 
                 return GenerationBatchResult(
