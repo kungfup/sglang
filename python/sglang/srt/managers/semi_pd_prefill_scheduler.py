@@ -160,164 +160,67 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         """
-        🔧 使用SGLang原生Pipeline并行机制
-        
-        简化逻辑：
-        1. 非PP0 stage需要先接收来自前一个stage的隐藏状态
-        2. 如果没有等待请求，返回None让SGLang原生PP处理
-        3. 有请求时使用原版Semi-PD逻辑
-        4. 让SGLang原生PP机制自动处理stage间同步
+        Use the standard Semi-PD prefill batching, and let the native
+        SGLang PP event loop handle cross-stage send/recv.
+        This method should not fabricate dummy batches for downstream PP stages.
         """
-        
-        # 🔧 INSIGHT: PP通信应该由SGLang原生机制处理，不在调度器层面手动处理
-        # tp_worker.forward_batch_generation 会自动处理PP通信的发送和接收
-        
-        # 🔧 PP模式关键修复：确保所有PP stages都同步处理请求
-        pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
-        
-        if pp_size > 1:
-            # PP模式：所有PP stages必须同步处理相同的请求
-            logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: Checking for work in PP mode (pp_size={pp_size})")
-            
-            # 🔑 关键洞察：在PP模式下，即使PP1没有等待队列中的请求，
-            # 它也需要进入工作循环来接收PP0发送的隐藏状态
-            if self.pp_rank == 0:
-                # PP0: 检查等待队列并获取工作
-                if not self.waiting_queue:
-                    logger.debug(f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None")
-                    return None
-                    
-                logger.info(f"🔧 [PP_PREFILL] PP0: Processing {len(self.waiting_queue)} waiting requests")
-            else:
-                # PP1: 即使没有等待队列，也需要准备接收PP0的隐藏状态
-                # 创建一个虚拟的工作batch来触发PP通信
-                logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: Preparing to receive hidden states from PP0")
-                
-                # 检查是否有需要同步处理的工作
-                # 通过检查PP0是否有工作来决定PP1是否需要参与
-                if not hasattr(self, '_pp_sync_signal'):
-                    # 简化：假设如果进入这个逻辑，说明有工作要做
-                    # 实际的工作内容会通过PP通信从PP0传递过来
-                    logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: Creating dummy batch for PP sync")
-                    
-                    # 返回None让SGLang原生PP机制处理同步
-                    # 重要：不返回None，而是让代码继续执行，确保进入forward逻辑
-                    pass
-        else:
-            # 非PP模式：原有逻辑
-            if not self.waiting_queue:
-                logger.debug(f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None for native PP handling")
-                return None
+        if not self.waiting_queue:
+            logger.debug(
+                f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None"
+            )
+            return None
 
         # 🔑 关键修复：在PP模式下，所有PP stages都需要处理相同的请求！
         # PP0 和 PP1 都需要主动获取工作，而不是只有PP0获取
         resp = None
         
-        if pp_size > 1:
-            # PP模式：所有stages都需要参与，即使没有本地请求
-            if self.pp_rank == 0:
-                # PP0: 正常处理等待队列中的请求
-                if self.waiting_queue and self.attn_tp_rank == 0:
-                    # 🔧 MIGRATION: 原版Semi-PD的候选请求选择逻辑
-                    n_prefill_tokens = 0
-                    candidates = []
-                    for r in self.waiting_queue:
-                        if n_prefill_tokens > self.server_args.chunked_prefill_size:
-                            break
-                        n_prefill_tokens += len(r.origin_input_ids)
-                        candidates.append(r.rid)
+        if self.waiting_queue and self.attn_tp_rank == 0:
+            # 由 DECODE 预分配资源（Semi-PD 的核心约束）
+            n_prefill_tokens = 0
+            candidates = []
+            for r in self.waiting_queue:
+                if n_prefill_tokens > self.server_args.chunked_prefill_size:
+                    break
+                n_prefill_tokens += len(r.origin_input_ids)
+                candidates.append(r.rid)
 
-                    req = GetNextPrefillBatchInput(rids=candidates)
-                    logger.debug(f"[PREFILL-PP{self.pp_rank}] Send request to D worker: {req}")
-                    self.send_to_d_instance.send_pyobj(req)
-                    resp = self.bridge_socket.recv_pyobj()
-                    logger.debug(f"[PREFILL-PP{self.pp_rank}] Recv response from D worker: {resp}")
-                    assert isinstance(
-                        resp, GetNextPrefillBatchOutput
-                    ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
+            req = GetNextPrefillBatchInput(rids=candidates)
+            logger.debug(
+                f"[PREFILL-PP{self.pp_rank}] Send request to D worker: {req}"
+            )
+            self.send_to_d_instance.send_pyobj(req)
+            resp = self.bridge_socket.recv_pyobj()
+            logger.debug(
+                f"[PREFILL-PP{self.pp_rank}] Recv response from D worker: {resp}"
+            )
+            assert isinstance(
+                resp, GetNextPrefillBatchOutput
+            ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
 
-                    # 🔧 MIGRATION: 原版Semi-PD的多GPU广播逻辑
-                    # 修复v0.4.8兼容性：使用attn_dp_rank而不是dp_rank
-                    if self.attn_tp_size > 1:
-                        attn_tp_rank_0 = self.attn_dp_rank * self.attn_tp_size
-                        resp = broadcast_pyobj(
-                            [resp],
-                            self.attn_tp_rank,
-                            self.attn_tp_cpu_group,
-                            src=attn_tp_rank_0,
-                        )[0]
-                else:
-                    # PP0没有请求，返回None
-                    return None
-            else:
-                # PP1: 不直接获取请求，而是通过PP通信接收工作
-                # 创建一个空的响应，让forward逻辑处理PP通信
-                logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: No local requests, but may receive work from PP0")
-                
-                # 创建一个虚拟的响应，让代码继续执行到forward阶段
-                # 在forward阶段，SGLang的PP机制会处理从PP0接收隐藏状态
-                resp = GetNextPrefillBatchOutput(
-                    rids=[],
-                    chunked_rid=None,
-                    req_pool_indices=[],
-                    prefix_lens=[],
-                    extend_input_lens=[],
-                )
-                logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: Created dummy response for PP sync")
+            # 多TP广播
+            if self.attn_tp_size > 1:
+                attn_tp_rank_0 = self.attn_dp_rank * self.attn_tp_size
+                resp = broadcast_pyobj(
+                    [resp],
+                    self.attn_tp_rank,
+                    self.attn_tp_cpu_group,
+                    src=attn_tp_rank_0,
+                )[0]
         else:
-            # 非PP模式：原有逻辑
-            if self.waiting_queue and self.attn_tp_rank == 0:
-                # 🔧 MIGRATION: 原版Semi-PD的候选请求选择逻辑
-                n_prefill_tokens = 0
-                candidates = []
-                for r in self.waiting_queue:
-                    if n_prefill_tokens > self.server_args.chunked_prefill_size:
-                        break
-                    n_prefill_tokens += len(r.origin_input_ids)
-                    candidates.append(r.rid)
-
-                req = GetNextPrefillBatchInput(rids=candidates)
-                logger.debug(f"[PREFILL-PP{self.pp_rank}] Send request to D worker: {req}")
-                self.send_to_d_instance.send_pyobj(req)
-                resp = self.bridge_socket.recv_pyobj()
-                logger.debug(f"[PREFILL-PP{self.pp_rank}] Recv response from D worker: {resp}")
-                assert isinstance(
-                    resp, GetNextPrefillBatchOutput
-                ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
-
-                # 🔧 MIGRATION: 原版Semi-PD的多GPU广播逻辑
-                # 修复v0.4.8兼容性：使用attn_dp_rank而不是dp_rank
-                if self.attn_tp_size > 1:
-                    attn_tp_rank_0 = self.attn_dp_rank * self.attn_tp_size
-                    resp = broadcast_pyobj(
-                        [resp],
-                        self.attn_tp_rank,
-                        self.attn_tp_cpu_group,
-                        src=attn_tp_rank_0,
-                    )[0]
+            resp = None
 
         ret = None
         if resp and len(resp.rids) > 0:
             ret = self.to_extend_batch(resp)
-        elif pp_size > 1 and self.pp_rank > 0 and resp is not None:
-            # 🔑 关键修复：PP1即使没有本地请求，也需要返回一个dummy batch来进入forward逻辑
-            # 这样PP1可以接收PP0发送的hidden states
-            logger.info(f"🔧 [PP_PREFILL] PP{self.pp_rank}: Creating dummy batch for PP sync to enable forward pass")
-            ret = ScheduleBatch(
-                reqs=[],  # 空请求列表，但batch不为None
-                forward_mode=ForwardMode.IDLE,  # 标记为空闲模式，但参与PP通信
-                batch_is_full=False,
-                seq_lens=torch.tensor([], dtype=torch.int64),  # 空的seq_lens tensor
-                input_ids=torch.tensor([], dtype=torch.int64),  # 空的input_ids tensor
-                req_pool_indices=torch.tensor([], dtype=torch.int64),  # 空的pool indices
-                seq_lens_sum=0,  # 序列长度总和为0
-            )
+        # 不再为下游PP stage创建虚拟batch，交由 event_loop_pp 统一驱动
 
         # Handle DP attention
         if self.server_args.enable_dp_attention:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
-        logger.debug(f"[PREFILL-PP{self.pp_rank}] Returning batch with {len(ret.reqs) if ret else 0} requests")
+        logger.debug(
+            f"[PREFILL-PP{self.pp_rank}] Returning batch with {len(ret.reqs) if ret else 0} requests"
+        )
         return ret
 
     def process_batch_result_prefill(
@@ -368,17 +271,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 self.send_to_d_instance.send_pyobj(req)
                 
             else:
-                # PP0 PREFILL: 不发送token给DECODE，隐藏状态已在forward中发送
-                logger.info(f"✅ [PP_PREFILL] PP{pp_rank}: Non-last PP stage, NOT sending tokens to DECODE")
-                logger.info(f"✅ [PP_PREFILL] PP{pp_rank}: Hidden states already sent via SGLang native PP mechanism")
-                logger.info(f"✅ [PP_PREFILL] PP{pp_rank}: Completing prefill process for non-last PP stage")
-                
-                # 🔑 关键修复：PP0 PREFILL 直接结束，不需要调用父类方法
-                # 隐藏状态已经在 tp_worker.forward_batch_generation() 中自动发送给PP1
-                # 调用父类方法是错误的，因为：
-                # 1. PP通信已经完成
-                # 2. PP0不应该处理next_token_ids 
-                # 3. PP0不应该进行stream_output
+                # PP0 PREFILL: 不发送token给DECODE，但必须执行父类逻辑以推进状态机
+                logger.info(
+                    f"✅ [PP_PREFILL] PP{pp_rank}: Non-last PP stage, delegate to parent processor"
+                )
+                super().process_batch_result_prefill(batch, result, launch_done)
                 return
                 
         else:  # 非PP模式，使用原来的逻辑

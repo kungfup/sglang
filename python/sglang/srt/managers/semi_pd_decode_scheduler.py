@@ -414,105 +414,20 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
         """
-        🔧 PP模式下的Semi-PD DECODE处理逻辑
-        
-        PP模式流程：
-        PP0 PREFILL → PP1 PREFILL → PP1 DECODE → PP0 DECODE
-             ↓              ↓              ↓              ↓
-        隐藏状态        next_token_ids   传递token    接收token并decode
-        
-        关键修改：
-        1. PP1 DECODE: 先传递token给PP0 DECODE，然后开始decode
-        2. PP0 DECODE: 等待PP1 DECODE传递的token，然后开始decode
+        PREFILL→DECODE（同 stage）最小交接：
+        - 不做跨 stage 的 NCCL 发送
+        - 仅将 next_token_ids 合并回本地 decode 队列
+        - 由原生 event_loop_pp 统一进行 GPU/PP 的 send/recv
         """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        import os
-        import torch.distributed as dist
-        
-        # 获取PP配置
-        pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
-        pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
-        is_last_pp_stage = (pp_rank == pp_size - 1)
-        
-        logger.info(f"🔧 [PP_DECODE] PP{pp_rank}/{pp_size-1}: process_prefill_result called")
-        logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: received {len(recv_req.next_token_ids)} tokens")
-        
+        import numpy as np
+        import torch
+
+        num_tokens = len(recv_req.next_token_ids) if recv_req.next_token_ids else 0
+        logger.info("[PP_DECODE] process_prefill_result: tokens from PREFILL=%d", num_tokens)
+
         batch = self.scheduled_prefill_batches.pop(0)
-        
-        # 🔑 核心逻辑：PP模式下的token传递和decode启动
-        if self.pp_size > 1:  # PP模式
-            if is_last_pp_stage:
-                # PP1 DECODE: 先传递token给PP0 DECODE，然后开始decode
-                logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Last stage, will pass tokens to PP0 and start decode")
-                
-                # 🔑 关键：PP1 DECODE需要将token传递给PP0 DECODE
-                if len(recv_req.next_token_ids) > 0:
-                    # 使用SGLang原生的distributed通信机制传递token给PP0
-                    # 这里需要实现PP stage间的token传递
-                    logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Passing {len(recv_req.next_token_ids)} tokens to PP0")
-                    
-                    # 创建token tensor并通过NCCL传递给PP0
-                    token_tensor = torch.tensor(recv_req.next_token_ids, dtype=torch.long, device=self.device)
-                    
-                    # 使用SGLang的PP通信组传递token
-                    # 注意：这里需要与PP0 DECODE的接收逻辑配合
-                    if hasattr(self, 'pp_group') and self.pp_group is not None:
-                        # 使用SGLang GroupCoordinator的send方法发送给PP0
-                        # dst=0 表示发送给PP组中的第一个rank (PP0)
-                        self.pp_group.send(token_tensor, dst=0)
-                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Tokens sent to PP0 via SGLang GroupCoordinator")
-                    else:
-                        logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No PP group found, cannot send tokens to PP0")
-                
-                # PP1 DECODE开始处理自己的decode
-                logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Starting decode phase")
-                
-            else:
-                # PP0 DECODE: 等待PP1 DECODE传递的token
-                logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Non-last stage, waiting for tokens from PP1")
-                
-                # 🔑 关键：PP0 DECODE需要等待PP1 DECODE传递的token
-                # 由于PP0 PREFILL没有发送token，PP0 DECODE需要从PP1 DECODE接收token
-                if len(recv_req.next_token_ids) == 0:
-                    logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: No tokens from PREFILL, waiting for tokens from PP1")
-                    
-                    # 从PP1 DECODE接收token
-                    if hasattr(self, 'pp_group') and self.pp_group is not None:
-                        # 🔧 修复时序问题：PP0 DECODE应该等待PP1 DECODE发送token
-                        # 使用阻塞接收，确保PP1 DECODE已经发送了token
-                        try:
-                            # 创建接收缓冲区
-                            max_tokens = batch.batch_size()  # 假设每个request一个token
-                            token_tensor = torch.zeros(max_tokens, dtype=torch.long, device=self.device)
-                            
-                            # 从PP1 (rank 1 in pp_group) 接收
-                            logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Waiting for tokens from PP1...")
-                            # 使用SGLang GroupCoordinator的recv方法
-                            token_tensor = self.pp_group.recv(token_tensor.size(), token_tensor.dtype, src=1)
-                            
-                            # 更新recv_req中的token
-                            recv_req.next_token_ids = token_tensor.cpu().numpy().tolist()
-                            logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Received {len(recv_req.next_token_ids)} tokens from PP1")
-                        except Exception as e:
-                            logger.error(f"❌ [PP_DECODE] PP{pp_rank}: Failed to receive tokens from PP1: {e}")
-                            # 使用空token列表作为fallback
-                            recv_req.next_token_ids = []
-                    else:
-                        logger.error(f"❌ [PP_DECODE] PP{pp_rank}: No PP group found, cannot receive tokens from PP1")
-                        # 使用空token列表作为fallback
-                        recv_req.next_token_ids = []
-                
-                logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Starting decode phase with received tokens")
-        
-        # 验证token数量
-        if len(batch.reqs) != len(recv_req.next_token_ids):
-            if self.pp_size > 1 and not is_last_pp_stage and len(recv_req.next_token_ids) == 0:
-                # PP0 DECODE在等待PP1传递token时可能暂时为空，这是正常的
-                logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: Token count mismatch, but this may be temporary in PP mode")
-            else:
-                logger.error(f"❌ [PP_DECODE] PP{pp_rank}: batch.reqs({len(batch.reqs)}) != next_token_ids({len(recv_req.next_token_ids)})")
-        
-        # 处理logits
+
         logits_processor_output = None
         if recv_req.next_token_logits is not None:
             logits_processor_output = LogitsProcessorOutput(
@@ -521,8 +436,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 ),
                 hidden_states=None,
             )
-        
-        # 创建结果
+
         result = GenerationBatchResult(
             next_token_ids=recv_req.next_token_ids,
             logits_output=logits_processor_output,
@@ -532,34 +446,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             bid=-1,
             can_run_cuda_graph=False,
         )
-        
-        if self.attn_tp_size > 1:
-            dist.barrier(group=self.attn_tp_cpu_group)
-        
-        # 设置batch.output_ids
-        # 🔧 修复：确保PP0 DECODE在等待PP1传递token时不会创建空的output_ids
-        if len(recv_req.next_token_ids) > 0:
+
+        if recv_req.next_token_ids:
             batch.output_ids = torch.from_numpy(
-                np.array(result.next_token_ids, dtype=np.int64)
+                np.array(recv_req.next_token_ids, dtype=np.int64)
             ).to(self.device, dtype=torch.int64, non_blocking=True)
-        else:
-            # 🔧 关键修复：在PP模式下，如果PP0 DECODE没有token，说明还在等待PP1传递
-            # 此时不应该创建空的output_ids，而应该等待PP1传递token后再设置
-            if self.pp_size > 1 and not is_last_pp_stage:
-                # PP0 DECODE等待PP1传递token，暂时不设置output_ids
-                logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No tokens yet, waiting for PP1 to pass tokens")
-                # 不设置batch.output_ids，让后续的PP通信逻辑处理
-                pass
-            else:
-                # 非PP模式或PP1 DECODE，创建空的output_ids
-                batch.output_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
-        
+
         self.process_batch_result_prefill(batch, result)
-        
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-        
         if not batch.is_empty():
             if self.running_batch.is_empty():
                 self.running_batch = batch
             else:
                 self.running_batch.merge_batch(batch)
+        # 其余跨 stage 的张量/令牌交接全部回归 event_loop_pp 处理

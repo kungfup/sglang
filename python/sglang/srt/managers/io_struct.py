@@ -1024,3 +1024,6 @@ class BatchRetractReqInput:
 class BatchProcessPrefillResultReq:
     next_token_ids: List[int]
     next_token_logits: npt.NDArray[np.float32]
+
+
+# (No extra control-plane messages needed; reuse native PP event loop.)
