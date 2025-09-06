@@ -286,11 +286,27 @@ class TpModelWorker:
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
-            # PP0: 非最后一个 stage，生成隐藏态并自动发送给下一个 stage
+            # PP0: 非最后一个 stage，生成隐藏态并发送给下一个 stage
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            
+            # 🔑 关键修复：PP0 必须发送隐藏状态给PP1！
+            # 原生 SGLang 在 event_loop_pp() 中处理，但 Semi-PD 没有这个循环
+            if isinstance(pp_proxy_tensors, PPProxyTensors):
+                logger.info(f"🚀 [PP_COMM_SEND] PP{self.pp_group.rank} sending hidden states to PP{self.pp_group.rank+1}")
+                logger.info(f"🔍 [PP_COMM_SEND] Hidden states keys: {pp_proxy_tensors.tensors.keys()}")
+                
+                # 发送隐藏状态给下一个PP stage（PP1）
+                self.pp_group.send_tensor_dict(
+                    pp_proxy_tensors.tensors,
+                    all_gather_group=self.get_attention_tp_group(),
+                )
+                logger.info(f"✅ [PP_COMM_SEND] PP{self.pp_group.rank} hidden states sent successfully")
+            else:
+                logger.error(f"❌ [PP_COMM_SEND] PP{self.pp_group.rank} expected PPProxyTensors but got {type(pp_proxy_tensors)}")
+            
             # 🔧 重要：PP0 不产生 next_token_ids，返回 None
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 

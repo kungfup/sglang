@@ -637,8 +637,13 @@ def run_scheduler_process(
         logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Scheduler disaggregation_mode: {scheduler.disaggregation_mode}")
         logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Scheduler enable_overlap: {scheduler.enable_overlap}")
         logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Instance role: {instance_role}")
+        logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PP_SIZE: {server_args.pp_size}")
 
-        if scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
+        # 🔧 CRITICAL FIX: Semi-PD在PP模式下必须使用event_loop_pp()
+        if server_args.pp_size > 1:
+            logger.info(f"🚀 [SEMI_PD_PP] PP{pp_rank} TP{tp_rank}: 启动Semi-PD Pipeline Parallel事件循环")
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
             logger.debug("Scheduler running in overlap mode")
             scheduler.event_loop_overlap()
         else:

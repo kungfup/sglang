@@ -73,30 +73,16 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         self.pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))  # 🔧 保存pp_size
 
         # 🔧 PP模式下的DECODE进程间通信初始化
-        self.pp_group = None
+        # 注意：不要覆盖父类设置的self.pp_group (GroupCoordinator对象)
+        # self.pp_group 已经在父类中通过 get_pp_group() 正确设置
         if self.pp_size > 1:
-            # 初始化PP通信组，用于PP stage间的token传递
-            try:
-                import torch.distributed as dist
-                if dist.is_initialized():
-                    # 创建PP通信组，包含所有PP stage的DECODE进程
-                    # 注意：这里假设PP stage的DECODE进程有相同的TP rank
-                    pp_decode_ranks = []
-                    for i in range(self.pp_size):
-                        # 每个PP stage的第一个TP rank作为代表参与PP通信
-                        if self.attn_tp_rank == 0:  # 只有TP rank 0参与PP通信
-                            pp_decode_ranks.append(i * self.attn_tp_size + self.attn_tp_rank)
-                    
-                    if len(pp_decode_ranks) > 1 and self.attn_tp_rank == 0:
-                        self.pp_group = dist.new_group(pp_decode_ranks)
-                        logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: Created PP communication group with ranks {pp_decode_ranks}")
-                    else:
-                        logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: TP{self.attn_tp_rank} - not participating in PP communication")
-                else:
-                    logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: Distributed not initialized, PP communication disabled")
-            except Exception as e:
-                logger.error(f"❌ [PP_DECODE] PP{pp_rank}: Failed to initialize PP communication: {e}")
-                self.pp_group = None
+            # SGLang原生PP组已经在父类中初始化，直接使用
+            if hasattr(self, 'pp_group') and self.pp_group is not None:
+                logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: Using SGLang native PP group with ranks {self.pp_group.ranks}")
+                logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: PP group type: {type(self.pp_group)}")
+                logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: is_first_rank={self.pp_group.is_first_rank}, is_last_rank={self.pp_group.is_last_rank}")
+            else:
+                logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No PP group available, PP communication disabled")
 
         self._request_dispatcher._mapping.extend(
             [
@@ -471,9 +457,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     # 使用SGLang的PP通信组传递token
                     # 注意：这里需要与PP0 DECODE的接收逻辑配合
                     if hasattr(self, 'pp_group') and self.pp_group is not None:
-                        # 发送给PP0 (rank 0 in pp_group)
-                        dist.send(token_tensor, dst=0, group=self.pp_group)
-                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Tokens sent to PP0 via NCCL")
+                        # 使用SGLang GroupCoordinator的send方法发送给PP0
+                        # dst=0 表示发送给PP组中的第一个rank (PP0)
+                        self.pp_group.send(token_tensor, dst=0)
+                        logger.info(f"✅ [PP_DECODE] PP{pp_rank}: Tokens sent to PP0 via SGLang GroupCoordinator")
                     else:
                         logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No PP group found, cannot send tokens to PP0")
                 
@@ -500,7 +487,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                             
                             # 从PP1 (rank 1 in pp_group) 接收
                             logger.info(f"🔧 [PP_DECODE] PP{pp_rank}: Waiting for tokens from PP1...")
-                            dist.recv(token_tensor, src=1, group=self.pp_group)
+                            # 使用SGLang GroupCoordinator的recv方法
+                            token_tensor = self.pp_group.recv(token_tensor.size(), token_tensor.dtype, src=1)
                             
                             # 更新recv_req中的token
                             recv_req.next_token_ids = token_tensor.cpu().numpy().tolist()

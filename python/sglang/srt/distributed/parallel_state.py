@@ -727,7 +727,9 @@ class GroupCoordinator:
         )
 
         # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        # 🔧 修复tensor buffer不可写的警告
+        serialized_data = pickle.dumps(obj)
+        object_tensor = torch.frombuffer(serialized_data, dtype=torch.uint8).clone()
 
         size_tensor = torch.tensor(
             [object_tensor.numel()], dtype=torch.long, device="cpu"
