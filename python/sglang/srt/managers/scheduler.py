@@ -1041,8 +1041,10 @@ class Scheduler(
                             all_gather_group=self.attn_tp_group
                         )
                     )
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    if next_pp_outputs is not None:
+                    # In PP, only the stage following the last rank receives tokens.
+                    # Other stages will receive hidden-state proxies without 'next_token_ids'.
+                    if "next_token_ids" in next_pp_outputs.tensors:
+                        mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                         logits_output_args = {
                             k[len("logits_output.") :]: v
                             for k, v in next_pp_outputs.tensors.items()
