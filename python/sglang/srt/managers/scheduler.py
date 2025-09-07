@@ -2225,10 +2225,21 @@ class Scheduler(
                 f"{self.tree_cache.evictable_size()=}, "
             )
 
+        # Optional py-spy dump (guarded in utils by env var)
         pyspy_dump_schedulers()
         logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
+
+        # In Semi-PD + PP mode, avoid killing the whole service; just warn.
+        try:
+            if getattr(self.server_args, 'enable_semi_pd', False) and self.server_args.pp_size > 1:
+                logger.warning("Watchdog triggered in Semi-PD+PP; skipping SIGQUIT to avoid killing service.")
+                # Reset the watchdog clock and continue monitoring
+                self.watchdog_last_time = time.perf_counter()
+                return
+        except Exception:
+            pass
 
         # Wait for some time so that the parent process can print the error.
         time.sleep(5)

@@ -1782,7 +1782,13 @@ def nullable_str(val: str):
 
 
 def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
+    """py-spy dump on all scheduler in a local node.
+
+    Disabled by default unless SGLANG_ENABLE_PYSPY=1. This avoids permission
+    errors on systems where perf/ptrace requires elevated privileges.
+    """
+    if os.environ.get("SGLANG_ENABLE_PYSPY", "0") not in ("1", "true", "True"):
+        return
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
