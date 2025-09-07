@@ -116,6 +116,8 @@ class TpModelWorker:
                     revision=server_args.revision,
                 )
         self.device = self.model_runner.device
+        # 预取隐藏态缓存：当scheduler误收到隐藏态时存放于此，供下一次forward消费
+        self._prefetched_pp_hidden: Optional[dict] = None
 
         # Init nccl groups
         self.pp_group = get_pp_group()
@@ -157,7 +159,7 @@ class TpModelWorker:
             broadcast_group = self.world_group.cpu_group
             broadcast_src = self.world_group.ranks[0]
             logger.info(f"[TP_WORKER] 标准模式: 使用world组进行random_seed广播")
-            
+
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
             broadcast_rank,
@@ -170,6 +172,17 @@ class TpModelWorker:
         self.worker = self
 
         self.hicache_layer_transfer_counter = None
+
+    def set_prefetched_pp_hidden(self, tensors: Optional[dict]):
+        self._prefetched_pp_hidden = tensors
+
+    def set_prefetched_pp_token(self, tensors: Optional[dict]):
+        self._prefetched_pp_token = tensors
+
+    def pop_prefetched_pp_token(self) -> Optional[dict]:
+        ret = self._prefetched_pp_token
+        self._prefetched_pp_token = None
+        return ret
 
     def init_attention_backend(self):
         """Initialize attention backend for Semi-PD delayed initialization."""
@@ -258,15 +271,38 @@ class TpModelWorker:
         # 🔑 关键：PP 隐藏态接收逻辑（与原生 SGLang 完全一致）
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            # PP1: 阻塞接收 PP0 发送的隐藏态
-            logger.info(f"🔍 [PP_COMM_TEST] PP{self.pp_group.rank} waiting to receive hidden states from PP{self.pp_group.rank-1}")
-            received_tensors = self.pp_group.recv_tensor_dict(
-                all_gather_group=self.get_attention_tp_group()
-            )
-            logger.info(f"✅ [PP_COMM_TEST] PP{self.pp_group.rank} received hidden states: type={type(received_tensors)}")
-            logger.info(f"🔍 [PP_COMM_TEST] PP{self.pp_group.rank} received tensors keys: {received_tensors.keys() if isinstance(received_tensors, dict) else 'N/A'}")
-            
-            pp_proxy_tensors = PPProxyTensors(received_tensors)
+            # 若有预取隐藏态，优先使用；否则阻塞接收，直到拿到被标记为隐藏态的包
+            if self._prefetched_pp_hidden is not None:
+                recv_dict = self._prefetched_pp_hidden
+                self._prefetched_pp_hidden = None
+            else:
+                recv_dict = None
+                while recv_dict is None:
+                    tmp = self.pp_group.recv_tensor_dict(
+                        all_gather_group=self.get_attention_tp_group()
+                    )
+                    if isinstance(tmp, dict) and tmp.get("__pp_msg__") == "hid":
+                        recv_dict = tmp
+                        break
+                    else:
+                        # 非隐藏态（token）缓存起来，交由scheduler端消费
+                        self._prefetched_pp_token = tmp
+                        continue
+            # 清理标记
+            recv_dict.pop("__pp_msg__", None)
+            # 对齐原生：DECODE阶段仅需要每条序列最后一个token的隐藏态
+            if model_worker_batch.forward_mode.is_decode():
+                expect = len(model_worker_batch.seq_lens)
+                for k in ("hidden_states", "residual"):
+                    if k in recv_dict:
+                        src = recv_dict[k]
+                        if src.shape[0] != expect:
+                            if src.shape[0] > expect:
+                                recv_dict[k] = src[-expect:]
+                            else:
+                                # 长度不足时，直接保留（理论上不会发生）
+                                recv_dict[k] = src
+            pp_proxy_tensors = PPProxyTensors(recv_dict)
 
         # 🔑 关键：根据 PP stage 决定处理逻辑（与原生 SGLang 完全一致）
         if self.pp_group.is_last_rank:

@@ -1585,12 +1585,44 @@ class ModelRunner:
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
+        # Semi-PD + PP: 当decode/idle批次收到来自prefill chunk的隐藏态（长度!=bs）时，禁用CUDA Graph以对齐原生行为
+        if can_run_cuda_graph and pp_proxy_tensors is not None:
+            if forward_batch.forward_mode.is_decode_or_idle():
+                try:
+                    bs = forward_batch.batch_size
+                    # 选取一个任意张量检查第一维
+                    if len(pp_proxy_tensors.tensors) > 0:
+                        any_tensor = next(iter(pp_proxy_tensors.tensors.values()))
+                        if any_tensor.shape[0] != bs:
+                            can_run_cuda_graph = False
+                    else:
+                        can_run_cuda_graph = False
+                except Exception:
+                    can_run_cuda_graph = False
         if can_run_cuda_graph:
-            ret = self.cuda_graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            # 防御性对齐：确保 PP 代理张量第一维与 bs 一致（仅 decode/idle 有意义）
+            if pp_proxy_tensors is not None and forward_batch.forward_mode.is_decode_or_idle():
+                try:
+                    bs = forward_batch.batch_size
+                    for k, v in list(pp_proxy_tensors.tensors.items()):
+                        if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.shape[0] != bs:
+                            if v.shape[0] > bs:
+                                pp_proxy_tensors.tensors[k] = v[-bs:].contiguous()
+                            else:
+                                # 长度不足，禁用图回退到eager
+                                can_run_cuda_graph = False
+                                break
+                except Exception:
+                    can_run_cuda_graph = False
+            if can_run_cuda_graph:
+                ret = self.cuda_graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                # 回退到 eager decode
+                ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():

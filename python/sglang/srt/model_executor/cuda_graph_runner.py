@@ -700,25 +700,39 @@ class CudaGraphRunner:
                 self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
 
-            # Common inputs
-            self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
-            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-            self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-            self.positions[:raw_num_token].copy_(forward_batch.positions)
+            # Common inputs (robust to input_ids longer than expected in decode)
+            n_id = min(raw_num_token, forward_batch.input_ids.shape[0])
+            if n_id > 0:
+                # take the last n_id tokens to match decode semantics
+                self.input_ids[:n_id].copy_(forward_batch.input_ids[-n_id:])
+            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
+            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
+            n_loc = min(raw_num_token, forward_batch.out_cache_loc.shape[0])
+            if n_loc > 0:
+                self.out_cache_loc[:n_loc].copy_(forward_batch.out_cache_loc[-n_loc:])
+            n_pos = min(raw_num_token, forward_batch.positions.shape[0])
+            if n_pos > 0:
+                self.positions[:n_pos].copy_(forward_batch.positions[-n_pos:])
 
             if forward_batch.seq_lens_cpu is not None:
                 if bs != raw_bs:
                     self.seq_lens_cpu.fill_(self.seq_len_fill_value)
-                self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+                self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
 
             if pp_proxy_tensors:
+                # 在DECODE图中，期望的pp代理张量长度是`raw_num_token`（=bs）。
+                # 若来源是prefill chunk（长度>>bs），仅拷贝末尾`copy_len=min(raw_num_token, src_len)`行，避免尺寸不匹配。
+                expect = raw_num_token
                 for key in self.pp_proxy_tensors.keys():
-                    dim = pp_proxy_tensors[key].shape[0]
-                    self.pp_proxy_tensors[key][:dim].copy_(pp_proxy_tensors[key])
+                    src = pp_proxy_tensors[key]
+                    src_len = int(src.shape[0])
+                    copy_len = min(expect, src_len)
+                    if copy_len > 0:
+                        # 取末尾 copy_len 行（每序列最后一个token语义）
+                        self.pp_proxy_tensors[key][:copy_len].copy_(src[-copy_len:])
 
-            if self.is_encoder_decoder:
-                self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens[:raw_bs])
             if forward_batch.mrope_positions is not None:
                 self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
             if self.require_gathered_buffer:
@@ -748,7 +762,8 @@ class CudaGraphRunner:
 
             # Store fields used by replay()
             self.raw_bs = raw_bs
-            self.raw_num_token = raw_num_token
+            # Use the actual copied token count to be consistent in replay
+            self.raw_num_token = n_id if n_id > 0 else raw_num_token
             self.bs = bs
 
             # Optional diagnostics
@@ -779,8 +794,10 @@ class CudaGraphRunner:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            n = min(self.raw_num_token, forward_batch.input_ids.shape[0])
+            if n > 0:
+                self.input_ids[: n].copy_(forward_batch.input_ids[-n:])
+                self.positions[: n].copy_(forward_batch.positions[-n:])
 
         # Replay
         self._log_streams("replay:entry")

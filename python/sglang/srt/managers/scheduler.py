@@ -1002,25 +1002,22 @@ class Scheduler(
 
                 # (last rank) send the outputs to the next step
                 # Semi-PD: PREFILL实例不负责跨stage回送token，交由DECODE实例通过控制面/NCCL处理
-                allow_last_rank_token_send = True
-                try:
-                    from sglang.semi_pd.utils import InstanceRole as _IR
-                    if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == _IR.PREFILL:
-                        allow_last_rank_token_send = False
-                except Exception:
-                    pass
-                if self.pp_group is not None and self.pp_group.is_last_rank and allow_last_rank_token_send:
+                if self.pp_group is not None and self.pp_group.is_last_rank:
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
                             result.bid,
                         )
+                        # Tag message type for receiver disambiguation
+                        if isinstance(next_token_ids, torch.Tensor):
+                            next_token_ids = next_token_ids
                         if self.cur_batch.return_logprob:
                             pp_outputs = PPProxyTensors(
                                 {
                                     "next_token_ids": next_token_ids,
                                     "extend_input_len_per_req": result.extend_input_len_per_req,
                                     "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
+                                    "__pp_msg__": "tok",
                                 }
                                 | (
                                     {
@@ -1035,6 +1032,7 @@ class Scheduler(
                             pp_outputs = PPProxyTensors(
                                 {
                                     "next_token_ids": next_token_ids,
+                                    "__pp_msg__": "tok",
                                 }
                             )
                         # send the output from the last round to let the next stage worker run post processing
@@ -1047,11 +1045,35 @@ class Scheduler(
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
-                        )
-                    )
+                    # 优先消费worker端缓存的token包
+                    recv = None
+                    try:
+                        if hasattr(self.tp_worker, 'pop_prefetched_pp_token'):
+                            recv = self.tp_worker.pop_prefetched_pp_token()
+                    except Exception:
+                        recv = None
+                    # 若无缓存，则从通道读取；只消费token包，隐藏态包转交给TpWorker缓存
+                    if recv is None:
+                        for _ in range(64):
+                            tmp = self.pp_group.recv_tensor_dict(
+                                all_gather_group=self.attn_tp_group
+                            )
+                            if isinstance(tmp, dict) and tmp.get("__pp_msg__") == "tok" and "next_token_ids" in tmp:
+                                recv = tmp
+                                break
+                            else:
+                                try:
+                                    if hasattr(self.tp_worker, 'set_prefetched_pp_hidden'):
+                                        self.tp_worker.set_prefetched_pp_hidden(tmp)
+                                except Exception:
+                                    pass
+                                continue
+                    if recv is None:
+                        recv = {}
+                    else:
+                        # Clean tag before constructing PPProxyTensors
+                        recv.pop("__pp_msg__", None)
+                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(recv)
                     mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                     logits_output_args = {
                         k[len("logits_output.") :]: v
@@ -1085,6 +1107,8 @@ class Scheduler(
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
+                        # Attach tag
+                        pp_outputs.tensors["__pp_msg__"] = "tok"
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
@@ -1103,6 +1127,8 @@ class Scheduler(
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # Tag hidden tensors
+                        result.pp_hidden_states_proxy_tensors["__pp_msg__"] = "hid"
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
