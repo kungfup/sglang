@@ -366,6 +366,18 @@ class ForwardBatch:
         if ret.forward_mode.is_decode():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+            # Robustness: decode step should use exactly one token per sequence.
+            # If input_ids includes more tokens (e.g., from chunk interactions), keep the last bs tokens.
+            try:
+                bs = ret.batch_size
+                if ret.input_ids.shape[0] != bs:
+                    ret.input_ids = ret.input_ids[-bs:]
+                if ret.out_cache_loc is not None and ret.out_cache_loc.shape[0] != bs:
+                    ret.out_cache_loc = ret.out_cache_loc[-bs:]
+                if ret.positions is not None and ret.positions.shape[0] != bs:
+                    ret.positions = ret.positions[-bs:]
+            except Exception:
+                pass
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32

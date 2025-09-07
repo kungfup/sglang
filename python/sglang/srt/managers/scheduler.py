@@ -1008,16 +1008,13 @@ class Scheduler(
                             result.next_token_ids,
                             result.bid,
                         )
-                        # Tag message type for receiver disambiguation
-                        if isinstance(next_token_ids, torch.Tensor):
-                            next_token_ids = next_token_ids
+                        # Send token packet with explicit tag
                         if self.cur_batch.return_logprob:
-                            pp_outputs = PPProxyTensors(
+                            send_tok = (
                                 {
                                     "next_token_ids": next_token_ids,
                                     "extend_input_len_per_req": result.extend_input_len_per_req,
                                     "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
-                                    "__pp_msg__": "tok",
                                 }
                                 | (
                                     {
@@ -1029,15 +1026,9 @@ class Scheduler(
                                 )
                             )
                         else:
-                            pp_outputs = PPProxyTensors(
-                                {
-                                    "next_token_ids": next_token_ids,
-                                    "__pp_msg__": "tok",
-                                }
-                            )
-                        # send the output from the last round to let the next stage worker run post processing
+                            send_tok = {"next_token_ids": next_token_ids}
                         self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
+                            send_tok,
                             all_gather_group=self.attn_tp_group,
                         )
 
@@ -1045,60 +1036,37 @@ class Scheduler(
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
-                    # 优先消费worker端缓存的token包
-                    recv = None
-                    try:
-                        if hasattr(self.tp_worker, 'pop_prefetched_pp_token'):
-                            recv = self.tp_worker.pop_prefetched_pp_token()
-                    except Exception:
-                        recv = None
-                    # 若无缓存，则从通道读取；只消费token包，隐藏态包转交给TpWorker缓存
-                    if recv is None:
-                        for _ in range(64):
-                            tmp = self.pp_group.recv_tensor_dict(
-                                all_gather_group=self.attn_tp_group
-                            )
-                            if isinstance(tmp, dict) and tmp.get("__pp_msg__") == "tok" and "next_token_ids" in tmp:
-                                recv = tmp
-                                break
-                            else:
-                                try:
-                                    if hasattr(self.tp_worker, 'set_prefetched_pp_hidden'):
-                                        self.tp_worker.set_prefetched_pp_hidden(tmp)
-                                except Exception:
-                                    pass
-                                continue
-                    if recv is None:
-                        recv = {}
-                    else:
-                        # Clean tag before constructing PPProxyTensors
-                        recv.pop("__pp_msg__", None)
-                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(recv)
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                    logits_output_args = {
-                        k[len("logits_output.") :]: v
-                        for k, v in next_pp_outputs.tensors.items()
-                        if k.startswith("logits_output.")
-                    }
-                    if len(logits_output_args) > 0:
-                        logits_output = LogitsProcessorOutput(**logits_output_args)
-                    else:
-                        logits_output = None
-                    output_result = GenerationBatchResult(
-                        logits_output=logits_output,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_input_len_per_req", None
-                        ),
-                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_logprob_start_len_per_req", None
-                        ),
-                        bid=bids[next_mb_id],
-                        can_run_cuda_graph=result.can_run_cuda_graph,
+                    next_pp_outputs = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
                     )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    if next_pp_outputs is not None:
+                        logits_output_args = {
+                            k[len("logits_output.") :]: v
+                            for k, v in next_pp_outputs.tensors.items()
+                            if k.startswith("logits_output.")
+                        }
+                        if len(logits_output_args) > 0:
+                            logits_output = LogitsProcessorOutput(**logits_output_args)
+                        else:
+                            logits_output = None
+                        output_result = GenerationBatchResult(
+                            logits_output=logits_output,
+                            pp_hidden_states_proxy_tensors=None,
+                            next_token_ids=next_pp_outputs["next_token_ids"],
+                            extend_input_len_per_req=next_pp_outputs.tensors.get(
+                                "extend_input_len_per_req", None
+                            ),
+                            extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                                "extend_logprob_start_len_per_req", None
+                            ),
+                            bid=bids[next_mb_id],
+                            can_run_cuda_graph=result.can_run_cuda_graph,
+                        )
+                        self.process_batch_result(mbs[next_mb_id], output_result)
+                        last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
                 if self.pp_group is not None and not self.pp_group.is_last_rank:
@@ -1107,8 +1075,6 @@ class Scheduler(
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
-                        # Attach tag
-                        pp_outputs.tensors["__pp_msg__"] = "tok"
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
@@ -1127,8 +1093,6 @@ class Scheduler(
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
-                        # Tag hidden tensors
-                        result.pp_hidden_states_proxy_tensors["__pp_msg__"] = "hid"
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
@@ -1918,51 +1882,12 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-
-                # update the consumer index of hicache to the running batch
                 self.tp_worker.set_hicache_consumer(
                     model_worker_batch.hicache_consumer_index
                 )
-                # 🔍 [DEBUG] 添加PP相关的调试日志
-                if self.pp_group is not None:
-                    logger.info(f"🔍 [PP_DEBUG] PP group info:")
-                    logger.info(f"🔍 [PP_DEBUG]   pp_group.rank: {self.pp_group.rank}")
-                    logger.info(f"🔍 [PP_DEBUG]   pp_group.world_size: {self.pp_group.world_size}")
-                    logger.info(f"🔍 [PP_DEBUG]   pp_group.is_last_rank: {self.pp_group.is_last_rank}")
-                    logger.info(f"🔍 [PP_DEBUG]   pp_group.last_rank: {self.pp_group.last_rank}")
-                else:
-                    logger.info(f"🔍 [PP_DEBUG] PP group is None (Semi-PD mode)")
-                
-                # 🔧 修复：Semi-PD TP模式下的PP stage判断逻辑
-                import os
-                pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
-                is_last_pp_stage = False
-                
-                if pp_size == 1:
-                    # Semi-PD TP模式 (PP=1)：DECODE进程就是最后一个PP stage
-                    is_last_pp_stage = True
-                    logger.info(f"🔧 [PP_DEBUG] Semi-PD TP mode (PP=1): DECODE is the last PP stage")
-                elif self.pp_group is not None:
-                    # 原生PP模式 (PP>1)：使用pp_group判断
-                    is_last_pp_stage = self.pp_group.is_last_rank
-                    logger.info(f"🔧 [PP_DEBUG] Native PP mode: is_last_pp_stage={is_last_pp_stage}")
-                else:
-                    # 异常情况：PP>1但pp_group为None
-                    logger.warning(f"⚠️ [PP_DEBUG] PP={pp_size} but pp_group is None, assuming last stage")
-                    is_last_pp_stage = True
-                
-                if is_last_pp_stage:
-                    logger.info(f"🔍 [PP_DEBUG] This is the LAST PP rank, should get next_token_ids")
-                    logits_output, next_token_ids, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                    logger.info(f"🔍 [PP_DEBUG] Got results: next_token_ids type={type(next_token_ids)}, shape={getattr(next_token_ids, 'shape', 'N/A')}")
-                else:
-                    logger.info(f"🔍 [PP_DEBUG] This is NOT the last PP rank, will get hidden states")
-                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                    logger.info(f"🔍 [PP_DEBUG] Got hidden states: type={type(pp_hidden_states_proxy_tensors)}")
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.tp_worker.forward_batch_generation(model_worker_batch)
+                )
                 bid = model_worker_batch.bid
             else:
                 (
@@ -1977,8 +1902,7 @@ class Scheduler(
                 self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
-            # 🔧 修复：使用统一的is_last_pp_stage判断
-            if is_last_pp_stage:
+            if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
@@ -1995,28 +1919,19 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            # 🔍 [DEBUG] 添加结果构造的调试日志
-            logger.info(f"🔍 [PP_DEBUG] Constructing GenerationBatchResult:")
-            logger.info(f"�� [PP_DEBUG]   is_last_rank: {is_last_pp_stage}")
-            
-            # 🔧 [SEMI-PD FIX] 修复Semi-PD模式下的结果构造逻辑
-            # 统一使用is_last_pp_stage判断，无论是Semi-PD还是原生PP模式
-            logits_output_result = logits_output if is_last_pp_stage else None
-            next_token_ids_result = next_token_ids if is_last_pp_stage else None
-            
-            logger.info(f"🔍 [PP_DEBUG]   logits_output_result: {logits_output_result is not None}")
-            logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result: {next_token_ids_result is not None}")
-            
-            if next_token_ids_result is not None:
-                logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result type: {type(next_token_ids_result)}")
-                logger.info(f"🔍 [PP_DEBUG]   next_token_ids_result shape: {getattr(next_token_ids_result, 'shape', 'N/A')}")
-            
+            if self.pp_group.is_last_rank:
+                logits_output_result = logits_output
+                next_token_ids_result = next_token_ids
+                hidden_states_result = None
+            else:
+                # For non-last PP rank, forward_batch_generation returns proxy tensors in `logits_output`
+                hidden_states_result = logits_output
+                logits_output_result = None
+                next_token_ids_result = None
             ret = GenerationBatchResult(
                 logits_output=logits_output_result,
                 pp_hidden_states_proxy_tensors=(
-                    pp_hidden_states_proxy_tensors
-                    if not is_last_pp_stage
-                    else None
+                    hidden_states_result if not self.pp_group.is_last_rank else None
                 ),
                 next_token_ids=next_token_ids_result,
                 extend_input_len_per_req=extend_input_len_per_req,
@@ -2025,7 +1940,6 @@ class Scheduler(
                 can_run_cuda_graph=can_run_cuda_graph,
             )
             
-            logger.info(f"🔍 [PP_DEBUG] Final result.next_token_ids: {ret.next_token_ids is not None}")
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)

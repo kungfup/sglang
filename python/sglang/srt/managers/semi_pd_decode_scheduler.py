@@ -37,6 +37,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.server_args import PortArgs, SemiPDPortArgs, ServerArgs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     broadcast_pyobj,
     get_bool_env_var,
@@ -151,6 +152,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Semi-PD: Remove extra EOS detection from update_running_batch
         # Let process_batch_result_decode handle EOS detection properly like original SGLang
 
+        # If this micro-batch is still in EXTEND (first pass on non-first PP stage),
+        # keep it as EXTEND until one pass completes, then switch to DECODE.
+        if batch.forward_mode is not None and batch.forward_mode.is_extend():
+            if not getattr(batch, "first_extend_done", False):
+                return batch
+            # EXTEND finished once; now switch to DECODE
+            batch.forward_mode = ForwardMode.DECODE
+
         batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
@@ -209,7 +218,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
-        # Update batch tensors
+        # Update batch tensors (now it's safe to run decode)
         batch.prepare_for_decode()
         return batch
 

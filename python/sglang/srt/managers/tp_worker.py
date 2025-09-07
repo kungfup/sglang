@@ -16,6 +16,7 @@
 import logging
 import threading
 from typing import Optional, Tuple, Union
+from collections import deque
 
 import torch
 
@@ -116,8 +117,8 @@ class TpModelWorker:
                     revision=server_args.revision,
                 )
         self.device = self.model_runner.device
-        # 预取隐藏态缓存：当scheduler误收到隐藏态时存放于此，供下一次forward消费
-        self._prefetched_pp_hidden: Optional[dict] = None
+        # 预取隐藏态缓存队列：当scheduler误收到隐藏态时存放于此，供下一次forward消费
+        self._prefetched_pp_hidden_q: deque[dict] = deque()
 
         # Init nccl groups
         self.pp_group = get_pp_group()
@@ -173,8 +174,9 @@ class TpModelWorker:
 
         self.hicache_layer_transfer_counter = None
 
-    def set_prefetched_pp_hidden(self, tensors: Optional[dict]):
-        self._prefetched_pp_hidden = tensors
+    def enqueue_prefetched_pp_hidden(self, tensors: Optional[dict]):
+        if tensors is not None:
+            self._prefetched_pp_hidden_q.append(tensors)
 
     def set_prefetched_pp_token(self, tensors: Optional[dict]):
         self._prefetched_pp_token = tensors
@@ -256,57 +258,17 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
-        """
-        🔧 Semi-PD + PP 并行：完全复用原生 SGLang Pipeline 并行逻辑
-        
-        关键要点：
-        1. PP0 (is_first_rank=True, is_last_rank=False): 生成隐藏态，返回 (tensors, None)
-        2. PP1 (is_first_rank=False, is_last_rank=True): 接收隐藏态，生成tokens，返回 (logits, tokens)
-        3. Semi-PD PREFILL 进程使用相同的逻辑，只是数据来源不同（CUDA IPC vs 正常调度）
-        """
-        # 🔧 使用SGLang原生PP机制，移除自定义同步逻辑
-        
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
-        # 🔑 关键：PP 隐藏态接收逻辑（与原生 SGLang 完全一致）
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            # 若有预取隐藏态，优先使用；否则阻塞接收，直到拿到被标记为隐藏态的包
-            if self._prefetched_pp_hidden is not None:
-                recv_dict = self._prefetched_pp_hidden
-                self._prefetched_pp_hidden = None
-            else:
-                recv_dict = None
-                while recv_dict is None:
-                    tmp = self.pp_group.recv_tensor_dict(
-                        all_gather_group=self.get_attention_tp_group()
-                    )
-                    if isinstance(tmp, dict) and tmp.get("__pp_msg__") == "hid":
-                        recv_dict = tmp
-                        break
-                    else:
-                        # 非隐藏态（token）缓存起来，交由scheduler端消费
-                        self._prefetched_pp_token = tmp
-                        continue
-            # 清理标记
-            recv_dict.pop("__pp_msg__", None)
-            # 对齐原生：DECODE阶段仅需要每条序列最后一个token的隐藏态
-            if model_worker_batch.forward_mode.is_decode():
-                expect = len(model_worker_batch.seq_lens)
-                for k in ("hidden_states", "residual"):
-                    if k in recv_dict:
-                        src = recv_dict[k]
-                        if src.shape[0] != expect:
-                            if src.shape[0] > expect:
-                                recv_dict[k] = src[-expect:]
-                            else:
-                                # 长度不足时，直接保留（理论上不会发生）
-                                recv_dict[k] = src
-            pp_proxy_tensors = PPProxyTensors(recv_dict)
+            pp_proxy_tensors = PPProxyTensors(
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=self.get_attention_tp_group()
+                )
+            )
 
-        # 🔑 关键：根据 PP stage 决定处理逻辑（与原生 SGLang 完全一致）
         if self.pp_group.is_last_rank:
-            # PP1: 最后一个 stage，生成 logits 和 next_token_ids
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
@@ -322,13 +284,10 @@ class TpModelWorker:
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
-            # PP0: 非最后一个 stage，生成隐藏态
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            # 原生 SGLang 在 event_loop_pp() 中统一负责发送/转发到下一PP stage。
-            # 这里不再直接发送，避免与 event_loop_pp 的发送重复导致死锁/错序。
             return pp_proxy_tensors.tensors, None, can_run_cuda_graph
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):

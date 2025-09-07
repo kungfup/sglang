@@ -189,6 +189,16 @@ class SchedulerOutputProcessorMixin:
 
             self.set_next_batch_sampling_info_done(batch)
 
+            # Semi-PD + PP: Mark first EXTEND completion on DECODE instance,
+            # so next iteration can switch to DECODE safely.
+            try:
+                if getattr(self, 'server_args', None) and getattr(self.server_args, 'enable_semi_pd', False):
+                    if hasattr(self, 'instance_role') and self.instance_role.name == 'DECODE':
+                        if getattr(batch, 'forward_mode', None) is not None and batch.forward_mode.is_extend():
+                            setattr(batch, 'first_extend_done', True)
+            except Exception:
+                pass
+
         else:  # embedding or reward model
             embeddings, bid = result.embeddings, result.bid
             embeddings = embeddings.tolist()
