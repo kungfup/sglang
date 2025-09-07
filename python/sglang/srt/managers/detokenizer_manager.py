@@ -195,16 +195,39 @@ class DetokenizerManager:
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        surr_texts = self.tokenizer.batch_decode(
-            surr_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
-        read_texts = self.tokenizer.batch_decode(
-            read_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
+        try:
+            surr_texts = self.tokenizer.batch_decode(
+                surr_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+            read_texts = self.tokenizer.batch_decode(
+                read_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+        except OverflowError:
+            # Fallback: sanitize negative/sentinel ids and retry to avoid HF overflow
+            def _sanitize(ids):
+                out = []
+                for t in ids or []:
+                    try:
+                        ti = int(t)
+                    except Exception:
+                        continue
+                    if ti >= 0:
+                        out.append(ti)
+                return out
+            surr_texts = self.tokenizer.batch_decode(
+                [_sanitize(x) for x in surr_ids],
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+            read_texts = self.tokenizer.batch_decode(
+                [_sanitize(x) for x in read_ids],
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
 
         # Incremental decoding
         output_strs = []

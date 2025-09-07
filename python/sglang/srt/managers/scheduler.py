@@ -1455,6 +1455,17 @@ class Scheduler(
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
         )
+        # Clamp usage to [0, 1] for robustness
+        try:
+            token_usage = num_used / self.max_total_num_tokens
+            if not isinstance(token_usage, float):
+                token_usage = float(token_usage)
+            if token_usage < 0:
+                token_usage = 0.0
+            elif token_usage > 1:
+                token_usage = 1.0
+        except Exception:
+            token_usage = 0.0
 
         num_new_seq = len(can_run_list)
         f = (
@@ -1462,7 +1473,7 @@ class Scheduler(
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"token usage: {token_usage:.2f}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1482,7 +1493,7 @@ class Scheduler(
             )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
+            self.stats.token_usage = round(token_usage, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -1514,11 +1525,22 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        # Clamp usage to [0, 1]
+        try:
+            token_usage = num_used / self.max_total_num_tokens
+            token_usage = float(token_usage)
+            if token_usage < 0:
+                token_usage = 0.0
+            elif token_usage > 1:
+                token_usage = 1.0
+        except Exception:
+            token_usage = 0.0
+
         msg = (
             f"Decode batch. "
             f"#running-req: {num_running_reqs}, "
             f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"token usage: {token_usage:.2f}, "
         )
 
         if self.spec_algorithm.is_none():
@@ -1546,7 +1568,7 @@ class Scheduler(
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = num_used / self.max_total_num_tokens
+            self.stats.token_usage = token_usage
             self.stats.cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)

@@ -542,6 +542,15 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                # Defensive: decode path should write a single token. If multi-token KV
+                # sneaks in (should have been handled by EXTEND), only commit the last token
+                # to avoid broadcast errors.
+                try:
+                    if k.dim() >= 3 and k.shape[0] != 1:
+                        k = k[-1:].contiguous()
+                        v = v[-1:].contiguous()
+                except Exception:
+                    pass
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
