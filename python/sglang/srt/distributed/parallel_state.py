@@ -905,13 +905,16 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
+            # Ensure contiguous layout to avoid implicit copies in c10d
+            tensor = tensor.contiguous()
+
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
                 torch.distributed.send(
                     tensor, dst=self.ranks[dst], group=metadata_group
                 )
             else:
-                # use group for GPU tensors
+                # use device group for GPU tensors
                 torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
         return None
 
@@ -943,7 +946,14 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                # Always place GPU tensors on this group's device to avoid
+                # implicit .to()/_to_copy() later.
+                dev = (
+                    self.device
+                    if (isinstance(value.device, str) and value.device != "cpu")
+                    else value.device
+                )
+                tensor = torch.empty(value.size, dtype=value.dtype, device=dev)
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor
@@ -993,8 +1003,11 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
 
         pynccl_comm = self.pynccl_comm
+        # Ensure contiguous to avoid implicit copies
+        tensor = tensor.contiguous()
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.send(tensor, dst)
+            # Keep default path via torch.distributed in eager mode to avoid deadlocks
+            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
@@ -1009,7 +1022,8 @@ class GroupCoordinator:
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.recv(tensor, src)
+            # Keep default path via torch.distributed in eager mode to avoid deadlocks
+            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
@@ -1034,6 +1048,21 @@ _WORLD: Optional[GroupCoordinator] = None
 
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
+    return _WORLD
+
+
+def get_group_coordinator(group: Optional[str] = None) -> Optional[GroupCoordinator]:
+    """Return a GroupCoordinator by name or the world group.
+
+    Args:
+        group: one of {"pp", "tp", None}. If None, return world group.
+    Returns:
+        GroupCoordinator or None if not initialized.
+    """
+    if group == "pp":
+        return _PP
+    if group == "tp":
+        return _TP
     return _WORLD
 
 

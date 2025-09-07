@@ -309,14 +309,17 @@ class CudaGraphRunner:
 
             # pipeline parallelism
             if self.pp_size > 1:
+                # NOTE: PP跨stage传递的是token级hidden_states/residual，因此容量应为max_num_token
+                # 使用模型实际dtype，避免copy_发生隐式dtype转换
+                dtype = getattr(self.model_runner, "dtype", torch.bfloat16)
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        (self.max_num_token, self.model_runner.model_config.hidden_size),
+                        dtype=dtype,
                     ),
                     "residual": torch.zeros(
-                        (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        (self.max_num_token, self.model_runner.model_config.hidden_size),
+                        dtype=dtype,
                     ),
                 }
 
