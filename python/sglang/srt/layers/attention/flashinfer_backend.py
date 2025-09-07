@@ -715,33 +715,60 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if spec_info is None:
-            bs = len(req_pool_indices)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            bs_raw = int(len(req_pool_indices))
+            max_bs = int(kv_indptr.numel()) - 1
+            need_realloc = bs_raw > max_bs
+            bs = min(bs_raw, max_bs) if max_bs > 0 else 0
+            if bs < bs_raw:
+                # Trim to avoid OOB
+                req_pool_indices = req_pool_indices[:bs]
+                paged_kernel_lens = paged_kernel_lens[:bs]
+                if kv_start_idx is not None:
+                    kv_start_idx = kv_start_idx[:bs]
+                # Recompute sum for trimmed length
+                paged_kernel_lens_sum = int(paged_kernel_lens.sum().item())
+
+            # Allocate local kv_indptr if capacity insufficient
+            if need_realloc:
+                kv_indptr_local = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device="cuda"
+                )
+            else:
+                kv_indptr_local = kv_indptr
+            kv_indptr_local[:1] = 0
+            if bs > 0:
+                kv_indptr_local[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr_local = kv_indptr_local[: bs + 1]
 
             if wrapper.is_cuda_graph_enabled:
                 # Directly write to the cuda graph input buffer
                 kv_indices = wrapper._paged_kv_indices_buf
+                # Ensure capacity
+                if kv_indices.numel() < paged_kernel_lens_sum:
+                    kv_indices = torch.empty(
+                        paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                    )
             else:
                 kv_indices = torch.empty(
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+            if bs > 0:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr_local,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
         wrapper.begin_forward(
-            kv_indptr,
+            kv_indptr_local if spec_info is None else kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
@@ -926,27 +953,52 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        bs = len(seq_lens)
+        bs_raw = int(len(seq_lens))
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
+            max_bs = int(kv_indptr.numel()) - 1
+            need_realloc = bs_raw > max_bs
+            bs = min(bs_raw, max_bs) if max_bs > 0 else 0
+            if bs < bs_raw:
+                req_pool_indices = req_pool_indices[:bs]
+                paged_kernel_lens = paged_kernel_lens[:bs]
+                seq_lens = seq_lens[:bs]
+                prefix_lens = prefix_lens[:bs]
+                if kv_start_idx is not None:
+                    kv_start_idx = kv_start_idx[:bs]
+                paged_kernel_lens_sum = int(paged_kernel_lens.sum().item())
+
             # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            if need_realloc:
+                kv_indptr_local = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=req_pool_indices.device
+                )
+            else:
+                kv_indptr_local = kv_indptr
+            kv_indptr_local[:1] = 0
+            if bs > 0:
+                kv_indptr_local[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr_local = kv_indptr_local[: bs + 1]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
-            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            if bs > 0:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr_local,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
+            if qo_indptr.numel() < bs + 1:
+                bs = min(bs, int(qo_indptr.numel()) - 1)
+            qo_indptr[:1] = 0
+            if bs > 0:
+                qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
@@ -976,7 +1028,7 @@ class FlashInferIndicesUpdaterPrefill:
         # cached part
         wrapper_paged.begin_forward(
             qo_indptr,
-            kv_indptr,
+            kv_indptr_local if spec_info is None else kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
             self.num_qo_heads,
