@@ -167,6 +167,11 @@ class SemiPDScheduler(Scheduler):
         原版Semi-PD的请求队列管理逻辑
         撤回的请求具有高优先级，插入队列头部
         """
+        # De-duplicate by rid within this scheduler instance to avoid
+        # accidental double-ingestion under PP + IPC mixed conditions.
+        existing = {r.rid for r in getattr(self, "waiting_queue", [])}
+        if req.rid in existing:
+            return
         if req.is_retracted:
             self.waiting_queue.insert(0, req)
         else:
@@ -183,7 +188,17 @@ class SemiPDScheduler(Scheduler):
           - 处理撤回的请求
           - 使用add_to_waiting_queue管理队列
         """
-        logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
+        # Log new requests only from DECODE to avoid duplicate logs from PREFILL
+        try:
+            if getattr(self, "instance_role", None) == InstanceRole.DECODE:
+                logger.info(
+                    f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}"
+                )
+        except Exception:
+            # Fallback: keep service robust even if attribute missing
+            logger.info(
+                f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}"
+            )
 
         # Create a new request
         if (
