@@ -141,6 +141,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
 
+    def _is_last_pp_stage(self) -> bool:
+        try:
+            if getattr(self, 'pp_group', None) is not None:
+                return bool(self.pp_group.is_last_rank)
+            # 环境变量兜底，防跨机器通信组差异导致逻辑失效
+            pp_rank = int(os.environ.get("SGLANG_PP_RANK", 0))
+            pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))
+            return pp_rank == pp_size - 1
+        except Exception:
+            return False
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """
         Semi-PD changes:
@@ -157,11 +168,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if batch.forward_mode is not None and batch.forward_mode.is_extend():
             # In Semi-PD + PP, last PP stage's DECODE instance must NOT
             # build decode indices for the first turn (it only forwards tokens).
-            if (
-                getattr(self.server_args, 'enable_semi_pd', False)
-                and self.pp_group is not None
-                and self.pp_group.is_last_rank
-            ):
+            if getattr(self.server_args, 'enable_semi_pd', False) and self._is_last_pp_stage():
                 # Wait until event_loop_pp consumes pending tokens without
                 # performing any local decode allocations.
                 if len(getattr(self, "_pending_token_ids", [])) > 0:
@@ -233,12 +240,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Semi-PD + PP (last stage): skip local decode allocations when only
         # relaying tokens to PP0. This avoids FlashInfer decode index build
         # under the single-step assumption and prevents out-of-bounds writes.
-        if (
-            getattr(self.server_args, 'enable_semi_pd', False)
-            and self.pp_group is not None
-            and self.pp_group.is_last_rank
-            and len(getattr(self, "_pending_token_ids", [])) > 0
-        ):
+        if getattr(self.server_args, 'enable_semi_pd', False) and self._is_last_pp_stage() and len(getattr(self, "_pending_token_ids", [])) > 0:
             return batch
 
         batch.prepare_for_decode()
@@ -248,11 +250,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Fast-path: In Semi-PD + PP, the last PP stage's DECODE instance only
         # relays tokens to PP0 after PREFILL. Bypass update_running_batch to avoid
         # calling prepare_for_decode (which allocates decode slots/indices).
-        if (
-            getattr(self.server_args, 'enable_semi_pd', False)
-            and self.pp_group is not None
-            and self.pp_group.is_last_rank
-        ):
+        if getattr(self.server_args, 'enable_semi_pd', False) and self._is_last_pp_stage():
             # If there is a ready decode batch prepared from PREFILL results
             # and our running slot is empty, pick it up directly.
             if self.running_batch.is_empty() and getattr(self, "_ready_decode_batches", None):
@@ -608,11 +606,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 self.running_batch = self._ready_decode_batches.popleft()
 
         # Integrate the fast-path here (this method overrides any earlier defs).
-        if (
-            getattr(self.server_args, 'enable_semi_pd', False)
-            and self.pp_group is not None
-            and self.pp_group.is_last_rank
-        ):
+        if getattr(self.server_args, 'enable_semi_pd', False) and self._is_last_pp_stage():
             if self.running_batch.is_empty() and getattr(self, "_ready_decode_batches", None):
                 if len(self._ready_decode_batches) > 0:
                     self.running_batch = self._ready_decode_batches.popleft()
