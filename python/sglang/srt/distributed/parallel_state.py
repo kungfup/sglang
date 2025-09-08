@@ -903,6 +903,18 @@ class GroupCoordinator:
             # Ensure contiguous layout to avoid implicit copies in c10d
             tensor = tensor.contiguous()
 
+            # Semi-PD + PP safety: explicitly synchronize the device stream
+            # before issuing P2P sends to avoid stale reads on NCCL when
+            # TORCH_NCCL_AVOID_RECORD_STREAMS is set and streams aren't recorded.
+            try:
+                if (
+                    self.device.type == "cuda"
+                    and os.getenv("SGLANG_ENABLE_SEMI_PD", "").lower() in ("1", "true")
+                ):
+                    torch.cuda.synchronize(self.device)
+            except Exception:
+                pass
+
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
                 torch.distributed.send(
@@ -963,6 +975,21 @@ class GroupCoordinator:
                 if use_all_gather:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    # Ensure the receive buffer is contiguous. Receiving into
+                    # a non-contiguous view can trigger illegal memory access
+                    # in NCCL/c10d when using DMA writes.
+                    tensor = tensor.contiguous()
+
+                # Semi-PD + PP safety: synchronize before recv to surface any
+                # prior kernel errors and ensure stream order.
+                try:
+                    if (
+                        self.device.type == "cuda"
+                        and os.getenv("SGLANG_ENABLE_SEMI_PD", "").lower() in ("1", "true")
+                    ):
+                        torch.cuda.synchronize(self.device)
+                except Exception:
+                    pass
 
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
