@@ -155,6 +155,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # If this micro-batch is still in EXTEND (first pass on non-first PP stage),
         # keep it as EXTEND until one pass completes, then switch to DECODE.
         if batch.forward_mode is not None and batch.forward_mode.is_extend():
+            # In Semi-PD + PP, last PP stage's DECODE instance must NOT
+            # build decode indices for the first turn (it only forwards tokens).
+            if (
+                getattr(self.server_args, 'enable_semi_pd', False)
+                and self.pp_group is not None
+                and self.pp_group.is_last_rank
+            ):
+                # Wait until event_loop_pp consumes pending tokens without
+                # performing any local decode allocations.
+                if len(getattr(self, "_pending_token_ids", [])) > 0:
+                    return batch
             if not getattr(batch, "first_extend_done", False):
                 return batch
             # EXTEND finished once; now switch to DECODE
@@ -219,10 +230,48 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             batch.batch_is_full = False
 
         # Update batch tensors (now it's safe to run decode)
+        # Semi-PD + PP (last stage): skip local decode allocations when only
+        # relaying tokens to PP0. This avoids FlashInfer decode index build
+        # under the single-step assumption and prevents out-of-bounds writes.
+        if (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and self.pp_group is not None
+            and self.pp_group.is_last_rank
+            and len(getattr(self, "_pending_token_ids", [])) > 0
+        ):
+            return batch
+
         batch.prepare_for_decode()
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Fast-path: In Semi-PD + PP, the last PP stage's DECODE instance only
+        # relays tokens to PP0 after PREFILL. Bypass update_running_batch to avoid
+        # calling prepare_for_decode (which allocates decode slots/indices).
+        if (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and self.pp_group is not None
+            and self.pp_group.is_last_rank
+        ):
+            # If there is a ready decode batch prepared from PREFILL results
+            # and our running slot is empty, pick it up directly.
+            if self.running_batch.is_empty() and getattr(self, "_ready_decode_batches", None):
+                if len(self._ready_decode_batches) > 0:
+                    self.running_batch = self._ready_decode_batches.popleft()
+                    ret = self.running_batch
+                    if self.server_args.enable_dp_attention:
+                        ret, _ = self.prepare_dp_attn_batch(ret)
+                    return ret
+            # If we already have a running batch and pending tokens to relay,
+            # return it as-is to let run_batch() construct a GenerationBatchResult
+            # without touching decode kernels.
+            if not self.running_batch.is_empty() and len(getattr(self, "_pending_token_ids", [])) > 0:
+                ret = self.running_batch
+                if self.server_args.enable_dp_attention:
+                    ret, _ = self.prepare_dp_attn_batch(ret)
+                return ret
+
+        # Default behavior
         if not self.running_batch.is_empty():
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
@@ -557,6 +606,27 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
             if len(self._ready_decode_batches) > 0:
                 self.running_batch = self._ready_decode_batches.popleft()
+
+        # Integrate the fast-path here (this method overrides any earlier defs).
+        if (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and self.pp_group is not None
+            and self.pp_group.is_last_rank
+        ):
+            if self.running_batch.is_empty() and getattr(self, "_ready_decode_batches", None):
+                if len(self._ready_decode_batches) > 0:
+                    self.running_batch = self._ready_decode_batches.popleft()
+                    ret = self.running_batch
+                    if self.server_args.enable_dp_attention:
+                        ret, _ = self.prepare_dp_attn_batch(ret)
+                    return ret
+            if not self.running_batch.is_empty() and len(getattr(self, "_pending_token_ids", [])) > 0:
+                ret = self.running_batch
+                if self.server_args.enable_dp_attention:
+                    ret, _ = self.prepare_dp_attn_batch(ret)
+                return ret
+
+        # Default behavior: delegate to superclass logic
         return super().get_next_batch_to_run()
 
     def recv_requests(self):
