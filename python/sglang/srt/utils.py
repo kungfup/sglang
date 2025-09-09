@@ -139,6 +139,67 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
+# ===============
+# Semi-PD logging helpers (rate-limited)
+# ===============
+_semi_pd_log_times: Dict[str, float] = {}
+_semi_pd_log_counts: Dict[str, int] = {}
+
+_SEMI_PD_LOG_ENABLED = os.getenv("SEMI_PD_LOG", "1").lower() in ("1", "true", "yes")
+_SEMI_PD_DEFAULT_INTERVAL_MS = int(os.getenv("SEMI_PD_LOG_INTERVAL_MS", "1000") or 1000)
+_SEMI_PD_DEFAULT_EVERY_N = int(os.getenv("SEMI_PD_LOG_EVERY_N", "100") or 100)
+
+
+def semi_pd_log_info_throttle(
+    logger: logging.Logger,
+    key: str,
+    msg: str,
+    interval_ms: Optional[int] = None,
+):
+    """Log at INFO level no more than once per interval per key.
+
+    Args:
+        logger: Python logger instance
+        key: unique key to rate-limit on (e.g., f"P2D.req.pp{pp_rank}")
+        msg: message to log
+        interval_ms: minimum interval between logs with the same key
+    """
+    try:
+        if not _SEMI_PD_LOG_ENABLED:
+            return
+        now = time.perf_counter()
+        ms = float(interval_ms if interval_ms is not None else _SEMI_PD_DEFAULT_INTERVAL_MS)
+        last = _semi_pd_log_times.get(key, 0.0)
+        if last == 0.0 or (now - last) * 1000.0 >= ms:
+            _semi_pd_log_times[key] = now
+            logger.info(msg)
+    except Exception:
+        # Fallback silently, do not disrupt the hot path
+        logger.info(msg)
+
+
+def semi_pd_log_every(
+    logger: logging.Logger, key: str, msg: str, every_n: Optional[int] = None
+):
+    """Log at INFO level for every N occurrences of a given key.
+
+    Args:
+        logger: Python logger instance
+        key: unique key to count on
+        msg: message to log
+        every_n: log every N-th occurrence
+    """
+    try:
+        if not _SEMI_PD_LOG_ENABLED:
+            return
+        n = int(every_n if every_n is not None else _SEMI_PD_DEFAULT_EVERY_N)
+        cnt = _semi_pd_log_counts.get(key, 0) + 1
+        _semi_pd_log_counts[key] = cnt
+        if cnt % n == 0:
+            logger.info(msg)
+    except Exception:
+        logger.info(msg)
+
 
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda

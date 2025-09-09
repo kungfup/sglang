@@ -268,7 +268,18 @@ class TpModelWorker:
                 )
             )
 
-        if self.pp_group.is_last_rank:
+        # Determine if this stage should produce next_token_ids.
+        is_last_stage = self.pp_group.is_last_rank
+        try:
+            import os
+            env_pp_rank = int(os.environ.get("SGLANG_PP_RANK", -1))
+            env_pp_size = int(os.environ.get("SGLANG_PP_SIZE", -1))
+            if env_pp_rank >= 0 and env_pp_size > 0 and env_pp_rank == env_pp_size - 1:
+                is_last_stage = True
+        except Exception:
+            pass
+
+        if is_last_stage:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )

@@ -997,12 +997,30 @@ class Scheduler(
 
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
+                    try:
+                        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+                            fm = getattr(self.cur_batch, 'forward_mode', None)
+                            logger.info(f"[PREFILL-PP{self.pp_rank}] batch ready mode={getattr(fm,'name',fm)}")
+                    except Exception:
+                        pass
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
+                    # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
+                    if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+                        try:
+                            self.process_batch_result(self.cur_batch, result)
+                        except Exception:
+                            logger.exception("[SEMI_PD_PP] PREFILL handoff failed; continue loop")
 
                 # (last rank) send the outputs to the next step
-                # Semi-PD: PREFILL实例不负责跨stage回送token，交由DECODE实例通过控制面/NCCL处理
-                if self.pp_group is not None and self.pp_group.is_last_rank:
+                # Semi-PD: Only DECODE instance is responsible for cross-stage token send.
+                # PREFILL instance does not send tokens across stages; it hands off
+                # tokens to same-stage DECODE via IPC, and DECODE performs the PP send.
+                if (
+                    self.pp_group is not None
+                    and self.pp_group.is_last_rank
+                    and getattr(self, "instance_role", None) == InstanceRole.DECODE
+                ):
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
@@ -1926,7 +1944,17 @@ class Scheduler(
                 self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
-            if self.pp_group.is_last_rank:
+            # Semi-PD(PREFILL): some environments misreport pp_group.is_last_rank; trust env/pp_rank
+            last_rank_for_tokens = self.pp_group.is_last_rank or (
+                getattr(self.server_args, 'enable_semi_pd', False)
+                and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                and (
+                    getattr(self, 'pp_rank', None) is not None and getattr(self, 'pp_size', None) is not None
+                    and self.pp_rank == self.pp_size - 1
+                )
+            )
+
+            if last_rank_for_tokens:
                 batch.output_ids = next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
@@ -1943,7 +1971,7 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            if self.pp_group.is_last_rank:
+            if last_rank_for_tokens:
                 logits_output_result = logits_output
                 next_token_ids_result = next_token_ids
                 hidden_states_result = None
