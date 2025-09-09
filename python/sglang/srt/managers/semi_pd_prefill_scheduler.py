@@ -124,19 +124,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     f"[PREFILL-PP{pp_rank}] Failed to set RCVTIMEO on bridge socket; will block on recv_pyobj()"
                 )
             logger.debug(f"🔧 [PREFILL-PP{pp_rank}] IPC连接已建立: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge={port_args.bridge_ipc_name}")
-            # 可选：为直连PP0 DECODE准备常驻socket（仅当提供了环境变量且当前非PP0）
-            self.send_to_pp0_d_instance = None
-            try:
-                pp0_ipc = os.environ.get("SGLANG_PP0_D_SCHEDULER_IPC")
-                if pp0_ipc and pp_rank != 0:
-                    self.send_to_pp0_d_instance = get_zmq_socket(
-                        context, zmq.PUSH, pp0_ipc, False
-                    )
-                    logger.info(
-                        f"🔧 [PREFILL-PP{pp_rank}] 建立到PP0 DECODE的直连IPC: {pp0_ipc}"
-                    )
-            except Exception as e:
-                logger.warning(f"⚠️ [PREFILL-PP{pp_rank}] 建立PP0直连IPC失败: {e}")
+            # 移除未使用的直连PP0通道（SGLANG_PP0_D_SCHEDULER_IPC）
         else:
             # 🔑 关键修复：非主TP rank也需要IPC连接（在PP模式下）
             # 但只有在PP模式下才这样做，避免影响纯TP模式
@@ -388,11 +376,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 self._awaiting_auth = True
                 self._last_candidates_ts = now
                 self._last_candidates = candidates
-                semi_pd_log_every(
-                    logger,
-                    key=f"pp{self.pp_rank}.p2d.wait",
-                    msg=f"[PREFILL-PP{self.pp_rank}] waiting for D reply on bridge...",
-                )
             # Blocking recv with socket-level RCVTIMEO; simpler and more robust than NOBLOCK loop
             resp = None
             try:
@@ -403,13 +386,6 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             except Exception:
                 resp = None
             if isinstance(resp, GetNextPrefillBatchOutput):
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{self.pp_rank}.p2d.resp",
-                    msg=(
-                        f"[PREFILL-PP{self.pp_rank}] ←D GetNextPrefillBatchOutput: #rids={len(resp.rids)}"
-                    ),
-                )
                 self._awaiting_auth = False
             else:
                 # No authorization; skip this round

@@ -437,14 +437,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         - If no capacity or no matching requests are available, send an empty
           authorization to let PREFILL clear its awaiting flag and retry later.
         """
-        semi_pd_log_info_throttle(
-            logger,
-            key=f"pp{self.pp_rank}.p2d.gnp.recv",
-            msg=(
-                f"[DECODE-PP{self.pp_rank}] ←P GetNextPrefillBatchInput: "
-                f"#candidates={len(recv_req.rids)}"
-            ),
-        )
+        # quiet
 
         # Release unfinished chunk if any, mirroring semipd_nopp behavior
         if self.chunked_req:
@@ -464,13 +457,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
                 )
                 self.bridge_socket.send_pyobj(empty)
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{self.pp_rank}.p2d.gnp.send",
-                    msg=(
-                        f"[DECODE-PP{self.pp_rank}] →P GetNextPrefillBatchOutput: #rids=0"
-                    ),
-                )
             else:
                 approved_rids = [r.rid for r in batch.reqs]
                 req_pool_indices = [r.req_pool_idx for r in batch.reqs]
@@ -485,13 +471,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     extend_input_lens=extend_input_lens,
                 )
                 self.bridge_socket.send_pyobj(msg)
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{self.pp_rank}.p2d.gnp.send",
-                    msg=(
-                        f"[DECODE-PP{self.pp_rank}] →P GetNextPrefillBatchOutput: #rids={len(approved_rids)}"
-                    ),
-                )
         except Exception:
             # Fall back silently; PREFILL will retry via resend logic.
             pass
@@ -718,7 +697,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         except Exception:
                             pass
                 if fwd_ct:
-                    logger.info(f"[DECODE-PP{self.pp_rank}] fwd→P generate: {fwd_ct}")
+                    pass
         except Exception:
             pass
         if getattr(self, 'recv_from_p_instance', None) is not None and self.attn_tp_rank == 0:

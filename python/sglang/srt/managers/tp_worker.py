@@ -118,7 +118,6 @@ class TpModelWorker:
                 )
         self.device = self.model_runner.device
         # 预取隐藏态缓存队列：当scheduler误收到隐藏态时存放于此，供下一次forward消费
-        self._prefetched_pp_hidden_q: deque[dict] = deque()
 
         # Init nccl groups
         self.pp_group = get_pp_group()
@@ -176,7 +175,7 @@ class TpModelWorker:
 
     def enqueue_prefetched_pp_hidden(self, tensors: Optional[dict]):
         if tensors is not None:
-            self._prefetched_pp_hidden_q.append(tensors)
+            pass
 
     def set_prefetched_pp_token(self, tensors: Optional[dict]):
         self._prefetched_pp_token = tensors

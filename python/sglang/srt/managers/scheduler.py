@@ -271,10 +271,6 @@ class Scheduler(
         self.instance_role = instance_role
         if self.server_args.enable_semi_pd:
             logger.info(f"[SCHEDULER] Semi-PD模式: 实例角色 {instance_role}")
-            # 原始的 Semi-PD 实现中没有权重共享 IPC，使用内存共享
-            self.weight_share_socket = None
-        else:
-            self.weight_share_socket = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             logger.info(f"[SCHEDULER] 当前进程是PP rank 0且注意力TP rank 0，初始化通信socket")
@@ -826,74 +822,6 @@ class Scheduler(
     def share_params_from_ipc(self, ipc_info: IPCInfo):
         self.tp_worker.share_params_from_ipc(ipc_info)
 
-    def setup_weight_sharing_for_prefill(self):
-        """Semi-PD Pipeline Parallel: PREFILL进程通过IPC获取DECODE进程的权重"""
-        if (self.server_args.enable_semi_pd and 
-            self.instance_role == InstanceRole.PREFILL and 
-            self.weight_share_socket is not None):
-            
-            try:
-                # 请求权重共享
-                logger.info(f"[PREFILL-PP{self.pp_rank}] Requesting weight sharing from DECODE process...")
-                self.weight_share_socket.send_pyobj({"type": "request_weights"})
-                
-                # 等待权重共享响应
-                response = self.weight_share_socket.recv_pyobj()
-                if response.get("success"):
-                    logger.info(f"[PREFILL-PP{self.pp_rank}] Weight sharing successful, received {response.get('weight_count', 0)} weights")
-                    # 通知tp_worker权重已共享
-                    self.tp_worker.notify_weights_shared()
-                else:
-                    logger.error(f"[PREFILL-PP{self.pp_rank}] Weight sharing failed: {response.get('error', 'Unknown error')}")
-                    raise RuntimeError("Weight sharing failed")
-                    
-            except Exception as e:
-                logger.error(f"[PREFILL-PP{self.pp_rank}] Weight sharing error: {e}")
-                raise RuntimeError(f"Failed to setup weight sharing: {e}")
-
-    def setup_weight_sharing_server_for_decode(self):
-        """Semi-PD Pipeline Parallel: DECODE进程启动权重共享服务器"""
-        if (self.server_args.enable_semi_pd and 
-            self.instance_role == InstanceRole.DECODE):
-            
-            # 启动权重共享服务器线程
-            import threading
-            self.weight_share_server_thread = threading.Thread(
-                target=self._weight_share_server_loop,
-                daemon=True
-            )
-            self.weight_share_server_thread.start()
-            logger.info(f"[DECODE-PP{self.pp_rank}] Weight sharing server started")
-
-    def _weight_share_server_loop(self):
-        """权重共享服务器循环"""
-        if not hasattr(self, 'weight_share_socket') or self.weight_share_socket is None:
-            return
-            
-        try:
-            while True:
-                # 等待PREFILL进程的权重共享请求
-                request = self.weight_share_socket.recv_pyobj()
-                if request.get("type") == "request_weights":
-                    # 共享权重给PREFILL进程
-                    try:
-                        # 通过IPC共享权重 - 获取完整的IPC信息
-                        ipc_info = self.tp_worker.get_ipc_info()
-                        self.tp_worker.share_params_from_ipc(ipc_info)
-                        
-                        # 发送成功响应
-                        response = {"success": True, "weight_count": 1}
-                        self.weight_share_socket.send_pyobj(response)
-                        logger.info(f"[DECODE-PP{self.pp_rank}] Weights shared successfully with PREFILL process")
-                        
-                    except Exception as e:
-                        # 发送失败响应
-                        response = {"success": False, "error": str(e)}
-                        self.weight_share_socket.send_pyobj(response)
-                        logger.error(f"[DECODE-PP{self.pp_rank}] Weight sharing failed: {e}")
-                        
-        except Exception as e:
-            logger.error(f"[DECODE-PP{self.pp_rank}] Weight sharing server error: {e}")
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -965,16 +893,7 @@ class Scheduler(
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism with Semi-PD support."""
         
-        # Semi-PD Pipeline Parallel: 初始化权重共享
-        if self.server_args.enable_semi_pd:
-            if self.instance_role == InstanceRole.DECODE:
-                # DECODE进程启动权重共享服务器
-                self.setup_weight_sharing_server_for_decode()
-                logger.info(f"[DECODE-PP{self.pp_rank}] Pipeline parallel loop started with weight sharing server")
-            elif self.instance_role == InstanceRole.PREFILL:
-                # PREFILL进程等待权重共享
-                self.setup_weight_sharing_for_prefill()
-                logger.info(f"[PREFILL-PP{self.pp_rank}] Pipeline parallel loop started with shared weights")
+        # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
         
         mbs = [None] * self.pp_size
         last_mbs = [None] * self.pp_size
@@ -997,12 +916,7 @@ class Scheduler(
 
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
-                    try:
-                        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-                            fm = getattr(self.cur_batch, 'forward_mode', None)
-                            logger.info(f"[PREFILL-PP{self.pp_rank}] batch ready mode={getattr(fm,'name',fm)}")
-                    except Exception:
-                        pass
+                    
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
                     # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
@@ -2866,8 +2780,7 @@ class Scheduler(
             "pp_size": self.pp_size,
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
-            "weight_shared": hasattr(self, 'weight_share_socket') and self.weight_share_socket is not None,
-            "weight_server_running": hasattr(self, 'weight_share_server_thread') and self.weight_share_server_thread.is_alive()
+            
         }
         return status
 

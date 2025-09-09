@@ -75,16 +75,7 @@ class SchedulerOutputProcessorMixin:
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
-                # Semi-PD + PP：仅当本实例需要真正产生token时才处理next_token_ids
-                if getattr(self.server_args, 'enable_semi_pd', False) and hasattr(self, 'instance_role'):
-                    import os
-                    pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))
-                    if pp_size > 1 and self.instance_role == InstanceRole.PREFILL:
-                        pp_rank = int(os.environ.get("SGLANG_PP_RANK", 0))
-                        # 非最后PP stage的PREFILL不应生成token，直接返回，由原生PP事件循环负责跨stage传递隐藏态
-                        if pp_rank != pp_size - 1:
-                            return
-                # 其他情况（最后一段PREFILL或DECODE/非PP），按常规处理
+                # 常规处理
                 if next_token_ids is not None and not isinstance(next_token_ids, list):
                     next_token_ids = next_token_ids.tolist()
                 
