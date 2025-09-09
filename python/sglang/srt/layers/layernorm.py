@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.two_batch_overlap import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -28,6 +29,13 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+try:
+    from sgl_kernel.utils import is_hopper_arch
+except ImportError:
+    is_hopper_arch = lambda: False
+
+import os
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -78,13 +86,40 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        _dbg = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+        if _dbg:
+            print(f"[TBO][rmsnorm] forward_cuda enter: x.shape={tuple(x.shape)}, x.dtype={x.dtype}, device={x.device}, residual={'Y' if residual is not None else 'N'}", flush=True)
+        
+        # 移除过于宽泛的 TBO context 检测，只在确实需要时才使用 forward_native
         if self.variance_size_override is not None:
+            if _dbg:
+                print("[TBO][rmsnorm] using forward_native due to variance_size_override", flush=True)
             return self.forward_native(x, residual)
-        if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        
+        # 对于 Hopper 架构或常规路径，尝试使用融合核；若失败则回退到 native
+        try:
+            if residual is not None:
+                if _dbg:
+                    print("[TBO][rmsnorm] calling fused_add_rmsnorm", flush=True)
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                if _dbg:
+                    print("[TBO][rmsnorm] fused_add_rmsnorm done", flush=True)
+                return x, residual
+            if _dbg:
+                print("[TBO][rmsnorm] calling rmsnorm", flush=True)
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if _dbg:
+                print("[TBO][rmsnorm] rmsnorm done", flush=True)
+            return out
+        except RuntimeError as e:
+            # 某些形状（例如很小的 batch 维度）可能导致 CUDA kernel 配置非法，回退到 native
+            if _is_cuda:
+                logger.warning(
+                    f"RMSNorm fused kernel failed: {e}. Falling back to native implementation."
+                )
+                if _dbg:
+                    print(f"[TBO][rmsnorm] fused kernel failed: {e}, using forward_native", flush=True)
+            return self.forward_native(x, residual)
 
     def forward_npu(
         self,
@@ -137,10 +172,16 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        _dbg = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+        if _dbg:
+            print(f"[TBO][rmsnorm] forward_native enter: x.shape={tuple(x.shape)}, x.dtype={x.dtype}, device={x.device}, residual={'Y' if residual is not None else 'N'}", flush=True)
+        
         if not x.is_contiguous():
             x = x.contiguous()
+        
         orig_dtype = x.dtype
         x = x.to(torch.float32)
+        
         if residual is not None:
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
@@ -163,9 +204,17 @@ class RMSNorm(CustomOp):
 
             x_var = x[..., : self.variance_size_override]
 
+        if _dbg:
+            print(f"[TBO][rmsnorm] computing variance, x_var.shape={x_var.shape}", flush=True)
+        
+        # 简化 variance 计算，使用更直接的方式
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
+        
+        if _dbg:
+            print("[TBO][rmsnorm] forward_native exit", flush=True)
+        
         if residual is None:
             return x
         else:

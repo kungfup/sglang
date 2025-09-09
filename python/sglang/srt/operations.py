@@ -116,6 +116,30 @@ class _StageExecutor:
             if (_HAS_CUDA and _ENABLE_SEPARATE_COMM_STREAM)
             else None
         )
+        
+        # 设置micro-batch ID用于精细化事件控制
+        # debug_name是"a"或"b"，对应micro-batch 1和2
+        if debug_name == "a":
+            self._batch_id = "b1"
+        elif debug_name == "b":
+            self._batch_id = "b2"
+        else:
+            self._batch_id = "b1"  # 默认值
+        
+        # 在state中设置batch ID，供TBO操作使用
+        self._stage_state._data['_tbo_batch_id'] = self._batch_id
+
+        # 将初始 inputs 中的关键字段预置到 state，避免第一阶段缺少 kwargs 时无法取到
+        try:
+            if isinstance(self._stage_output, dict):
+                for key in ("positions", "forward_batch", "tbo_subbatch_index"):
+                    if key in self._stage_output and self._stage_output[key] is not None:
+                        # 使用 __setitem__ 以符合 _StateDict 的一致语义
+                        if key not in self._stage_state:
+                            self._stage_state[key] = self._stage_output[key]
+        except Exception:
+            # 预置失败不应影响后续流程
+            pass
 
     def _record_event_on_current(self, event: torch.cuda.Event):
         if _HAS_CUDA and event is not None:
@@ -223,6 +247,16 @@ class _StateDict:
     def __delattr__(self, item):
         del self._data[item]
 
+    # Added to support state['key'] = value and state['key'] access
+    def __setitem__(self, key, value):
+        assert (
+            key not in self._data
+        ), f"`{key}` already exist, are you sure you want to override it?"
+        self._data[key] = value
+
+    def __getitem__(self, item):
+        return self._data[item]
+
     def pop(self, item):
         return self._data.pop(item)
 
@@ -232,6 +266,18 @@ class _StateDict:
 
     def get(self, item):
         return self._data.get(item)
+
+    # Added to support `'key' in state` membership checks safely
+    def __contains__(self, item):
+        return item in self._data
+
+    # Added for safer introspection when needed
+    def keys(self):
+        return self._data.keys()
+
+    # Added to avoid "not iterable" fallbacks in Python membership semantics
+    def __iter__(self):
+        return iter(self._data)
 
     def clear(self, expect_keys: Sequence[str]):
         if set(self._data.keys()) != set(expect_keys):

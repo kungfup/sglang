@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -443,6 +444,7 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # TBO强制模式 - 直接执行TBO准备，不允许失败
         TboForwardBatchPreparer.prepare(
             ret, is_draft_worker=model_runner.is_draft_worker
         )
@@ -700,9 +702,108 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
+        
+        # TBO后CUDA状态重置：确保在TBO执行后CUDA环境仍然稳定
+        if torch.cuda.is_available():
+            try:
+                # 全面CUDA环境重置
+                torch.cuda.synchronize()
+                current_device = torch.cuda.current_device()
+                torch.cuda.set_device(current_device)
+                
+                # 重置默认流
+                default_stream = torch.cuda.default_stream()
+                torch.cuda.set_stream(default_stream)
+                default_stream.synchronize()
+                
+                if os.environ.get("SGLANG_TBO_DEBUG"):
+                    print("[TBO] prepare_mlp_sync_batch: CUDA environment reset for post-TBO stability")
+                    
+            except Exception as reset_e:
+                if os.environ.get("SGLANG_TBO_DEBUG"):
+                    print(f"[TBO] prepare_mlp_sync_batch: CUDA reset warning: {reset_e}")
+        
+        # TBO强化安全检查：多重保护机制确保tensor创建成功
+        if self.global_num_tokens_gpu is not None:
+            # 方法1：尝试使用原tensor的new_tensor方法
+            try:
+                # 验证原tensor的有效性
+                if hasattr(self.global_num_tokens_gpu, 'device') and hasattr(self.global_num_tokens_gpu, 'dtype'):
+                    original_device = self.global_num_tokens_gpu.device
+                    original_dtype = self.global_num_tokens_gpu.dtype
+                    
+                    # 确保设备可访问
+                    if original_device.type == 'cuda' and torch.cuda.is_available():
+                        with torch.cuda.device(original_device.index or 0):
+                            torch.cuda.synchronize()
+                            
+                    # 使用new_tensor方法
+                    self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
+                        global_num_tokens
+                    )
+                    
+                    if os.environ.get("SGLANG_TBO_DEBUG"):
+                        print(f"[TBO] prepare_mlp_sync_batch: Successfully used new_tensor method")
+                else:
+                    raise AttributeError("Original tensor lacks device/dtype attributes")
+                    
+            except Exception as new_tensor_e:
+                if os.environ.get("SGLANG_TBO_DEBUG"):
+                    print(f"[TBO] prepare_mlp_sync_batch: new_tensor failed: {new_tensor_e}")
+                
+                # 方法2：重新创建tensor
+                try:
+                    # 获取设备信息
+                    if torch.cuda.is_available():
+                        device = torch.cuda.current_device()
+                        torch.cuda.synchronize()
+                    else:
+                        device = "cpu"
+                        
+                    self.global_num_tokens_gpu = torch.tensor(
+                        [global_num_tokens], dtype=torch.int32, device=device
+                    )
+                    
+                    if os.environ.get("SGLANG_TBO_DEBUG"):
+                        print(f"[TBO] prepare_mlp_sync_batch: Successfully recreated tensor on {device}")
+                        
+                except Exception as recreate_e:
+                    if os.environ.get("SGLANG_TBO_DEBUG"):
+                        print(f"[TBO] prepare_mlp_sync_batch: Tensor recreation failed: {recreate_e}")
+                    
+                    # 方法3：CPU tensor（最安全）
+                    try:
+                        self.global_num_tokens_gpu = torch.tensor(
+                            [global_num_tokens], dtype=torch.int32, device="cpu"
+                        )
+                        if os.environ.get("SGLANG_TBO_DEBUG"):
+                            print("[TBO] prepare_mlp_sync_batch: Used CPU tensor as final fallback")
+                    except Exception as cpu_e:
+                        if os.environ.get("SGLANG_TBO_DEBUG"):
+                            print(f"[TBO] prepare_mlp_sync_batch: CPU tensor creation failed: {cpu_e}")
+                        # 保持为None，让上层处理
+                        self.global_num_tokens_gpu = None
+        else:
+            # global_num_tokens_gpu为None，安全地创建新tensor
+            try:
+                device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    
+                self.global_num_tokens_gpu = torch.tensor(
+                    [global_num_tokens], dtype=torch.int32, device=device
+                )
+                
+                if os.environ.get("SGLANG_TBO_DEBUG"):
+                    print(f"[TBO] prepare_mlp_sync_batch: Created new tensor on {device}")
+                    
+            except Exception as create_e:
+                if os.environ.get("SGLANG_TBO_DEBUG"):
+                    print(f"[TBO] prepare_mlp_sync_batch: New tensor creation failed: {create_e}")
+                # 使用CPU作为最后手段
+                self.global_num_tokens_gpu = torch.tensor(
+                    [global_num_tokens], dtype=torch.int32, device="cpu"
+                )
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

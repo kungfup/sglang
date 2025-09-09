@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
+import os
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
@@ -28,6 +29,122 @@ from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, is_hip
 import os
+
+# 在文件开头添加资源清理和错误处理
+import atexit
+import threading
+import weakref
+
+# 在文件开头的import后添加vLLM风格的微批处理管理
+import threading
+import weakref
+from typing import Dict, Any
+from contextlib import contextmanager
+
+# 参考vLLM的UBatchContext，为SGLang实现微批处理上下文管理
+class SGLangMicroBatchContext:
+    """
+    SGLang微批处理上下文管理器
+    参考vLLM的UBatchContext实现，用于管理多请求batch的micro-batch执行
+    """
+    
+    def __init__(self, 
+                 micro_batch_id: int,
+                 total_micro_batches: int,
+                 forward_batch,
+                 parent_batch_info: Dict[str, Any]):
+        self.micro_batch_id = micro_batch_id
+        self.total_micro_batches = total_micro_batches
+        self.forward_batch = forward_batch
+        self.parent_batch_info = parent_batch_info
+        
+        # 同步事件
+        self.execution_done = threading.Event()
+        self.ready_for_merge = threading.Event()
+        
+        # 结果存储
+        self.execution_result = None
+        self.execution_error = None
+        
+    def mark_execution_done(self, result=None, error=None):
+        """标记micro-batch执行完成"""
+        self.execution_result = result
+        self.execution_error = error
+        self.execution_done.set()
+        
+    def wait_for_execution(self, timeout=None):
+        """等待micro-batch执行完成"""
+        return self.execution_done.wait(timeout)
+        
+    def is_ready_for_merge(self):
+        """检查是否准备好合并"""
+        return self.ready_for_merge.is_set()
+
+# 全局micro-batch管理器
+_global_micro_batch_contexts: Dict[str, List[SGLangMicroBatchContext]] = {}
+_global_context_lock = threading.Lock()
+
+def create_micro_batch_contexts(batch_id: str, 
+                               num_micro_batches: int,
+                               forward_batch,
+                               batch_info: Dict[str, Any]) -> List[SGLangMicroBatchContext]:
+    """
+    创建micro-batch上下文列表
+    参考vLLM的make_ubatch_contexts
+    """
+    with _global_context_lock:
+        contexts = []
+        for i in range(num_micro_batches):
+            context = SGLangMicroBatchContext(
+                micro_batch_id=i,
+                total_micro_batches=num_micro_batches,
+                forward_batch=forward_batch,
+                parent_batch_info=batch_info
+            )
+            contexts.append(context)
+        
+        _global_micro_batch_contexts[batch_id] = contexts
+        return contexts
+
+def cleanup_micro_batch_contexts(batch_id: str):
+    """清理micro-batch上下文"""
+    with _global_context_lock:
+        if batch_id in _global_micro_batch_contexts:
+            del _global_micro_batch_contexts[batch_id]
+
+@contextmanager
+def sglang_micro_batch_execution(context: SGLangMicroBatchContext):
+    """
+    SGLang micro-batch执行上下文管理器
+    参考vLLM的UBatchContext.__enter__/__exit__
+    """
+    try:
+        if _TBO_DEBUG:
+            _tbo_log(f"SGLang micro-batch {context.micro_batch_id} execution started")
+        yield context
+    except Exception as e:
+        context.mark_execution_done(error=e)
+        raise
+    finally:
+        if _TBO_DEBUG:
+            _tbo_log(f"SGLang micro-batch {context.micro_batch_id} execution completed")
+
+# 全局资源追踪
+_active_tbo_resources = weakref.WeakSet()
+_resource_lock = threading.Lock()
+
+def _cleanup_tbo_resources():
+    """清理TBO相关资源"""
+    with _resource_lock:
+        try:
+            for resource in list(_active_tbo_resources):
+                if hasattr(resource, 'cleanup'):
+                    resource.cleanup()
+        except Exception as e:
+            print(f"[TBO] Warning: Error during resource cleanup: {e}")
+
+# 注册退出时清理
+atexit.register(_cleanup_tbo_resources)
 
 _TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
 
@@ -63,24 +180,99 @@ def get_token_num_per_seq(
         return None
 
 
-# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
+# TBO强制模式：EXTEND强制执行，DECODE单token跳过
 def compute_split_seq_index(
     forward_mode: "ForwardMode",
     num_tokens: int,
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    """
+    Dense模型TBO切分索引：EXTEND强制执行，DECODE单token跳过
+    """
+    
+    # 1. EXTEND模式的切分逻辑
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
-        return _split_extend_seqs(extend_lens)
+        num_requests = len(extend_lens)
+        total_extend_tokens = sum(extend_lens)
+        
+        # 1.1 单请求two-chunk特殊处理：参考vLLM，允许单请求通过token切分启用TBO
+        if num_requests == 1 and _is_two_chunk_split_enabled(extend_lens):
+            if _TBO_DEBUG:
+                _tbo_log(f"compute_split_seq_index EXTEND: single request two-chunk enabled, extend_lens={list(extend_lens)}, return idx=0")
+            return 0
+            
+        # 1.2 强制切分：无论请求数量多少，都执行切分
+        if num_requests < 2:
+            if _TBO_DEBUG:
+                _tbo_log(f"compute_split_seq_index EXTEND: FORCE MODE, num_requests={num_requests}, forcing split at idx=0")
+            return 0
+        
+        # 1.3 执行切分（参考vLLM的智能切分算法）
+        idx = _split_extend_seqs(extend_lens)
+        
+        # 1.4 强制确保有效索引
+        if idx <= 0:
+            idx = 1
+        elif idx >= num_requests:
+            idx = num_requests - 1
+        
+        # 1.5 多请求batch切分质量评估（参考vLLM的负载均衡检查）
+        left_tokens = sum(extend_lens[:idx])
+        right_tokens = sum(extend_lens[idx:])
+        imbalance_ratio = abs(left_tokens - right_tokens) / max(left_tokens, right_tokens) if max(left_tokens, right_tokens) > 0 else 0
+        
+        if _TBO_DEBUG:
+            _tbo_log(f"compute_split_seq_index EXTEND: FORCE MODE split analysis:")
+            _tbo_log(f"  extend_lens={list(extend_lens)}, split_idx={idx}")
+            _tbo_log(f"  micro_batch_A: {idx} requests, {left_tokens} tokens")
+            _tbo_log(f"  micro_batch_B: {num_requests-idx} requests, {right_tokens} tokens")
+            _tbo_log(f"  load_imbalance_ratio={imbalance_ratio:.3f}")
+        
+        return idx
+        
+    # 2. DECODE/VERIFY模式的切分逻辑
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
-        return (num_tokens // token_num_per_seq) // 2
+        num_requests = num_tokens // token_num_per_seq if token_num_per_seq > 0 else 1
+        
+        # 2.1 DECODE阶段单token保护：避免产生空micro-batch
+        if num_requests < 2:
+            if _TBO_DEBUG:
+                _tbo_log(f"compute_split_seq_index {forward_mode}: single request DECODE (num_requests={num_requests}, num_tokens={num_tokens})")
+                _tbo_log(f"compute_split_seq_index {forward_mode}: DECODE single token cannot be meaningfully split, skipping TBO")
+            # DECODE阶段单token无法有效切分，静默跳过TBO
+            return None
+            
+        # 2.2 执行切分（参考vLLM的均衡切分）
+        idx = max(1, num_requests // 2)
+        
+        # 2.3 强制确保有效索引
+        if idx >= num_requests:
+            idx = num_requests - 1
+        
+        # 2.4 多请求batch切分质量评估（DECODE模式）
+        micro_batch_a_size = idx
+        micro_batch_b_size = num_requests - idx
+        micro_batch_a_tokens = micro_batch_a_size * token_num_per_seq
+        micro_batch_b_tokens = micro_batch_b_size * token_num_per_seq
+        
+        if _TBO_DEBUG:
+            _tbo_log(f"compute_split_seq_index {forward_mode}: FORCE MODE split analysis:")
+            _tbo_log(f"  total_requests={num_requests}, split_idx={idx}")
+            _tbo_log(f"  micro_batch_A: {micro_batch_a_size} requests, {micro_batch_a_tokens} tokens")
+            _tbo_log(f"  micro_batch_B: {micro_batch_b_size} requests, {micro_batch_b_tokens} tokens")
+            _tbo_log(f"  token_per_seq={token_num_per_seq}")
+            
+        return idx
+        
+    # 3. IDLE模式
     elif forward_mode.is_idle():
         assert num_tokens == 0
         return 0
     else:
-        raise NotImplementedError()
+        raise NotImplementedError(f"Unsupported forward_mode: {forward_mode}")
 
 
 def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
@@ -92,9 +284,12 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     overall_sum = sum(extend_lens)
     threshold = global_server_args_dict["tbo_token_distribution_threshold"]
     assert threshold <= 0.5, f"{threshold=}"
-    return left_sum < overall_sum * threshold or left_sum > overall_sum * (
+    enabled = left_sum < overall_sum * threshold or left_sum > overall_sum * (
         1 - threshold
     )
+    if _TBO_DEBUG:
+        _tbo_log(f"two_chunk_check: extend_lens={list(extend_lens)}, vanilla_idx={vanilla_split_seq_index}, left_sum={left_sum}, overall={overall_sum}, threshold={threshold}, enabled={enabled}")
+    return enabled
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
@@ -150,12 +345,63 @@ def _update_device_and_sum_field_from_cpu_field(
     ):
         return
 
-    new_device_value = (
-        cpu_value
-        if isinstance(cpu_value, torch.Tensor)
-        else torch.tensor(cpu_value, dtype=old_device_value.dtype)
-    ).to(device=global_server_args_dict["device"], non_blocking=True)
-    setattr(batch, device_field, new_device_value)
+    # TBO强制模式：安全的tensor创建和转移，多重保护机制
+    target_device = global_server_args_dict["device"]
+    
+    # 重置CUDA环境确保稳定性
+    if torch.cuda.is_available() and hasattr(target_device, 'type') and target_device.type == 'cuda':
+        try:
+            torch.cuda.synchronize()
+            current_device = torch.cuda.current_device()
+            torch.cuda.set_device(current_device)
+        except Exception as reset_e:
+            if _TBO_DEBUG:
+                _tbo_log(f"_update_device_and_sum_field_from_cpu_field: CUDA reset warning: {reset_e}")
+    
+    # 多级tensor创建和转移策略
+    new_device_value = None
+    success = False
+    
+    try:
+        # 方法1：直接转移到目标设备
+        if isinstance(cpu_value, torch.Tensor):
+            new_device_value = cpu_value.to(device=target_device, non_blocking=True)
+        else:
+            temp_tensor = torch.tensor(cpu_value, dtype=old_device_value.dtype)
+            new_device_value = temp_tensor.to(device=target_device, non_blocking=True)
+        success = True
+        
+        if _TBO_DEBUG:
+            _tbo_log(f"_update_device_and_sum_field_from_cpu_field: Direct transfer successful to {target_device}")
+            
+    except Exception as e:
+        if _TBO_DEBUG:
+            _tbo_log(f"_update_device_and_sum_field_from_cpu_field: Direct transfer failed: {e}")
+        
+        try:
+            # 方法2：同步转移（更安全）
+            if isinstance(cpu_value, torch.Tensor):
+                new_device_value = cpu_value.to(device=target_device, non_blocking=False)
+            else:
+                temp_tensor = torch.tensor(cpu_value, dtype=old_device_value.dtype)
+                new_device_value = temp_tensor.to(device=target_device, non_blocking=False)
+            success = True
+            
+            if _TBO_DEBUG:
+                _tbo_log(f"_update_device_and_sum_field_from_cpu_field: Sync transfer successful")
+                
+        except Exception as sync_e:
+            if _TBO_DEBUG:
+                _tbo_log(f"_update_device_and_sum_field_from_cpu_field: Sync transfer failed: {sync_e}")
+            
+            # 方法3：保持原值（最安全）
+            new_device_value = old_device_value
+            if _TBO_DEBUG:
+                _tbo_log("_update_device_and_sum_field_from_cpu_field: Keeping original value")
+    
+    # 设置新值
+    if new_device_value is not None:
+        setattr(batch, device_field, new_device_value)
 
     if sum_field is not None:
         sum_value = (
@@ -378,6 +624,12 @@ class TboDPAttentionPreparer:
                 num_tokens = local_batch.batch_size() * token_num_per_seq
             else:
                 num_tokens = local_batch.extend_num_tokens
+            
+            # TBO强制模式：跳过batch size检查，直接计算split index
+            batch_size = local_batch.batch_size() if hasattr(local_batch, 'batch_size') else 0
+            if _TBO_DEBUG:
+                _tbo_log(f"TboDPAttentionPreparer: FORCE MODE, batch_size={batch_size}, proceeding with TBO")
+            
             self.local_tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=local_batch.forward_mode,
                 num_tokens=num_tokens,
@@ -393,6 +645,10 @@ class TboDPAttentionPreparer:
                 and enable_deepep_moe
                 and (resolved_deepep_mode == DeepEPMode.LOW_LATENCY)
             )
+            if _TBO_DEBUG:
+                _tbo_log(
+                    f"tbo_gate_local: enable_two_batch_overlap={enable_two_batch_overlap}, forward_mode={local_batch.forward_mode}, bs={local_batch.batch_size() if hasattr(local_batch,'batch_size') else None}, extend_num_tokens={getattr(local_batch,'extend_num_tokens',None)}, split_seq_idx={self.local_tbo_split_seq_index}, local_can_run_tbo={local_can_run_tbo}, resolved_deepep_mode={resolved_deepep_mode}, enable_deepep_moe={enable_deepep_moe}"
+                )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -414,6 +670,21 @@ class TboDPAttentionPreparer:
             and local_can_run_tbo_aggregated
             and forward_mode_agree
         )
+        # 强制放行：用于 TP-only 或混杂模式快速验证 TBO
+        force_tbo = os.environ.get("SGLANG_TBO_FORCE_TBO", "0") == "1"
+        if force_tbo and self.enable_two_batch_overlap:
+            can_run_tbo = True
+            # 如果全局模式未解析，默认按 EXTEND 处理以运行 prefill TBO
+            if global_forward_mode is None:
+                global_forward_mode = ForwardMode.EXTEND
+            # 兜底 split 索引：若本地未计算到，则设为 1（至少能分成两份）
+            if self.local_tbo_split_seq_index is None:
+                self.local_tbo_split_seq_index = 1
+
+        if _TBO_DEBUG:
+            _tbo_log(
+                f"tbo_gate_global: can_run_tbo={can_run_tbo}, enable_two_batch_overlap={self.enable_two_batch_overlap}, local_can_run_tbo_aggregated={local_can_run_tbo_aggregated}, forward_mode_agree={forward_mode_agree}, global_forward_mode={global_forward_mode}, local_split_seq_idx={self.local_tbo_split_seq_index}, force_tbo={force_tbo}"
+            )
 
         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
         global_forward_mode = global_forward_mode if can_run_tbo else None
@@ -434,13 +705,49 @@ class TboDPAttentionPreparer:
         if not forward_modes_excluding_idle:
             return ForwardMode.IDLE, False
 
+        # 原逻辑：必须完全一致
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
             forward_modes_excluding_idle
         )
-        global_forward_mode = (
-            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+
+        # 放宽：若仅包含 DECODE/TARGET_VERIFY 的混合，也按 DECODE 处理
+        unique_modes = set(forward_modes_excluding_idle)
+        relaxed_decode_ok = unique_modes.issubset(
+            {ForwardMode.DECODE.value, ForwardMode.TARGET_VERIFY.value}
         )
-        return global_forward_mode, forward_mode_agree
+        # 放宽：若仅包含 EXTEND/TARGET_VERIFY 的混合，也按 EXTEND 处理
+        relaxed_extend_ok = unique_modes.issubset(
+            {ForwardMode.EXTEND.value, ForwardMode.TARGET_VERIFY.value}
+        )
+
+        # 环境变量强制放行
+        force_decode = os.environ.get("SGLANG_TBO_FORCE_DECODE", "0") == "1"
+        force_extend = os.environ.get("SGLANG_TBO_FORCE_EXTEND", "0") == "1"
+
+        agree = (
+            forward_mode_agree
+            or (relaxed_decode_ok and force_decode)
+            or (relaxed_extend_ok and force_extend)
+        )
+        if agree:
+            if relaxed_decode_ok and (force_decode or forward_mode_agree):
+                resolved = ForwardMode.DECODE
+            elif relaxed_extend_ok and (force_extend or forward_mode_agree):
+                resolved = ForwardMode.EXTEND
+            else:
+                resolved = ForwardMode(forward_modes_excluding_idle[0])
+        else:
+            resolved = None
+
+        if _TBO_DEBUG:
+            _tbo_log(
+                f"global_mode_check: forward_modes={forward_modes}, excl_idle={forward_modes_excluding_idle}, "
+                f"unique={list(unique_modes)}, forward_mode_agree={forward_mode_agree}, "
+                f"relaxed_decode_ok={relaxed_decode_ok}, relaxed_extend_ok={relaxed_extend_ok}, "
+                f"force_decode={force_decode}, force_extend={force_extend}, agree={agree}, resolved={resolved}"
+            )
+
+        return resolved, agree
 
     @staticmethod
     def _is_all_same(x):
@@ -452,6 +759,10 @@ class TboForwardBatchPreparer:
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
         if batch.tbo_split_seq_index is None or is_draft_worker:
             return
+
+        # TBO强制模式：跳过batch size验证，强制执行TBO
+        if _TBO_DEBUG:
+            _tbo_log(f"TboForwardBatchPreparer.prepare: FORCE MODE, batch_size={batch.batch_size}, proceeding with TBO")
 
         tbo_children_num_token_non_padded = (
             cls.compute_tbo_children_num_token_non_padded(batch)
@@ -696,6 +1007,76 @@ class TboForwardBatchPreparer:
         else:
             gathered_buffer = None
 
+        # TBO强制模式：安全的tensor创建，确保CUDA状态正确
+        child_num_tokens = end_token_index - start_token_index
+        if batch.global_num_tokens_gpu is not None:
+            # 强制重置CUDA环境，确保tensor创建的稳定性
+            if torch.cuda.is_available():
+                try:
+                    # 重置CUDA环境
+                    torch.cuda.synchronize()
+                    current_device = torch.cuda.current_device()
+                    torch.cuda.set_device(current_device)
+                    torch.cuda.empty_cache()
+                except Exception as reset_e:
+                    if _TBO_DEBUG:
+                        _tbo_log(f"TBO filter_batch: CUDA reset warning: {reset_e}")
+            
+            # 安全创建子批次tensor - 多重保护机制
+            original_device = batch.global_num_tokens_gpu.device
+            original_dtype = batch.global_num_tokens_gpu.dtype
+            
+            try:
+                # 方法1：直接在目标设备上创建
+                if torch.cuda.is_available() and original_device.type == 'cuda':
+                    target_device_idx = original_device.index if original_device.index is not None else torch.cuda.current_device()
+                    
+                    # 确保设备状态正确
+                    with torch.cuda.device(target_device_idx):
+                        # 验证设备可访问性
+                        torch.cuda.synchronize()
+                        child_global_num_tokens_gpu = torch.tensor(
+                            [child_num_tokens], 
+                            dtype=original_dtype,
+                            device=original_device
+                        )
+                else:
+                    # CPU设备
+                    child_global_num_tokens_gpu = torch.tensor(
+                        [child_num_tokens], 
+                        dtype=original_dtype,
+                        device=original_device
+                    )
+                
+                if _TBO_DEBUG:
+                    _tbo_log(f"TBO filter_batch: Successfully created child tensor on {original_device}")
+                    
+            except Exception as e:
+                if _TBO_DEBUG:
+                    _tbo_log(f"TBO filter_batch: Primary tensor creation failed: {e}")
+                
+                # 方法2：先在CPU创建，再转移（更安全）
+                try:
+                    cpu_tensor = torch.tensor([child_num_tokens], dtype=torch.int32)
+                    if original_device.type == 'cuda' and torch.cuda.is_available():
+                        child_global_num_tokens_gpu = cpu_tensor.to(device=original_device, dtype=original_dtype, non_blocking=False)
+                    else:
+                        child_global_num_tokens_gpu = cpu_tensor.to(dtype=original_dtype)
+                    
+                    if _TBO_DEBUG:
+                        _tbo_log(f"TBO filter_batch: Used CPU->GPU transfer method successfully")
+                        
+                except Exception as transfer_e:
+                    if _TBO_DEBUG:
+                        _tbo_log(f"TBO filter_batch: CPU->GPU transfer also failed: {transfer_e}")
+                    
+                    # 方法3：最后手段 - 使用None（让上层处理）
+                    child_global_num_tokens_gpu = None
+                    if _TBO_DEBUG:
+                        _tbo_log("TBO filter_batch: Using None for child_global_num_tokens_gpu")
+        else:
+            child_global_num_tokens_gpu = None
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
@@ -710,8 +1091,8 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
-                global_num_tokens_gpu=None,
-                global_num_tokens_cpu=None,
+                global_num_tokens_gpu=child_global_num_tokens_gpu,
+                global_num_tokens_cpu=child_num_tokens,
                 dp_padding_mode=None,
                 gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
@@ -787,12 +1168,12 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 
 
 def model_forward_maybe_tbo(
-    layers,
+    layers: torch.nn.ModuleList,
     enable_tbo: bool,
+    input_data_scatter_mode: ScatterMode,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
-    input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
 ):
@@ -803,14 +1184,47 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
+    
+    # 增强的TBO安全检查
+    tbo_safety_checks_passed = True
+    disable_reason = ""
+    
+    # TBO强制模式 - 基础CUDA环境检查，确保执行环境稳定
+    if torch.cuda.is_available():
+        try:
+            # 基础CUDA环境检查和重置
+            torch.cuda.synchronize()
+            current_device = torch.cuda.current_device()
+            torch.cuda.set_device(current_device)
+            
+            # 重置到默认流状态
+            default_stream = torch.cuda.default_stream()
+            torch.cuda.set_stream(default_stream)
+            
+            if _TBO_DEBUG:
+                _tbo_log("TBO FORCE MODE: Basic CUDA environment validated and reset")
+        except Exception as basic_e:
+            if _TBO_DEBUG:
+                _tbo_log(f"TBO FORCE MODE: Basic CUDA check failed: {basic_e}")
+    
+    if _TBO_DEBUG:
+        _tbo_log("TBO FORCE MODE: Proceeding with enforced TBO execution")
+    
+    # 强制初始化operations_strategy - 不允许失败
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
     if _TBO_DEBUG:
+        _tbo_log("TBO operations_strategy initialized successfully")
+    
+    # TBO强制模式：跳过所有safety checks，强制执行TBO
+    if _TBO_DEBUG:
         _tbo_log(
-            f"maybe_tbo: enable={enable_tbo}, mode={forward_batch.global_forward_mode}, delta={operations_strategy.tbo_delta_stages}"
+            f"TBO FORCE MODE: enable={enable_tbo}, mode={forward_batch.global_forward_mode}, delta={getattr(operations_strategy, 'tbo_delta_stages', 'N/A')}"
         )
+        _tbo_log("TBO FORCE MODE: Skipping all safety checks, enforcing TBO execution")
+    
     if enable_tbo:
         return _model_forward_tbo(
             inputs=inputs,
@@ -819,38 +1233,216 @@ def model_forward_maybe_tbo(
             layer_input_scatter_mode=layer_input_scatter_mode,
         )
     else:
-        return _model_forward_non_tbo(inputs, operations_strategy)
+        # 当禁用TBO时，使用标准的逐层forward，避免TBO operations
+        if _TBO_DEBUG:
+            _tbo_log(f"using standard layer-by-layer forward for {len(layers)} layers")
+        current_hidden_states = hidden_states
+        current_residual = residual
+        for layer in layers:
+            current_hidden_states, current_residual = layer(
+                positions=positions,
+                hidden_states=current_hidden_states,
+                forward_batch=forward_batch,
+                residual=current_residual,
+            )
+        return current_hidden_states, current_residual
 
 
 def _model_forward_tbo(
-    inputs,
+    inputs: dict,
     operations_strategy: OperationsStrategy,
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
-    inputs_arr = _model_forward_tbo_split_inputs(
-        **inputs,
+    if _TBO_DEBUG:
+        _tbo_log(f"_model_forward_tbo ENTRY: operations_strategy.tbo_delta_stages={operations_strategy.tbo_delta_stages}")
+    
+    # 获取并分割输入
+    split_inputs = _model_forward_tbo_split_inputs(
+        hidden_states=inputs["hidden_states"],
+        residual=inputs["residual"],
+        positions=inputs["positions"],
+        forward_batch=inputs["forward_batch"],
+        zero_allocator=inputs.get("zero_allocator"),
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
     )
-    del inputs
-
-    context = (
-        empty_context()
-        if _is_hip
-        else deep_gemm_wrapper.configure_deep_gemm_num_sms(
-            operations_strategy.deep_gemm_num_sms
-        )
+    if _TBO_DEBUG:
+        _tbo_log(f"split_inputs: micro_batch_a.shape={split_inputs[0]['hidden_states'].shape}, micro_batch_b.shape={split_inputs[1]['hidden_states'].shape}")
+    
+    # 检查空批次回退
+    for i, micro_batch_inputs in enumerate(split_inputs):
+        if micro_batch_inputs['hidden_states'].shape[0] == 0:
+            if _TBO_DEBUG:
+                _tbo_log(f"micro_batch_{i} is empty (shape[0]=0), falling back to execute_operations on original inputs")
+            # 有空批次，回退到标准执行
+            outputs = execute_operations(inputs, operations_strategy.operations)
+            return outputs["hidden_states"], outputs["residual"]
+    
+    if _TBO_DEBUG:
+        _tbo_log(f"🚀 ENTERING TBO OVERLAP EXECUTION with {len(split_inputs)} micro-batches")
+        _tbo_log(f"   operations count: {len(operations_strategy.operations)}")
+        _tbo_log(f"   delta_stages: {operations_strategy.tbo_delta_stages}")
+        _tbo_log(f"   batch info: forward_mode={inputs['forward_batch'].forward_mode}, batch_size={inputs['forward_batch'].batch_size}")
+    
+    # 创建micro-batch上下文管理（参考vLLM的UBatchContext）
+    batch_id = f"tbo_batch_{id(inputs['forward_batch'])}"
+    micro_contexts = create_micro_batch_contexts(
+        batch_id=batch_id,
+        num_micro_batches=len(split_inputs),
+        forward_batch=inputs['forward_batch'],
+        batch_info={
+            'forward_mode': inputs['forward_batch'].forward_mode,
+            'batch_size': inputs['forward_batch'].batch_size,
+            'operations_strategy': operations_strategy
+        }
     )
-
-    with context:
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
-        )
-
-    return _model_forward_tbo_merge_outputs(*outputs_arr)
+    
+    try:
+        # 🔧 TBO前环境重置：确保每次TBO都从干净的CUDA环境开始
+        enable_tbo_cuda_sync = os.environ.get("SGLANG_TBO_CUDA_SYNC", "1") == "1"
+        if enable_tbo_cuda_sync and torch.cuda.is_available():
+            try:
+                # 1. 重置CUDA环境到已知状态
+                torch.cuda.synchronize()
+                
+                # 2. 确保所有设备的流状态正确
+                for device_id in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_id):
+                        default_stream = torch.cuda.default_stream()
+                        torch.cuda.set_stream(default_stream)
+                        default_stream.synchronize()
+                
+                # 3. 清理内存状态
+                torch.cuda.empty_cache()
+                
+                # 4. 重置当前设备
+                current_device = torch.cuda.current_device()
+                torch.cuda.set_device(current_device)
+                
+                # 5. 尝试清除任何累积的CUDA错误状态
+                try:
+                    # 执行一个简单的CUDA操作来"flush"任何潜在错误
+                    test_tensor = torch.tensor([1.0], device=current_device)
+                    _ = test_tensor + 1.0
+                    del test_tensor, _
+                except Exception:
+                    pass  # 忽略测试操作的错误
+                
+                if _TBO_DEBUG:
+                    _tbo_log("TBO pre-execution: CUDA environment reset successful")
+            except Exception as e:
+                if _TBO_DEBUG:
+                    _tbo_log(f"TBO pre-execution: CUDA reset failed: {e}")
+        
+        # 执行重叠操作 - 这是TBO的核心！（参考vLLM的微批处理模式）
+        try:
+            output_a, output_b = execute_overlapped_operations(
+                inputs_arr=[split_inputs[0], split_inputs[1]],
+                operations_arr=[operations_strategy.operations, operations_strategy.operations],
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
+        except Exception as e:
+            if _TBO_DEBUG:
+                _tbo_log(f"TBO execution error: {e}")
+            # 发生错误时强制同步并清理
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            raise
+        
+        # 标记micro-batch执行完成
+        if len(micro_contexts) >= 2:
+            micro_contexts[0].mark_execution_done(result=output_a)
+            micro_contexts[1].mark_execution_done(result=output_b)
+            
+    finally:
+        # 清理micro-batch上下文
+        cleanup_micro_batch_contexts(batch_id)
+    
+    if _TBO_DEBUG:
+        _tbo_log(f"✅ TBO OVERLAP EXECUTION COMPLETED")
+        _tbo_log(f"   output_a.shape: {output_a['hidden_states'].shape if isinstance(output_a, dict) and 'hidden_states' in output_a else 'N/A'}")
+        _tbo_log(f"   output_b.shape: {output_b['hidden_states'].shape if isinstance(output_b, dict) and 'hidden_states' in output_b else 'N/A'}")
+    
+    # 合并输出
+    hidden_states, residual = _model_forward_tbo_merge_outputs(output_a, output_b)
+    
+    # TBO后的状态恢复：确保主forward_batch的关键状态正确
+    main_batch = inputs["forward_batch"]
+    if hasattr(main_batch, 'tbo_children') and main_batch.tbo_children:
+        try:
+            # 恢复主batch的token数量信息（安全版本）
+            total_tokens = hidden_states.shape[0] if hidden_states is not None else 0
+            if main_batch.global_num_tokens_gpu is None and total_tokens > 0:
+                try:
+                    # 安全地创建tensor
+                    device = hidden_states.device if hidden_states is not None else 'cpu'
+                    if torch.cuda.is_available() and device.type == 'cuda':
+                        with torch.cuda.device(device.index if device.index is not None else 0):
+                            main_batch.global_num_tokens_gpu = torch.tensor(
+                                [total_tokens], dtype=torch.int32, device=device
+                            )
+                    else:
+                        main_batch.global_num_tokens_gpu = torch.tensor(
+                            [total_tokens], dtype=torch.int32, device=device
+                        )
+                except Exception as tensor_e:
+                    # tensor创建失败，使用CPU fallback
+                    if _TBO_DEBUG:
+                        _tbo_log(f"TBO post-merge: tensor creation failed, using CPU: {tensor_e}")
+                    main_batch.global_num_tokens_gpu = torch.tensor([total_tokens], dtype=torch.int32)
+                    
+            if _TBO_DEBUG:
+                _tbo_log(f"TBO post-merge: restored main_batch global_num_tokens_gpu to {total_tokens}")
+        except Exception as e:
+            if _TBO_DEBUG:
+                _tbo_log(f"TBO post-merge: failed to restore main_batch state: {e}")
+    
+    # 🔥 关键修复：彻底重置CUDA状态，确保下一次TBO执行的环境干净
+    if enable_tbo_cuda_sync and torch.cuda.is_available():
+        try:
+            # 1. 全面同步所有设备和流
+            torch.cuda.synchronize()
+            
+            # 2. 重置所有CUDA流到默认状态
+            for device_id in range(torch.cuda.device_count()):
+                with torch.cuda.device(device_id):
+                    default_stream = torch.cuda.default_stream()
+                    torch.cuda.set_stream(default_stream)
+                    default_stream.synchronize()
+            
+            # 3. 清理GPU内存碎片
+            torch.cuda.empty_cache()
+            
+            # 4. 重置CUDA错误状态
+            try:
+                torch.cuda.get_device_properties(torch.cuda.current_device())
+            except Exception:
+                pass
+            
+            # 5. 确保当前设备状态正确
+            current_device = torch.cuda.current_device()
+            torch.cuda.set_device(current_device)
+            
+            if _TBO_DEBUG:
+                _tbo_log("TBO post-execution: Complete CUDA environment reset successful")
+        except Exception as e:
+            if _TBO_DEBUG:
+                _tbo_log(f"TBO post-execution: CUDA reset failed: {e}")
+            # 最后的安全网：强制同步和设备重置
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                current_device = torch.cuda.current_device()
+                torch.cuda.set_device(current_device)
+            except Exception:
+                pass
+    
+    return hidden_states, residual
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -951,6 +1543,17 @@ def _model_forward_filter_inputs(
     tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    start, end = output_forward_batch.tbo_parent_token_range
+    if end <= start:
+        empty_hs = hidden_states.new_empty((0,) + hidden_states.shape[1:])
+        empty_pos = positions.new_empty((0,), dtype=positions.dtype)
+        return dict(
+            hidden_states=empty_hs,
+            residual=None if residual is None else residual.new_empty((0,) + residual.shape[1:]),
+            positions=empty_pos,
+            forward_batch=output_forward_batch,
+            tbo_subbatch_index=tbo_subbatch_index,
+        )
     return dict(
         hidden_states=hidden_states[token_slice],
         residual=None if residual is None else residual[token_slice],

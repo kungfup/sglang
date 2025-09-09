@@ -1496,6 +1496,11 @@ class Scheduler(
                 self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
 
+        else:
+            # 当不需要DP/聚合准备时，仍需执行一次批次准备，以驱动TBO的gate与tbo_children构造
+            if self.server_args.enable_two_batch_overlap and ret is not None:
+                ret = self.prepare_mlp_sync_batch(ret)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1956,6 +1961,11 @@ class Scheduler(
             group = tp_group.cpu_group
             device = "cpu"
 
+        # 强制调试：确保能看到 TBO 逻辑执行
+        _TBO_DEBUG = bool(int(os.environ.get("SGLANG_TBO_DEBUG", "0")))
+        if _TBO_DEBUG:
+            print(f"[TBO][scheduler] Starting TBO preparation: enable_two_batch_overlap={enable_two_batch_overlap}, local_batch={local_batch is not None}")
+
         local_info = torch.tensor(
             [
                 num_tokens,
@@ -1991,6 +2001,10 @@ class Scheduler(
             global_info[:, :, 4:6]
         )
 
+        # 强制调试：显示 TBO 决策结果
+        if _TBO_DEBUG:
+            print(f"[TBO][scheduler] TBO decision: tbo_split_seq_index={tbo_split_seq_index}, global_forward_mode={global_forward_mode}")
+
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
 
@@ -2008,7 +2022,11 @@ class Scheduler(
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
 
-            # Check forward mode for cuda graph
+                    # 强制调试：确认最终的 TBO 状态
+        if _TBO_DEBUG:
+            print(f"[TBO][scheduler] Final batch TBO state: tbo_split_seq_index={local_batch.tbo_split_seq_index}, global_forward_mode={local_batch.global_forward_mode}")
+
+        # Check forward mode for cuda graph
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
