@@ -1180,6 +1180,17 @@ def _launch_semi_pd_subprocesses(
     
     tokenizer_manager = TokenizerManager(server_args, port_args)
     template_manager = TemplateManager()
+    # Align Semi-PD path with standard init: load chat/completion templates
+    try:
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
+        logger.info("✅ [SEMI-PD] Templates initialized (chat/completion)")
+    except Exception:
+        logger.exception("[SEMI-PD] Template initialization failed; proceeding with HF default")
     logger.info("✅ [SEMI-PD] Tokenizer and Template managers initialized")
 
     # Assume all schedulers have the same scheduler_info

@@ -42,7 +42,8 @@ import setproctitle
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, MultimodalInputs
 
 # Compatibility layer for ImageInputs (v0.4.8 uses MultimodalInputs)
 try:
@@ -261,25 +262,35 @@ class SemiPDScheduler(Scheduler):
                 self.add_to_waiting_queue(req)
                 return
 
-        # Handle multimodal inputs
-        # 🔧 v0.4.8 COMPATIBILITY: image_inputs -> mm_inputs
+        # Handle multimodal inputs (reuse native SGLang pipeline)
         if recv_req.mm_inputs is not None:
-            # 🔧 v0.4.8: For now, skip complex multimodal processing in Semi-PD
-            # This maintains compatibility while avoiding complex multimodal logic
-            logger.warning("Multimodal inputs detected but skipped in Semi-PD mode for v0.4.8 compatibility")
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
 
-            # Basic validation to prevent oversized inputs
+            # Debug-only: inspect mm tensors residency
+            try:
+                for _i, _item in enumerate(image_inputs.mm_items):
+                    _pv = getattr(_item, "pixel_values", None)
+                    if hasattr(_pv, "device"):
+                        logger.info(
+                            f"[PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
+                            f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
+                        )
+            except Exception:
+                pass
+
+            # Expand special multimodal tokens in input_ids and attach inputs
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, image_inputs
+            )
+            req.extend_image_inputs(image_inputs)
+
+            # Length validation after expansion
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                error_msg = (
-                    "Multimodal prompt is too long. "
-                    f"Input length {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                )
-                logger.error(error_msg)
-                req.origin_input_ids = [0]
-                req.mm_inputs = None
-                req.sampling_params.max_new_tokens = 0
-                req.finished_reason = FINISH_ABORT(
-                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                req.set_finish_with_abort(
+                    error_msg=(
+                        "Multimodal prompt is too long after expanding multimodal tokens. "
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    )
                 )
                 # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
@@ -507,6 +518,17 @@ def run_scheduler_process(
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_GPU_ID={os.environ.get('SGLANG_GPU_ID')}")
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_PP_SIZE={os.environ.get('SGLANG_PP_SIZE')}")
     
+    # 🔧 初始化多模态嵌入缓存（与原生路径保持一致）
+    try:
+        embedding_cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+    except Exception:
+        embedding_cache_size_mb = 100
+    try:
+        init_embedding_cache(embedding_cache_size_mb * 1024 * 1024)
+        logger.info(f"[SEMI-PD] 初始化多模态嵌入缓存: {embedding_cache_size_mb} MB")
+    except Exception:
+        logger.exception("[SEMI-PD] 初始化多模态嵌入缓存失败，将在首次使用时报错")
+
     # 🔧 检查pipeline并行配置
     if server_args.pp_size > 1:
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 检测到Pipeline并行模式")

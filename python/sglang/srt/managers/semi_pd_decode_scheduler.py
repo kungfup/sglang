@@ -227,12 +227,34 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             for req in retracted_reqs:
                 req: Req
 
-                # 重新打包请求并发送给P-Scheduler
+                # 重新打包请求并发送给P-Scheduler（携带多模态输入）
+                mm_inputs_dict = None
+                if getattr(req, "multimodal_inputs", None) is not None:
+                    mm = req.multimodal_inputs
+                    # Build a minimal dict expected by MultimodalInputs.from_dict
+                    mm_inputs_dict = {"mm_items": mm.mm_items}
+                    # Optional IDs used by different VLMs
+                    for _k in (
+                        "image_pad_len",
+                        "im_token_id",
+                        "im_start_id",
+                        "im_end_id",
+                        "slice_start_id",
+                        "slice_end_id",
+                        "audio_start_id",
+                        "audio_end_id",
+                        "audio_token_id",
+                        "video_token_id",
+                    ):
+                        _v = getattr(mm, _k, None)
+                        if _v is not None:
+                            mm_inputs_dict[_k] = _v
+
                 message = TokenizedGenerateReqInput(
                     rid=req.rid,
-                    input_text=req.origin_input_text + req.decoded_text,
+                    input_text=(req.origin_input_text or "") + req.decoded_text,
                     input_ids=req.origin_input_ids + req.output_ids,
-                    image_inputs=req.image_inputs,
+                    mm_inputs=mm_inputs_dict,
                     sampling_params=req.sampling_params,
                     return_logprob=req.return_logprob,
                     logprob_start_len=req.extend_logprob_start_len,

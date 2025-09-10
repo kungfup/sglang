@@ -468,8 +468,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.info(f"[PREFILL-PP{pp_rank}] →D tokens: {len(next_token_ids_list)}")
             self.send_to_d_instance.send_pyobj(req)
             return
-        # 非最后段（无token）：保持父类行为，维持原生PP推进
-        super().process_batch_result_prefill(batch, result, launch_done)
+        # 非最后段（无token）：不做本地处理，交由原生PP事件循环在下一段接收并处理
+        # 在非最后PP段，prefill不产生token，直接返回避免父类对None进行迭代。
+        return
 
 
 
