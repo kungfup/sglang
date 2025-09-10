@@ -41,12 +41,14 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -299,8 +301,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w
             )
-            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            # ensure non-negative padding when dimensions are divisible
+            pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size) % vit_merger_window_size
+            pad_w = (vit_merger_window_size - llm_grid_w % vit_merger_window_size) % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
@@ -326,7 +329,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
             )
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
-        window_index = torch.cat(window_index, dim=0)
+        # downstream expects long indices
+        window_index = torch.cat(window_index, dim=0).to(torch.long)
         return window_index, cu_window_seqlens
 
     @property
@@ -463,14 +467,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2_5_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-        )
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.visual = Qwen2_5_VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
+        else:
+            self.visual = PPMissingLayer()
 
         self.model = Qwen2Model(
             config,
@@ -478,19 +487,49 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            self.lm_head = PPMissingLayer()
+        # tie embeddings across pp if needed
+        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
+            if self.pp_group.is_first_rank:
+                self.pp_group.send(
+                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                )
+            if self.pp_group.is_last_rank:
+                target_dtype = config.torch_dtype or torch.float16
+                emb_token_weight = self.pp_group.recv(
+                    size=(config.vocab_size, config.hidden_size),
+                    dtype=target_dtype,
+                    src=self.pp_group.first_rank,
+                )
+                self.lm_head.weight.data.copy_(emb_token_weight)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.image_token_idx = config.image_token_id
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -499,15 +538,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # ensure data on correct device
+        for item in items:
+            if item.pixel_values is not None and item.pixel_values.device != self.device:
+                item.pixel_values = item.pixel_values.to(device=self.device)
+            if item.image_grid_thw is not None and item.image_grid_thw.device != self.device:
+                item.image_grid_thw = item.image_grid_thw.to(device=self.device)
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            self.visual.dtype
-        )
+        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(self.visual.dtype)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+        return image_embeds.contiguous()
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
@@ -525,6 +568,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors=None,
     ):
         """Run forward pass for Qwen2_5-VL.
 
@@ -555,9 +599,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
-            image_data_embedding_func=self.get_image_feature,
+            image_data_embedding_func=(self.get_image_feature if self.pp_group.is_first_rank else None),
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        # For non-last PP stages, return proxy tensors to the next stage.
+        if not self.pp_group.is_last_rank:
+            return hidden_states
 
         if not get_embedding:
             return self.logits_processor(
@@ -567,49 +616,113 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
+        """Robust weight loader that supports fused/non-fused naming and PP slicing.
+
+        - Handles q/k/v→qkv_proj and gate/up→gate_up_proj mapping when available;
+          falls back to original separate weights otherwise.
+        - Skips vision weights on non-first PP stage and lm_head weights on non-last PP stage.
+        - Silently skips any tensor not present on this PP stage to avoid KeyError.
+        """
+        from inspect import signature
+
+        prefix_map = {
+            "model.": "model.",
+            "lm_head.": "lm_head.",
+            "visual.": "visual.",
+        }
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "visual" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
+            # Normalize prefix (handle llava-style vision prefix if any)
+            if name.startswith("visual.vision_tower.vision_model."):
+                sglang_name = name.replace(
+                    "visual.vision_tower.vision_model.", "visual."
+                )
             else:
-                if "visual" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                sglang_name = name
+                for old_prefix, new_prefix in prefix_map.items():
+                    if sglang_name.startswith(old_prefix):
+                        sglang_name = new_prefix + sglang_name[len(old_prefix) :]
+                        break
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+            # Non-first PP stage does not own vision module
+            if (
+                self.pp_group.world_size > 1
+                and not self.pp_group.is_first_rank
+                and sglang_name.startswith("visual.")
+            ):
+                continue
+            # Non-last PP stage does not own lm_head
+            if (
+                self.pp_group.world_size > 1
+                and not self.pp_group.is_last_rank
+                and sglang_name.startswith("lm_head")
+            ):
+                continue
 
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            # Adapt qkv naming for vision if needed
+            if ".attn.qkv." in sglang_name:
+                sglang_name = sglang_name.replace(".attn.qkv.", ".attn.qkv_proj.")
+
+            # Try bitsandbytes-stacked mapping first (q/k/v and gate/up fusions)
+            is_stacked = False
+            for src_proj_name, (dst_fused, shard_idx) in (
+                self.bitsandbytes_stacked_params_mapping.items()
+            ):
+                pattern_base = f".{src_proj_name}"
+                if sglang_name.endswith(f"{pattern_base}.weight") or sglang_name.endswith(
+                    f"{pattern_base}.bias"
+                ):
+                    fused_name = sglang_name.replace(pattern_base, f".{dst_fused}")
+                    if fused_name in params_dict:
+                        # Use fused param loader with appropriate shard id
+                        param = params_dict[fused_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        # Prefer keyword arg if supported to avoid mismatched signatures
+                        try:
+                            sig = signature(weight_loader)
+                            if "loaded_shard_id" in sig.parameters:
+                                # Map q/k/v to string identifiers expected by attention loaders
+                                if src_proj_name in ["q_proj", "k_proj", "v_proj"]:
+                                    loaded_shard_id = src_proj_name.split("_")[0]
+                                else:
+                                    loaded_shard_id = shard_idx
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    loaded_shard_id=loaded_shard_id,
+                                )
+                            else:
+                                # Fall back to positional if only 2-arg loaders exist
+                                weight_loader(param, loaded_weight)
+                        except Exception:
+                            # Last-resort fallback for any unforeseen loader signature
+                            weight_loader(param, loaded_weight)
+                        is_stacked = True
+                    elif sglang_name in params_dict:
+                        # Fallback: load original separate weight
+                        param = params_dict[sglang_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        is_stacked = True
+                    break
+            if is_stacked:
+                continue
+
+            # Regular load path
+            if sglang_name.endswith(".bias") and sglang_name not in params_dict:
+                continue
+            if sglang_name not in params_dict:
+                continue
+            param = params_dict[sglang_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]

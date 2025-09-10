@@ -145,20 +145,10 @@ class TpModelWorker:
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        # Sync random seed across TP workers
-        # 🔧 Semi-PD模式: 所有PP stage共享同一个分布式环境，使用world组进行广播
-        if hasattr(server_args, 'enable_semi_pd') and server_args.enable_semi_pd:
-            # 🔧 Semi-PD模式: 所有PP stage都使用world组进行广播
-            broadcast_rank = self.tp_size * self.pp_rank + tp_rank
-            broadcast_group = self.world_group.cpu_group
-            broadcast_src = self.world_group.ranks[0]
-            logger.info(f"[TP_WORKER] 🔧 Semi-PD模式: 使用world组进行random_seed广播")
-            logger.info(f"[TP_WORKER] 🔧 Semi-PD模式: broadcast_rank={broadcast_rank}, broadcast_src={broadcast_src}")
-        else:
-            broadcast_rank = self.tp_size * self.pp_rank + tp_rank
-            broadcast_group = self.world_group.cpu_group
-            broadcast_src = self.world_group.ranks[0]
-            logger.info(f"[TP_WORKER] 标准模式: 使用world组进行random_seed广播")
+        # Sync random seed across TP workers: revert to TP CPU group to match原生
+        broadcast_rank = self.tp_size * self.pp_rank + tp_rank
+        broadcast_group = get_tp_group().cpu_group
+        broadcast_src = get_tp_group().ranks[0]
 
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],

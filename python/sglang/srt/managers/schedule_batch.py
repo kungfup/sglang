@@ -244,7 +244,11 @@ class MultimodalDataItem:
                 ]
                 tensor = torch.concat(tensor_list)
             if tensor.is_cuda:
-                return gpu_tensor_hash(tensor)
+                try:
+                    return gpu_tensor_hash(tensor)
+                except Exception:
+                    # Fallback to CPU hashing if GPU hashing is unavailable (e.g., Triton cannot access pointer)
+                    pass
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:

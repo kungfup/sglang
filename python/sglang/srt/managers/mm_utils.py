@@ -563,6 +563,7 @@ def general_mm_embed_routine(
         Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    pp_proxy_tensors=None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -581,44 +582,57 @@ def general_mm_embed_routine(
         Hidden states from language model forward pass
     """
     assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
-    if (
-        not forward_batch.forward_mode.is_decode()
-        and forward_batch.contains_mm_inputs()
-    ):
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
-        extend_prefix_lens = [
-            prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        inputs_embeds = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            input_embedding=embed_tokens,
-            image_data_embedding_func=image_data_embedding_func,
-            audio_data_embedding_func=audio_data_embedding_func,
-            placeholder_tokens=placeholder_tokens,
-        )
-        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-        # just being defensive here
-        forward_batch.mm_inputs = None
+    # 如果是下游PP分段（非首段），才跳过embedding；首段即使传入pp_proxy_tensors（如CUDA图捕获阶段）也应正常构建embedding。
+    skip_embedding = pp_proxy_tensors is not None
+    try:
+        pp_group = getattr(language_model, "pp_group", None)
+        if pp_group is not None and getattr(pp_group, "is_first_rank", False):
+            skip_embedding = False
+    except Exception:
+        pass
+
+    if skip_embedding:
+        inputs_embeds = None
     else:
-        inputs_embeds = embed_tokens(input_ids)
+        embed_tokens = language_model.get_input_embeddings()
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_mm_inputs()
+        ):
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            extend_prefix_lens = [
+                prefix_len
+                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            extend_seq_lens = [
+                seq_len
+                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            inputs_embeds = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                input_embedding=embed_tokens,
+                image_data_embedding_func=image_data_embedding_func,
+                audio_data_embedding_func=audio_data_embedding_func,
+                placeholder_tokens=placeholder_tokens,
+            )
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
+        else:
+            inputs_embeds = embed_tokens(input_ids)
 
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=inputs_embeds,
+        pp_proxy_tensors=pp_proxy_tensors,
         **kwargs,
     )
     return hidden_states

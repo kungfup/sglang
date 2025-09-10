@@ -895,9 +895,7 @@ def _launch_semi_pd_subprocesses(
             logger.info(f"  🔌 Decode NCCL Port: {port_args.d_nccl_port}")
         
         logger.info(f"🔧 [SEMI-PD] Port allocation completed for {len(port_args_per_pp)} PP stages")
-        # 暴露PP0的DECODE IPC地址（可选）。仅当 SGLANG_PP_DIRECT_TO_PP0=1 时启用直连兜底。
-        if os.environ.get("SGLANG_PP_DIRECT_TO_PP0", "0").lower() in ("1", "true", "yes"):
-            os.environ["SGLANG_PP0_D_SCHEDULER_IPC"] = port_args_per_pp[0].d_scheduler_input_ipc_name
+        # 移除未使用的直连PP0 IPC注入，避免路径分叉与困惑
 
         # 🔧 关键修复：为Semi-PD + TP模式分配独立的分布式初始化端口
         # DECODE和PREFILL进程使用不同的分布式初始化端口，但共享相同的NCCL端口

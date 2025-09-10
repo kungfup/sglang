@@ -933,7 +933,10 @@ class Scheduler(
                 if (
                     self.pp_group is not None
                     and self.pp_group.is_last_rank
-                    and getattr(self, "instance_role", None) == InstanceRole.DECODE
+                    and (
+                        not getattr(self.server_args, "enable_semi_pd", False)
+                        or getattr(self, "instance_role", None) == InstanceRole.DECODE
+                    )
                 ):
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
@@ -2254,7 +2257,7 @@ class Scheduler(
         ret["last_gen_throughput"] = self.last_gen_throughput
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
-                self.cum_spec_accept_count / self.cum_spec_accept_count
+                self.cum_spec_accept_length / self.cum_spec_accept_count
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict

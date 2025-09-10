@@ -34,6 +34,7 @@ from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -41,6 +42,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -451,28 +453,51 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-        )
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.visual = Qwen2VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
+        else:
+            self.visual = PPMissingLayer()
 
         self.model = Qwen2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            self.lm_head = PPMissingLayer()
+
+        # tie embeddings across pp if needed
+        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
+            if self.pp_group.is_first_rank:
+                self.pp_group.send(
+                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                )
+            if self.pp_group.is_last_rank:
+                target_dtype = getattr(config, "torch_dtype", None) or torch.float16
+                emb_token_weight = self.pp_group.recv(
+                    size=(config.vocab_size, config.hidden_size),
+                    dtype=target_dtype,
+                    src=self.pp_group.first_rank,
+                )
+                self.lm_head.weight.data.copy_(emb_token_weight)
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
         self.logits_processor = LogitsProcessor(config)
@@ -512,6 +537,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors=None,
     ):
         """Run forward pass for Qwen2-VL.
 
@@ -541,9 +567,14 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
-            image_data_embedding_func=self.get_image_feature,
+            image_data_embedding_func=(self.get_image_feature if self.pp_group.is_first_rank else None),
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        # 非最后一段：返回代理张量
+        if not self.pp_group.is_last_rank:
+            return hidden_states
 
         if get_embedding:
             return self.pooler(hidden_states, forward_batch)
@@ -564,6 +595,20 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # PP裁剪: 非首段跳过视觉权重; 非末段跳过 lm_head
+            if (
+                self.pp_group.world_size > 1
+                and not self.pp_group.is_first_rank
+                and name.startswith("visual.")
+            ):
+                continue
+            if (
+                self.pp_group.world_size > 1
+                and not self.pp_group.is_last_rank
+                and name.startswith("lm_head")
+            ):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue

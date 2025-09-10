@@ -599,9 +599,15 @@ class CudaGraphRunner:
                 self.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
+                # 仅在非首段传入pp代理，避免首段在捕获阶段误走代理路径
+                try:
+                    is_first_rank = getattr(self.model_runner.pp_group, "is_first_rank", False)
+                except Exception:
+                    is_first_rank = False
+                if not is_first_rank:
+                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                    )
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
