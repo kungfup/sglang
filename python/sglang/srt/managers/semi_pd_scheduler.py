@@ -558,6 +558,8 @@ def run_scheduler_process(
     logger.info(f"🚀 [SEMI_PD_TP2] 进程标题设置: sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
     logger.info(f"🚀 [SEMI_PD_TP2] 父进程PID: {parent_process.pid if parent_process else 'None'}")
 
+    # (reverted) 不在此处强制进行早期设备绑定，以避免副作用
+
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         dp_rank = int(os.environ["SGLANG_DP_RANK"])

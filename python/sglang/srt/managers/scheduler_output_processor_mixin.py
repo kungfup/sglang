@@ -497,6 +497,17 @@ class SchedulerOutputProcessorMixin:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
+        # Guard for Semi-PD+PP streaming to align with your original design: only PP stage-0 & attn_tp_rank==0 streams.
+        try:
+            if getattr(self.server_args, 'enable_semi_pd', False):
+                if getattr(self, 'attn_tp_rank', 0) != 0:
+                    return
+                pp_group = getattr(self, 'pp_group', None)
+                # 仅允许 PP stage-0 进行流式输出（回退到你的原始语义）
+                if pp_group is not None and getattr(pp_group, 'is_last_rank', False):
+                    return
+        except Exception:
+            pass
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -593,16 +604,23 @@ class SchedulerOutputProcessorMixin:
                     pass
 
                 # 恢复原逻辑：多模态发送完整，文本发送增量
-                if self.server_args.enable_semi_pd:
-                    # Semi-PD: always send full decode_ids to keep detokenizer offsets consistent
-                    decode_ids_list.append(decode_ids)
-                elif self.model_config.is_multimodal_gen:
-                    decode_ids_list.append(decode_ids)
+                # 同时：在 Semi-PD 模式下，发送“完整序列 + 绝对 read_offset”，以便 detokenizer 维护自身增量窗口。
+                if self.server_args.enable_semi_pd or self.model_config.is_multimodal_gen:
+                    # Full sequence path: send full decode_ids but use the PREVIOUS full length
+                    # as read_offset so detokenizer emits only the delta.
+                    full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
+                    prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
+                    decode_ids_list.append(full_decode_ids)
+                    read_offset_to_send = prev_full_len
                 else:
+                    # Text-only: send incremental slice with relative read_offset
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                    read_offset_to_send = read_offset
 
+                # Update baselines for next round
                 req.send_decode_id_offset = len(decode_ids)
-                read_offsets.append(read_offset)
+                req.last_full_decode_len = len(req.origin_input_ids_unpadded + req.output_ids)
+                read_offsets.append(read_offset_to_send)
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)

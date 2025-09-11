@@ -662,6 +662,7 @@ def _launch_subprocesses(
     server_args.check_server_args()
     _set_envs_and_config(server_args)
 
+
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
@@ -693,26 +694,48 @@ def _launch_subprocesses(
             for pp_rank in range(server_args.pp_size):
                 for tp_rank in range(tp_size_per_node):
                     reader, writer = mp.Pipe(duplex=False)
-                    gpu_id = (
+                    phys_gpu_id = (
                         server_args.base_gpu_id
                         + (pp_rank * tp_size_per_node)
                         + (tp_rank * server_args.gpu_id_step)
                     )
-                    proc = mp.Process(
-                        target=run_original_scheduler_process,
-                        args=(
-                            server_args,
-                            port_args,
-                            gpu_id,
-                            tp_rank,
-                            pp_rank,
-                            None,
-                            writer,
-                        ),
+                    # Per-process GPU visibility isolation: limit child to a single physical GPU
+                    prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                    # Optional diagnostic: disable NCCL P2P for this child when enabled
+                    prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                    if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                        os.environ["NCCL_P2P_DISABLE"] = "1"
+                    logger.info(
+                        f"[LAUNCH] PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
                     )
 
-                    with memory_saver_adapter.configure_subprocess():
-                        proc.start()
+                    try:
+                        proc = mp.Process(
+                            target=run_original_scheduler_process,
+                            args=(
+                                server_args,
+                                port_args,
+                                0,  # child sees a single GPU; use index 0
+                                tp_rank,
+                                pp_rank,
+                                None,
+                                writer,
+                            ),
+                        )
+                        with memory_saver_adapter.configure_subprocess():
+                            proc.start()
+                    finally:
+                        # Restore parent's env to avoid leaking settings
+                        if prev_cuda_visible is None:
+                            del os.environ["CUDA_VISIBLE_DEVICES"]
+                        else:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                        if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                            del os.environ["NCCL_P2P_DISABLE"]
+                        elif prev_nccl_p2p is not None:
+                            os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
+
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
         else:
@@ -844,6 +867,7 @@ def _launch_semi_pd_subprocesses(
     server_args.check_server_args()
     _set_envs_and_config(server_args)
 
+
     logger.info(f"🚀 [SEMI-PD] Starting Semi-PD subprocesses with config: {server_args=}")
     logger.info(f"🔧 [SEMI-PD] TP_SIZE={server_args.tp_size}, PP_SIZE={server_args.pp_size}, DP_SIZE={server_args.dp_size}, NNODES={server_args.nnodes}")
 
@@ -958,7 +982,7 @@ def _launch_semi_pd_subprocesses(
                 port_args = port_args_per_pp[pp_rank - pp_rank_range.start]
                 
                 # GPU ID计算 (参考原生逻辑)
-                gpu_id = (
+                phys_gpu_id = (
                     server_args.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
@@ -969,29 +993,48 @@ def _launch_semi_pd_subprocesses(
                     DECODE_ENGINE_SM_PERCENTILE
                 )
                 logger.info(
-                    f"🚀 [SEMI-PD] Launching D instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with "
+                    f"🚀 [SEMI-PD] Launching D instance PP{pp_rank} TP{tp_rank} on GPU{phys_gpu_id} with "
                     f"{os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs, "
                     f"NCCL port: {port_args.d_nccl_port}"
                 )
                 
                 d_reader, d_writer = mp.Pipe(duplex=False)
-                d_proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        None,  # dp_rank=None for DECODE instances
-                        d_writer,
-                        p_ipc_info_queue,
-                        False,  # bypass_load_weight=False - D instances load weights
-                        InstanceRole.DECODE,
-                        pp_rank,  # 🔧 正确传递pp_rank参数
-                    ),
+                # Per-process GPU visibility isolation for DECODE
+                prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                    os.environ["NCCL_P2P_DISABLE"] = "1"
+                logger.info(
+                    f"[LAUNCH] D PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
                 )
-                with memory_saver_adapter.configure_subprocess():
-                    d_proc.start()
+                try:
+                    d_proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            0,  # child sees only one GPU
+                            tp_rank,
+                            None,  # dp_rank=None for DECODE instances
+                            d_writer,
+                            p_ipc_info_queue,
+                            False,  # bypass_load_weight=False - D instances load weights
+                            InstanceRole.DECODE,
+                            pp_rank,  # 🔧 正确传递pp_rank参数
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        d_proc.start()
+                finally:
+                    if prev_cuda_visible is None:
+                        del os.environ["CUDA_VISIBLE_DEVICES"]
+                    else:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                    if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                        del os.environ["NCCL_P2P_DISABLE"]
+                    elif prev_nccl_p2p is not None:
+                        os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
                 scheduler_procs.append(d_proc)
                 d_scheduler_pipe_readers.append(d_reader)
                 logger.info(f"✅ [SEMI-PD] D instance PP{pp_rank} TP{tp_rank} started with PID: {d_proc.pid}")
@@ -1027,7 +1070,7 @@ def _launch_semi_pd_subprocesses(
                 port_args = port_args_per_pp[pp_rank - pp_rank_range.start]
                 
                 # GPU ID计算 (与DECODE实例相同)
-                gpu_id = (
+                phys_gpu_id = (
                     server_args.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
@@ -1039,30 +1082,49 @@ def _launch_semi_pd_subprocesses(
                 )
 
                 logger.info(
-                    f"🚀 [SEMI-PD] Launching P instance PP{pp_rank} TP{tp_rank} on GPU{gpu_id} with "
+                    f"🚀 [SEMI-PD] Launching P instance PP{pp_rank} TP{tp_rank} on GPU{phys_gpu_id} with "
                     f"{os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs, "
                     f"NCCL port: {port_args.p_nccl_port}, "
                     f"IPC queue: {queue_idx}"
                 )
                 
                 p_reader, p_writer = mp.Pipe(duplex=False)
-                p_proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        port_args,
-                        gpu_id,
-                        tp_rank,
-                        None,  # dp_rank=None for PREFILL instances
-                        p_writer,
-                        p_ipc_info_queue,
-                        True,  # bypass_load_weight=True - P instances share weights
-                        InstanceRole.PREFILL,
-                        pp_rank,  # 🔧 正确传递pp_rank参数
-                    ),
+                # Per-process GPU visibility isolation for PREFILL
+                prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                    os.environ["NCCL_P2P_DISABLE"] = "1"
+                logger.info(
+                    f"[LAUNCH] P PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
                 )
-                with memory_saver_adapter.configure_subprocess():
-                    p_proc.start()
+                try:
+                    p_proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            0,
+                            tp_rank,
+                            None,  # dp_rank=None for PREFILL instances
+                            p_writer,
+                            p_ipc_info_queue,
+                            True,  # bypass_load_weight=True - P instances share weights
+                            InstanceRole.PREFILL,
+                            pp_rank,  # 🔧 正确传递pp_rank参数
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        p_proc.start()
+                finally:
+                    if prev_cuda_visible is None:
+                        del os.environ["CUDA_VISIBLE_DEVICES"]
+                    else:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                    if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                        del os.environ["NCCL_P2P_DISABLE"]
+                    elif prev_nccl_p2p is not None:
+                        os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
                 scheduler_procs.append(p_proc)
                 p_scheduler_pipe_readers.append(p_reader)
                 logger.info(f"✅ [SEMI-PD] P instance PP{pp_rank} TP{tp_rank} started with PID: {p_proc.pid}")
@@ -1136,11 +1198,11 @@ def _launch_semi_pd_subprocesses(
     logger.info("🚀 [SEMI-PD] Launching Detokenizer process...")
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
     
-    # 🔧 在PP模式下，使用第一个PP stage的端口配置
+    # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
     if server_args.dp_size == 1 and server_args.pp_size > 1:
-        port_args = port_args_per_pp[0]  # 使用第一个PP stage的端口配置
+        port_args = port_args_per_pp[0]
         logger.info(f"🔧 [SEMI-PD] Using PP0 port configuration for detokenizer")
-    
+
     detoken_proc = mp.Process(
         target=run_detokenizer_process,
         args=(
@@ -1173,11 +1235,11 @@ def _launch_semi_pd_subprocesses(
     # Launch tokenizer process
     logger.info("🚀 [SEMI-PD] Launching Tokenizer process...")
     
-    # 🔧 在PP模式下，使用第一个PP stage的端口配置
+    # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
     if server_args.dp_size == 1 and server_args.pp_size > 1:
-        port_args = port_args_per_pp[0]  # 使用第一个PP stage的端口配置
+        port_args = port_args_per_pp[0]
         logger.info(f"🔧 [SEMI-PD] Using PP0 port configuration for tokenizer")
-    
+
     tokenizer_manager = TokenizerManager(server_args, port_args)
     template_manager = TemplateManager()
     # Align Semi-PD path with standard init: load chat/completion templates

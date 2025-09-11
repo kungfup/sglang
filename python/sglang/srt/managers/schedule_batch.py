@@ -549,6 +549,8 @@ class Req:
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
+        # Track the last full sequence length for full-seq streaming (mm/semi-pd)
+        self.last_full_decode_len: int = len(self.origin_input_ids_unpadded)
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -765,6 +767,8 @@ class Req:
         self.send_decode_id_offset = 0
         self.surr_offset = None
         self.read_offset = None
+        # Reset full-seq streaming baseline as well
+        self.last_full_decode_len = len(self.origin_input_ids_unpadded)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

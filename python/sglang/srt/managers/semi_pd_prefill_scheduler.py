@@ -76,6 +76,10 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         self._awaiting_auth = False
         self._last_candidates_ts = 0.0
         self._last_candidates = []
+
+        # Glue-only: let DECODE be the single source of streaming.
+        # Prevent PREFILL from calling stream_output in scheduler_output_processor_mixin.
+        self.skip_stream_for_pp = True
         
         # （移除临时PP通信测试导入，避免环境缺模块导致噪声告警）
 

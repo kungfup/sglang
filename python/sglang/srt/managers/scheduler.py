@@ -2855,6 +2855,8 @@ def run_scheduler_process(
     
     logger.info(f"[SCHEDULER_PROC] 日志配置完成，前缀={prefix}")
 
+    # (reverted) do not force early device binding here
+
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)

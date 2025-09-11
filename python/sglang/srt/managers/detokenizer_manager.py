@@ -42,6 +42,7 @@ from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
     get_exception_traceback,
+    trim_overlap,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,16 +175,26 @@ class DetokenizerManager:
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
+                # NOTE: scheduler sends decode_ids starting from its current surr_offset,
+                # and read_offsets are relative to that start. So our local surr_offset is 0
+                # for the current payload, and read_offset equals the relative value.
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
                     surr_offset=0,
-                    read_offset=recv_obj.read_offsets[i],
+                    read_offset=int(recv_obj.read_offsets[i]),
                 )
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
+                # Replace the payload to the latest window; reset local surr_offset to 0.
                 s.decode_ids = recv_obj.decode_ids[i]
+                s.surr_offset = 0
+                try:
+                    s.read_offset = int(recv_obj.read_offsets[i])
+                except Exception:
+                    # Fallback: keep previous read_offset
+                    pass
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -230,6 +241,8 @@ class DetokenizerManager:
             )
 
         # Incremental decoding
+        # IMPORTANT: Detokenizer should return the delta chunk only.
+        # TokenizerManager is responsible for accumulating full text (`state.text += chunk`).
         output_strs = []
         for i in range(bs):
             try:
@@ -243,24 +256,41 @@ class DetokenizerManager:
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
+
+            # New text w.r.t. the current surr window
             new_text = read_texts[i][len(surr_texts[i]) :]
+
             if recv_obj.finished_reasons[i] is None:
-                # Streaming chunk: update the decode status
+                # Streaming step
                 if len(new_text) > 0 and not new_text.endswith("�"):
+                    # Flushable chunk: commit offsets and return the delta only
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    new_text = ""
+                    output_chunk = new_text
                 else:
-                    new_text = find_printable_text(new_text)
-
-            output_strs.append(
-                self.trim_matched_stop(
+                    # Not flushable yet: only return the non-overlapping printable delta
+                    cand = find_printable_text(new_text)
+                    # Remove any overlap with what has already been sent to avoid duplicates
+                    output_chunk = trim_overlap(s.decoded_text, cand)
+                    if len(output_chunk) > 0:
+                        # Remember what we actually sent this round
+                        s.decoded_text = s.decoded_text + output_chunk
+            else:
+                # Finished step: trim stop on the final full text, then return only the final delta
+                final_full = self.trim_matched_stop(
                     s.decoded_text + new_text,
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
-            )
+                # Delta relative to accumulated decoded_text
+                output_chunk = final_full[len(s.decoded_text) :]
+                # Commit state to final
+                s.decoded_text = final_full
+                s.surr_offset = s.read_offset
+                s.read_offset = len(s.decode_ids)
+
+            output_strs.append(output_chunk)
 
         return BatchStrOut(
             rids=recv_obj.rids,
