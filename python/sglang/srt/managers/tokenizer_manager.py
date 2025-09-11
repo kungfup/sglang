@@ -230,6 +230,15 @@ class TokenizerManager:
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor
             )
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true"):
+                try:
+                    import multiprocessing as _mp
+                    logger.info(
+                        f"[TOKENIZER_MM] pid={os.getpid()} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')} "
+                        f"use_fast={(not server_args.disable_fast_image_processor)} start_method={_mp.get_start_method()}"
+                    )
+                except Exception:
+                    pass
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None

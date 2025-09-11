@@ -469,6 +469,16 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
 
+        # Debug: PP 信息与设备信息（默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 开启）
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                logger.info(
+                    f"[QWEN2_5_VL_INIT] pp_world={self.pp_group.world_size} "
+                    f"is_first={self.pp_group.is_first_rank} is_last={self.pp_group.is_last_rank}"
+                )
+        except Exception:
+            pass
+
         if self.pp_group.is_first_rank:
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
@@ -549,6 +559,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                _dev = pixel_values.device
+                _dtype = pixel_values.dtype
+                logger.info(
+                    f"[QWEN2_5_VL_GET_IMAGE_FEATURE] pv_dev={_dev} pv_dtype={_dtype} pv_shape={tuple(pixel_values.shape)}"
+                )
+        except Exception:
+            pass
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds.contiguous()
 
@@ -603,6 +622,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                logger.info(
+                    f"[QWEN2_5_VL_FWD] mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'} "
+                    f"mm={forward_batch.contains_mm_inputs()} pp_first={self.pp_group.is_first_rank} pp_last={self.pp_group.is_last_rank} "
+                    f"hs_dev={hidden_states.device} hs_shape={tuple(hidden_states.shape)}"
+                )
+        except Exception:
+            pass
 
         # For non-last PP stages, return proxy tensors to the next stage.
         if not self.pp_group.is_last_rank:

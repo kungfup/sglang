@@ -431,6 +431,15 @@ class Qwen2ForCausalLM(nn.Module):
                 else:
                     logger.info(f"🔧 [MODEL_LOADER] {instance_role}进程：跳过PP权重绑定通信（避免Meta tensor错误）")
 
+        # Debug: 打印 PP/TP 基本信息（默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 开启）
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                logger.info(
+                    f"[QWEN2_INIT] pp_world={self.pp_group.world_size} is_first={self.pp_group.is_first_rank} is_last={self.pp_group.is_last_rank}"
+                )
+        except Exception:
+            pass
+
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
@@ -457,6 +466,16 @@ class Qwen2ForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                logger.info(
+                    f"[QWEN2_FWD] mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'} "
+                    f"pp_first={self.pp_group.is_first_rank} pp_last={self.pp_group.is_last_rank} "
+                    f"hs_dev={hidden_states.device} hs_shape={tuple(hidden_states.shape)}"
+                )
+        except Exception:
+            pass
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
