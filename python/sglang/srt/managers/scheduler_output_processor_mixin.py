@@ -32,8 +32,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 添加调试日志控制
-DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+# 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
 
 DEFAULT_FORCE_STREAM_INTERVAL = 128
 
@@ -497,15 +497,24 @@ class SchedulerOutputProcessorMixin:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
-        # Guard for Semi-PD+PP streaming to align with your original design: only PP stage-0 & attn_tp_rank==0 streams.
+        # PP 流式来源守卫（可配置）：默认仅允许 PP stage-0 + attn_tp_rank==0 输出
         try:
             if getattr(self.server_args, 'enable_semi_pd', False):
                 if getattr(self, 'attn_tp_rank', 0) != 0:
                     return
                 pp_group = getattr(self, 'pp_group', None)
-                # 仅允许 PP stage-0 进行流式输出（回退到你的原始语义）
-                if pp_group is not None and getattr(pp_group, 'is_last_rank', False):
-                    return
+                src_mode = os.environ.get("SGLANG_PP_STREAM_SOURCE", "stage0").lower()
+                if pp_group is not None:
+                    if src_mode in ("stage0", "first"):
+                        if not getattr(pp_group, 'is_first_rank', False):
+                            return
+                    elif src_mode in ("lastrank", "last"):
+                        if not getattr(pp_group, 'is_last_rank', False):
+                            return
+                    else:
+                        # 默认回退到 stage0
+                        if not getattr(pp_group, 'is_first_rank', False):
+                            return
         except Exception:
             pass
         rids = []
@@ -603,17 +612,28 @@ class SchedulerOutputProcessorMixin:
                 except Exception:
                     pass
 
-                # 恢复原逻辑：多模态发送完整，文本发送增量
-                # 同时：在 Semi-PD 模式下，发送“完整序列 + 绝对 read_offset”，以便 detokenizer 维护自身增量窗口。
-                if self.server_args.enable_semi_pd or self.model_config.is_multimodal_gen:
-                    # Full sequence path: send full decode_ids but use the PREVIOUS full length
-                    # as read_offset so detokenizer emits only the delta.
-                    full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
-                    prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
-                    decode_ids_list.append(full_decode_ids)
-                    read_offset_to_send = prev_full_len
+                # 多模态/文本 detokenizer 协议（通过开关控制）：
+                # SGLANG_MM_DETOKENIZER_MODE: off(默认)/incremental/full
+                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "off").lower()
+                if self.model_config.is_multimodal_gen:
+                    if mm_mode in ("off", "0", "false"):
+                        # 原生语义：多模态不经 detokenizer，跳过发送
+                        # 回到 for 循环，处理下一个 req
+                        rids.pop(); finished_reasons.pop(); decoded_texts.pop()
+                        continue
+                    elif mm_mode == "full":
+                        # 全量+绝对窗口（兼容/调试）
+                        full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
+                        prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
+                        decode_ids_list.append(full_decode_ids)
+                        read_offset_to_send = prev_full_len
+                        req.last_full_decode_len = len(full_decode_ids)
+                    else:
+                        # 增量模式
+                        decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                        read_offset_to_send = read_offset
                 else:
-                    # Text-only: send incremental slice with relative read_offset
+                    # 文本：保持增量协议
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                     read_offset_to_send = read_offset
 

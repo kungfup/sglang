@@ -347,7 +347,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        logger.info(f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
+        if get_bool_env_var("SGLANG_LOG_WAITQUEUE", default="0"):
+            logger.info(
+                f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}"
+            )
         for req in self.waiting_queue:
             # Semi-PD
             if rids is not None and req.rid not in rids:

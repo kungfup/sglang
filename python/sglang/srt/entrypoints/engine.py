@@ -699,16 +699,18 @@ def _launch_subprocesses(
                         + (pp_rank * tp_size_per_node)
                         + (tp_rank * server_args.gpu_id_step)
                     )
-                    # Per-process GPU visibility isolation: limit child to a single physical GPU
-                    prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-                    os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
-                    # Optional diagnostic: disable NCCL P2P for this child when enabled
-                    prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
-                    if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
-                        os.environ["NCCL_P2P_DISABLE"] = "1"
-                    logger.info(
-                        f"[LAUNCH] PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
-                    )
+                    isolate_child = os.environ.get("SGLANG_ISOLATE_CHILD_VISIBLE", "0").lower() in ("1", "true")
+                    if isolate_child:
+                        # Limit child to a single physical GPU via CUDA_VISIBLE_DEVICES
+                        prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                        os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                        # Optional diagnostic: disable NCCL P2P for this child when enabled
+                        prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                        if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                            os.environ["NCCL_P2P_DISABLE"] = "1"
+                        logger.info(
+                            f"[LAUNCH] PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
+                        )
 
                     try:
                         proc = mp.Process(
@@ -716,7 +718,7 @@ def _launch_subprocesses(
                             args=(
                                 server_args,
                                 port_args,
-                                0,  # child sees a single GPU; use index 0
+                                0 if isolate_child else phys_gpu_id,
                                 tp_rank,
                                 pp_rank,
                                 None,
@@ -726,15 +728,16 @@ def _launch_subprocesses(
                         with memory_saver_adapter.configure_subprocess():
                             proc.start()
                     finally:
-                        # Restore parent's env to avoid leaking settings
-                        if prev_cuda_visible is None:
-                            del os.environ["CUDA_VISIBLE_DEVICES"]
-                        else:
-                            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
-                        if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
-                            del os.environ["NCCL_P2P_DISABLE"]
-                        elif prev_nccl_p2p is not None:
-                            os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
+                        if isolate_child:
+                            # Restore parent's env to avoid leaking settings
+                            if prev_cuda_visible is None:
+                                del os.environ["CUDA_VISIBLE_DEVICES"]
+                            else:
+                                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                            if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                                del os.environ["NCCL_P2P_DISABLE"]
+                            elif prev_nccl_p2p is not None:
+                                os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
 
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
@@ -999,22 +1002,24 @@ def _launch_semi_pd_subprocesses(
                 )
                 
                 d_reader, d_writer = mp.Pipe(duplex=False)
-                # Per-process GPU visibility isolation for DECODE
-                prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
-                prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
-                if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
-                    os.environ["NCCL_P2P_DISABLE"] = "1"
-                logger.info(
-                    f"[LAUNCH] D PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
-                )
+                isolate_child = os.environ.get("SGLANG_ISOLATE_CHILD_VISIBLE", "0").lower() in ("1", "true")
+                if isolate_child:
+                    # Per-process GPU visibility isolation for DECODE
+                    prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                    prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                    if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                        os.environ["NCCL_P2P_DISABLE"] = "1"
+                    logger.info(
+                        f"[LAUNCH] D PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
+                    )
                 try:
                     d_proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
                             server_args,
                             port_args,
-                            0,  # child sees only one GPU
+                            0 if isolate_child else phys_gpu_id,  # child sees only one GPU when isolated
                             tp_rank,
                             None,  # dp_rank=None for DECODE instances
                             d_writer,
@@ -1027,14 +1032,15 @@ def _launch_semi_pd_subprocesses(
                     with memory_saver_adapter.configure_subprocess():
                         d_proc.start()
                 finally:
-                    if prev_cuda_visible is None:
-                        del os.environ["CUDA_VISIBLE_DEVICES"]
-                    else:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
-                    if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
-                        del os.environ["NCCL_P2P_DISABLE"]
-                    elif prev_nccl_p2p is not None:
-                        os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
+                    if isolate_child:
+                        if prev_cuda_visible is None:
+                            del os.environ["CUDA_VISIBLE_DEVICES"]
+                        else:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                        if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                            del os.environ["NCCL_P2P_DISABLE"]
+                        elif prev_nccl_p2p is not None:
+                            os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
                 scheduler_procs.append(d_proc)
                 d_scheduler_pipe_readers.append(d_reader)
                 logger.info(f"✅ [SEMI-PD] D instance PP{pp_rank} TP{tp_rank} started with PID: {d_proc.pid}")
@@ -1089,22 +1095,24 @@ def _launch_semi_pd_subprocesses(
                 )
                 
                 p_reader, p_writer = mp.Pipe(duplex=False)
-                # Per-process GPU visibility isolation for PREFILL
-                prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
-                prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
-                if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
-                    os.environ["NCCL_P2P_DISABLE"] = "1"
-                logger.info(
-                    f"[LAUNCH] P PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
-                )
+                isolate_child = os.environ.get("SGLANG_ISOLATE_CHILD_VISIBLE", "0").lower() in ("1", "true")
+                if isolate_child:
+                    # Per-process GPU visibility isolation for PREFILL
+                    prev_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    os.environ["CUDA_VISIBLE_DEVICES"] = str(phys_gpu_id)
+                    prev_nccl_p2p = os.environ.get("NCCL_P2P_DISABLE")
+                    if os.environ.get("SGLANG_DEBUG_NCCL_P2P_DISABLE") in ("1", "true", "True"):
+                        os.environ["NCCL_P2P_DISABLE"] = "1"
+                    logger.info(
+                        f"[LAUNCH] P PP{pp_rank} TP{tp_rank} set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
+                    )
                 try:
                     p_proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
                             server_args,
                             port_args,
-                            0,
+                            0 if isolate_child else phys_gpu_id,
                             tp_rank,
                             None,  # dp_rank=None for PREFILL instances
                             p_writer,
@@ -1117,14 +1125,15 @@ def _launch_semi_pd_subprocesses(
                     with memory_saver_adapter.configure_subprocess():
                         p_proc.start()
                 finally:
-                    if prev_cuda_visible is None:
-                        del os.environ["CUDA_VISIBLE_DEVICES"]
-                    else:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
-                    if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
-                        del os.environ["NCCL_P2P_DISABLE"]
-                    elif prev_nccl_p2p is not None:
-                        os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
+                    if isolate_child:
+                        if prev_cuda_visible is None:
+                            del os.environ["CUDA_VISIBLE_DEVICES"]
+                        else:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible
+                        if prev_nccl_p2p is None and "NCCL_P2P_DISABLE" in os.environ:
+                            del os.environ["NCCL_P2P_DISABLE"]
+                        elif prev_nccl_p2p is not None:
+                            os.environ["NCCL_P2P_DISABLE"] = prev_nccl_p2p
                 scheduler_procs.append(p_proc)
                 p_scheduler_pipe_readers.append(p_reader)
                 logger.info(f"✅ [SEMI-PD] P instance PP{pp_rank} TP{tp_rank} started with PID: {p_proc.pid}")

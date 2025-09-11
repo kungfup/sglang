@@ -47,8 +47,8 @@ from sglang.utils import (
 
 logger = logging.getLogger(__name__)
 
-# 添加调试日志控制
-DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+# 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -172,12 +172,11 @@ class DetokenizerManager:
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "off").lower()
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
-                # NOTE: scheduler sends decode_ids starting from its current surr_offset,
-                # and read_offsets are relative to that start. So our local surr_offset is 0
-                # for the current payload, and read_offset equals the relative value.
+                # 默认按照“增量+相对 read_offset”的契约初始化
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
@@ -187,14 +186,23 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                # Replace the payload to the latest window; reset local surr_offset to 0.
-                s.decode_ids = recv_obj.decode_ids[i]
-                s.surr_offset = 0
-                try:
-                    s.read_offset = int(recv_obj.read_offsets[i])
-                except Exception:
-                    # Fallback: keep previous read_offset
-                    pass
+                if mm_mode == "full":
+                    # “全量+绝对”窗口模式（仅用于兼容调试），用新的窗口替换状态
+                    s.decode_ids = recv_obj.decode_ids[i]
+                    s.surr_offset = 0
+                    try:
+                        s.read_offset = int(recv_obj.read_offsets[i])
+                    except Exception:
+                        pass
+                else:
+                    # 增量：在已有 decode_ids 后追加
+                    try:
+                        s.decode_ids.extend(recv_obj.decode_ids[i])
+                    except Exception:
+                        # 防御：异常时退化为替换
+                        s.decode_ids = recv_obj.decode_ids[i]
+                        s.surr_offset = 0
+                        s.read_offset = int(recv_obj.read_offsets[i])
 
             read_ids.append(
                 self.trim_matched_stop(
