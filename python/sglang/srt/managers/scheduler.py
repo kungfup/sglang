@@ -227,7 +227,7 @@ class Scheduler(
         logger.info(f"[SCHEDULER] 开始初始化调度器")
         logger.info(f"[SCHEDULER] 进程信息: gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}, dp_rank={dp_rank}")
         logger.info(f"[SCHEDULER] 实例角色: {instance_role}")
-        
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -258,7 +258,7 @@ class Scheduler(
                 self.dp_size,
             )
         )
-        
+
         logger.info(f"[SCHEDULER] 配置信息: tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}")
         logger.info(f"[SCHEDULER] 注意力配置: attn_tp_rank={self.attn_tp_rank}, attn_tp_size={self.attn_tp_size}, attn_dp_rank={self.attn_dp_rank}")
         logger.info(f"[SCHEDULER] 调度策略: schedule_policy={self.schedule_policy}, enable_overlap={self.enable_overlap}")
@@ -266,7 +266,7 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
-        
+
         # Semi-PD: 设置实例角色
         self.instance_role = instance_role
         if self.server_args.enable_semi_pd:
@@ -433,11 +433,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        
+
         logger.info(f"[SCHEDULER] Worker信息: max_total_num_tokens={self.max_total_num_tokens}, max_prefill_tokens={self.max_prefill_tokens}")
         logger.info(f"[SCHEDULER] Worker信息: max_running_requests={self.max_running_requests}, max_req_len={self.max_req_len}, max_req_input_len={self.max_req_input_len}")
         logger.info(f"[SCHEDULER] Worker信息: device={self.device}, random_seed={self.random_seed}")
-        
+
         if global_server_args_dict["max_micro_batch_size"] is None:
             global_server_args_dict["max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
@@ -449,7 +449,7 @@ class Scheduler(
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
-        
+
         logger.info(f"[SCHEDULER] 分布式组信息: tp_group.world_size={self.tp_group.world_size}, pp_group.world_size={self.pp_group.world_size if self.pp_group is not None else 'None'}")
         logger.info(f"[SCHEDULER] 分布式组信息: world_group.world_size={self.world_group.world_size}")
 
@@ -475,6 +475,39 @@ class Scheduler(
         logger.info(f"[SCHEDULER] 开始初始化内存池和缓存")
         self.init_memory_pool_and_cache()
         logger.info(f"[SCHEDULER] 内存池和缓存初始化完成")
+        # Low-risk GPU mem/KV stats after pool/cache ready (debug only)
+        if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true"):
+            try:
+                import torch
+                dev = torch.cuda.current_device()
+                mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+                try:
+                    mem_max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
+                    mem_max_rsv = torch.cuda.max_memory_reserved(dev) / (1024**3)
+                except Exception:
+                    mem_max_alloc = mem_max_rsv = -1
+                kv_pages = None
+                kv_page_size = getattr(self, "page_size", None)
+                avail_tokens = None
+                evictable_tokens = None
+                try:
+                    kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                    kv_pages = getattr(kvcache, "size", None)
+                except Exception:
+                    pass
+                try:
+                    avail_tokens = self.token_to_kv_pool_allocator.available_size()
+                except Exception:
+                    pass
+                try:
+                    evictable_tokens = self.tree_cache.evictable_size()
+                except Exception:
+                    pass
+                pass
+            except Exception:
+                pass
+
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -604,7 +637,7 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
-            
+
         logger.info(f"[SCHEDULER] 调度器初始化完成")
 
     def maybe_sleep_on_idle(self):
@@ -892,9 +925,9 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism with Semi-PD support."""
-        
+
         # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
-        
+
         mbs = [None] * self.pp_size
         last_mbs = [None] * self.pp_size
         self.running_mbs = [
@@ -902,7 +935,7 @@ class Scheduler(
         ]
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
-        
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_size):
@@ -916,7 +949,7 @@ class Scheduler(
 
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
-                    
+
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
                     # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
@@ -1908,7 +1941,7 @@ class Scheduler(
                 bid=bid,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
-            
+
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
@@ -2263,7 +2296,7 @@ class Scheduler(
             ret["step_time_dict"] = self.step_time_dict
 
         ret["load"] = self.get_load()
-        
+
         # Semi-PD Pipeline Parallel: 添加状态信息
         if self.server_args.enable_semi_pd:
             ret["semipd_pp_status"] = self.get_semipd_pp_status()
@@ -2776,14 +2809,14 @@ class Scheduler(
         """获取Semi-PD Pipeline并行的状态信息"""
         if not self.server_args.enable_semi_pd:
             return "Semi-PD disabled"
-            
+
         status = {
             "instance_role": self.instance_role.name,
             "pp_rank": self.pp_rank,
             "pp_size": self.pp_size,
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
-            
+
         }
         return status
 
@@ -2841,7 +2874,7 @@ def run_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
-    
+
     logger.info(f"[SCHEDULER_PROC] 设置进程标题: sglang::scheduler{prefix.replace(' ', '_')}")
 
     # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
@@ -2852,7 +2885,7 @@ def run_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
-    
+
     logger.info(f"[SCHEDULER_PROC] 日志配置完成，前缀={prefix}")
 
     # (reverted) do not force early device binding here
@@ -2867,13 +2900,13 @@ def run_scheduler_process(
         embedding_cache_size = int(os.environ["SGLANG_VLM_CACHE_SIZE_MB"])
     init_embedding_cache(embedding_cache_size * 1024 * 1024)
     logger.info(f"[SCHEDULER_PROC] 初始化嵌入缓存: {embedding_cache_size} MB")
-    
+
     # Create a scheduler and run the event loop
     try:
         logger.info(f"[SCHEDULER_PROC] 开始创建调度器")
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
         logger.info(f"[SCHEDULER_PROC] 调度器创建完成")
-        
+
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2882,7 +2915,7 @@ def run_scheduler_process(
             }
         )
         logger.info(f"[SCHEDULER_PROC] 发送就绪状态到父进程")
-        
+
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         logger.info(f"[SCHEDULER_PROC] 分离模式: {disaggregation_mode}")
 

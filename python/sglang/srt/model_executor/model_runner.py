@@ -519,11 +519,11 @@ class ModelRunner:
             # 🔧 关键修复：在Semi-PD + TP模式下，DECODE和PREFILL进程使用相同的world_size
             world_size = self.tp_size * self.pp_size
             rank = self.tp_size * self.pp_rank + self.tp_rank
-            
+
             logger.info(f"🔧 [SEMI-PD] 初始化分布式环境: backend={backend}, world_size={world_size}")
             logger.info(f"🔧 [SEMI-PD] 当前rank: {rank}, local_rank={self.gpu_id}")
             logger.info(f"🔧 [SEMI-PD] 分布式初始化地址: {dist_init_method}")
-            
+
             init_distributed_environment(
                 backend=backend,
                 world_size=world_size,
@@ -532,13 +532,13 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            
+
             logger.info(f"🔧 [SEMI-PD] 初始化模型并行: tensor_parallel_size={self.tp_size}, pipeline_parallel_size={self.pp_size}")
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
             )
-            
+
             logger.info(f"🔧 [SEMI-PD] 初始化DP attention: enable_dp_attention={self.server_args.enable_dp_attention}")
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
@@ -841,6 +841,12 @@ class ModelRunner:
         ).view(req_to_token_shape)
 
         self.req_to_token_pool.req_to_token = req_to_token_tensor
+
+        # Mark IPC KV mapping done for diagnostics
+        try:
+            self._ipc_kv_mapped = True
+        except Exception:
+            pass
 
         logger.info("🔍 [ORIGINAL SEMI-PD] Parameter sharing from IPC completed")
 

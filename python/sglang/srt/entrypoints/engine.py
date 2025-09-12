@@ -85,7 +85,8 @@ from sglang.version import __version__
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-_is_cuda = is_cuda()
+# NOTE: Avoid eager CUDA checks at import time to prevent initializing CUDA before MM pool is created.
+# Defer is_cuda() checks to runtime where necessary.
 
 
 class Engine(EngineBase):
@@ -620,7 +621,9 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda:
+    # Avoid eager CUDA checks in parent; allow deferring via env
+    defer_cuda_check = os.environ.get("SGLANG_DEFER_CUDA_CHECK", "0").lower() in ("1", "true")
+    if not defer_cuda_check and is_cuda():
         assert_pkg_version(
             "sgl-kernel",
             "0.1.9",
@@ -686,10 +689,10 @@ def _launch_subprocesses(
             # 关键：所有PP stage的DECODE进程使用相同的world_size和rank
             nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
             tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-            
+
             # 🔑 关键修复：DECODE进程的分布式环境
             # PP0-DECODE: rank=0, world_size=pp_size
-            # PP1-DECODE: rank=1, world_size=pp_size  
+            # PP1-DECODE: rank=1, world_size=pp_size
             # 这样它们可以通信，而不是每个PP stage独立
             for pp_rank in range(server_args.pp_size):
                 for tp_rank in range(tp_size_per_node):
@@ -863,6 +866,14 @@ def _launch_subprocesses(
 def _launch_semi_pd_subprocesses(
     server_args: ServerArgs,
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    # Defer any CUDA checks in the parent process to avoid initializing CUDA before MM pool creation
+    os.environ.setdefault("SGLANG_DEFER_CUDA_CHECK", "1")
+
+    # Locals for optional early tokenizer init
+    early_tokenizer_initialized = False
+    tokenizer_manager: Optional[TokenizerManager] = None
+    template_manager: Optional[TemplateManager] = None
+
     from sglang.srt.managers.semi_pd_scheduler import run_scheduler_process
 
     # Configure global environment
@@ -884,7 +895,7 @@ def _launch_semi_pd_subprocesses(
     if server_args.dp_size == 1:
         # Allocate ports for inter-process communications
         logger.info("🔧 [SEMI-PD] Allocating Semi-PD specific ports...")
-        
+
         # 🔧 PP + TP Configuration (参考原生逻辑)
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
@@ -903,7 +914,7 @@ def _launch_semi_pd_subprocesses(
         logger.info(f"  📊 nnodes_per_tp_group={nnodes_per_tp_group}")
         logger.info(f"  📊 tp_size_per_node={tp_size_per_node}, tp_rank_range={list(tp_rank_range)}")
         logger.info(f"  📊 pp_size_per_node={pp_size_per_node}, pp_rank_range={list(pp_rank_range)}")
-        
+
         # 🔧 为每个PP stage创建独立的端口配置
         port_args_per_pp: List[SemiPDPortArgs] = []
         for pp_rank in pp_rank_range:
@@ -916,11 +927,25 @@ def _launch_semi_pd_subprocesses(
             logger.info(f"  📡 Prefill Scheduler IPC: {port_args.p_scheduler_input_ipc_name}")
             logger.info(f"  📡 Decode Scheduler IPC: {port_args.d_scheduler_input_ipc_name}")
             logger.info(f"  📡 Bridge IPC: {port_args.bridge_ipc_name}")
-            logger.info(f"  📡 RPC IPC: {port_args.rpc_ipc_name}")
-            logger.info(f"  🔌 Standalone NCCL Port: {port_args.s_nccl_port}")
-            logger.info(f"  🔌 Prefill NCCL Port: {port_args.p_nccl_port}")
-            logger.info(f"  🔌 Decode NCCL Port: {port_args.d_nccl_port}")
-        
+
+        # Early init Tokenizer and Templates BEFORE launching any CUDA/NCCL children
+        # This ensures MM process pool (fork) happens when parent has not touched CUDA
+        logger.info("🔧 [SEMI-PD] Early-initializing Tokenizer and Templates before schedulers")
+        tokenizer_manager = TokenizerManager(server_args, port_args_per_pp[0])
+        template_manager = TemplateManager()
+        try:
+            template_manager.initialize_templates(
+                tokenizer_manager=tokenizer_manager,
+                model_path=server_args.model_path,
+                chat_template=server_args.chat_template,
+                completion_template=server_args.completion_template,
+            )
+            logger.info("✅ [SEMI-PD] Early templates initialized (chat/completion)")
+        except Exception:
+            logger.exception("[SEMI-PD] Early template initialization failed; proceeding with HF default")
+        logger.info("✅ [SEMI-PD] Early Tokenizer and Template managers initialized")
+        early_tokenizer_initialized = True
+
         logger.info(f"🔧 [SEMI-PD] Port allocation completed for {len(port_args_per_pp)} PP stages")
         # 移除未使用的直连PP0 IPC注入，避免路径分叉与困惑
 
@@ -932,17 +957,17 @@ def _launch_semi_pd_subprocesses(
             if server_args.pp_size > 1:
                 # PP模式：DECODE和PREFILL使用不同端口，但PP stage间使用相同NCCL端口
                 base_dist_port = 40000 + random.randint(100, 199)
-                
+
                 # DECODE和PREFILL使用不同的分布式初始化端口，避免端口冲突
                 decode_dist_port = base_dist_port
                 prefill_dist_port = base_dist_port + 100  # 错开100个端口
-                
+
                 # 每个PP stage使用独立的NCCL端口
                 base_nccl_port = 40000 + random.randint(200, 299)
                 for pp_rank in range(server_args.pp_size):
                     pp_nccl_port = base_nccl_port + pp_rank * 10
                     logger.info(f"🔧 [SEMI-PD+PP] PP{pp_rank} NCCL端口: {pp_nccl_port}")
-                
+
                 logger.info(f"🔧 [SEMI-PD+PP] DECODE进程分布式端口: {decode_dist_port}")
                 logger.info(f"🔧 [SEMI-PD+PP] PREFILL进程分布式端口: {prefill_dist_port}")
                 logger.info(f"🔧 [SEMI-PD+PP] PP模式：DECODE和PREFILL使用独立端口，PP stage间使用相同NCCL端口")
@@ -951,7 +976,7 @@ def _launch_semi_pd_subprocesses(
                 decode_dist_port = 40000 + random.randint(100, 199)
                 prefill_dist_port = 40000 + random.randint(200, 299)
                 logger.info(f"🔧 [SEMI-PD] DECODE和PREFILL进程使用独立的分布式初始化端口")
-            
+
             os.environ["SGLANG_DECODE_DIST_PORT"] = str(decode_dist_port)
             os.environ["SGLANG_PREFILL_DIST_PORT"] = str(prefill_dist_port)
             logger.info(f"🔧 [SEMI-PD] DECODE进程分布式端口: {decode_dist_port}")
@@ -970,7 +995,7 @@ def _launch_semi_pd_subprocesses(
         # 为每个PP stage创建IPC队列
         total_pp_stages = len(pp_rank_range)
         p_ipc_info_queues: List[List[mp.Queue]] = [
-            [mp.Queue() for _ in range(tp_size_per_node)] 
+            [mp.Queue() for _ in range(tp_size_per_node)]
             for _ in range(total_pp_stages)
         ]
 
@@ -980,17 +1005,17 @@ def _launch_semi_pd_subprocesses(
             for tp_rank in tp_rank_range:
                 queue_idx = tp_rank % tp_size_per_node
                 p_ipc_info_queue = p_ipc_info_queues[pp_rank - pp_rank_range.start][queue_idx]
-                
+
                 # 使用对应PP stage的端口配置
                 port_args = port_args_per_pp[pp_rank - pp_rank_range.start]
-                
+
                 # GPU ID计算 (参考原生逻辑)
                 phys_gpu_id = (
                     server_args.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                
+
                 # Set CUDA MPS for Decode instance (100% SMs)
                 os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
                     DECODE_ENGINE_SM_PERCENTILE
@@ -1000,7 +1025,7 @@ def _launch_semi_pd_subprocesses(
                     f"{os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs, "
                     f"NCCL port: {port_args.d_nccl_port}"
                 )
-                
+
                 d_reader, d_writer = mp.Pipe(duplex=False)
                 isolate_child = os.environ.get("SGLANG_ISOLATE_CHILD_VISIBLE", "0").lower() in ("1", "true")
                 if isolate_child:
@@ -1056,7 +1081,7 @@ def _launch_semi_pd_subprocesses(
             scheduler_infos.append(data)
             server_args.max_total_tokens = data["max_total_num_tokens"]
             logger.info(f"✅ [SEMI-PD] D instance PP{pp_rank} TP{tp_rank} ready, max_total_tokens: {data['max_total_num_tokens']}")
-            
+
             # 验证同一PP stage内的max_total_tokens一致性
             if i % len(tp_rank_range) > 0:
                 assert (
@@ -1071,17 +1096,17 @@ def _launch_semi_pd_subprocesses(
             for tp_rank in tp_rank_range:
                 queue_idx = tp_rank % tp_size_per_node
                 p_ipc_info_queue = p_ipc_info_queues[pp_rank - pp_rank_range.start][queue_idx]
-                
+
                 # 使用对应PP stage的端口配置
                 port_args = port_args_per_pp[pp_rank - pp_rank_range.start]
-                
+
                 # GPU ID计算 (与DECODE实例相同)
                 phys_gpu_id = (
                     server_args.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                
+
                 # Set CUDA MPS for Prefill instance (80% SMs)
                 os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
                     PREFILL_ENGINE_SM_PERCENTILE
@@ -1093,7 +1118,7 @@ def _launch_semi_pd_subprocesses(
                     f"NCCL port: {port_args.p_nccl_port}, "
                     f"IPC queue: {queue_idx}"
                 )
-                
+
                 p_reader, p_writer = mp.Pipe(duplex=False)
                 isolate_child = os.environ.get("SGLANG_ISOLATE_CHILD_VISIBLE", "0").lower() in ("1", "true")
                 if isolate_child:
@@ -1153,7 +1178,7 @@ def _launch_semi_pd_subprocesses(
 
         logger.info("🎉 [SEMI-PD] All schedulers are ready! Semi-PD initialization completed successfully!")
         logger.info(f"📊 [SEMI-PD] Final stats: {len(scheduler_procs)} total processes, {len(scheduler_infos)} scheduler infos")
-        
+
         # Log final process mapping
         for i, proc in enumerate(scheduler_procs):
             if i < len(d_scheduler_pipe_readers):
@@ -1206,7 +1231,7 @@ def _launch_semi_pd_subprocesses(
     # Launch detokenizer process with pipe for ready signal
     logger.info("🚀 [SEMI-PD] Launching Detokenizer process...")
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
-    
+
     # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
     if server_args.dp_size == 1 and server_args.pp_size > 1:
         port_args = port_args_per_pp[0]
@@ -1241,32 +1266,33 @@ def _launch_semi_pd_subprocesses(
         logger.error(f"❌ [SEMI-PD] Error waiting for Detokenizer: {e}")
         raise
 
-    # Launch tokenizer process
-    logger.info("🚀 [SEMI-PD] Launching Tokenizer process...")
-    
-    # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
-    if server_args.dp_size == 1 and server_args.pp_size > 1:
-        port_args = port_args_per_pp[0]
-        logger.info(f"🔧 [SEMI-PD] Using PP0 port configuration for tokenizer")
+    # Launch tokenizer process (if not created early)
+    if not early_tokenizer_initialized:
+        logger.info("🚀 [SEMI-PD] Launching Tokenizer process...")
 
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    template_manager = TemplateManager()
-    # Align Semi-PD path with standard init: load chat/completion templates
-    try:
-        template_manager.initialize_templates(
-            tokenizer_manager=tokenizer_manager,
-            model_path=server_args.model_path,
-            chat_template=server_args.chat_template,
-            completion_template=server_args.completion_template,
-        )
-        logger.info("✅ [SEMI-PD] Templates initialized (chat/completion)")
-    except Exception:
-        logger.exception("[SEMI-PD] Template initialization failed; proceeding with HF default")
-    logger.info("✅ [SEMI-PD] Tokenizer and Template managers initialized")
+        # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
+        if server_args.dp_size == 1 and server_args.pp_size > 1:
+            port_args = port_args_per_pp[0]
+            logger.info(f"🔧 [SEMI-PD] Using PP0 port configuration for tokenizer")
+
+        tokenizer_manager = TokenizerManager(server_args, port_args)
+        template_manager = TemplateManager()
+        # Align Semi-PD path with standard init: load chat/completion templates
+        try:
+            template_manager.initialize_templates(
+                tokenizer_manager=tokenizer_manager,
+                model_path=server_args.model_path,
+                chat_template=server_args.chat_template,
+                completion_template=server_args.completion_template,
+            )
+            logger.info("✅ [SEMI-PD] Templates initialized (chat/completion)")
+        except Exception:
+            logger.exception("[SEMI-PD] Template initialization failed; proceeding with HF default")
+        logger.info("✅ [SEMI-PD] Tokenizer and Template managers initialized")
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     logger.info(f"✅ [SEMI-PD] Final configuration: max_req_input_len={scheduler_info['max_req_input_len']}")
-    
+
     return tokenizer_manager, template_manager, scheduler_info

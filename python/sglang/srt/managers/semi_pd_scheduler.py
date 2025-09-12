@@ -109,7 +109,7 @@ class SemiPDScheduler(Scheduler):
         # 获取TP和PP大小信息
         tp_size = getattr(server_args, "tp_size", 1)
         pp_size = getattr(server_args, "pp_size", 1)
-        
+
         # 根据设计逻辑设置环境变量：
         # TP=2时：使用Semi-PD，不依赖PP组通信，使用IPC机制
         # PP=2时：使用原生流水线并行，依赖PP组通信
@@ -128,7 +128,7 @@ class SemiPDScheduler(Scheduler):
         else:
             # 单GPU模式
             logger.info(f"🔧 [SINGLE_GPU] PP{pp_rank} TP{tp_rank}: 单GPU模式 (TP={tp_size}, PP={pp_size})")
-        
+
         # 设置PP相关环境变量
         os.environ["SGLANG_PP_RANK"] = str(pp_rank)
         os.environ["SGLANG_PP_SIZE"] = str(pp_size)
@@ -145,14 +145,14 @@ class SemiPDScheduler(Scheduler):
             bypass_load_weight,
             instance_role,
         )
-        
+
         # 🔧 保存port_args参数供子类使用
         self.port_args = port_args
-        
+
         # 🔧 记录PP stage信息
         self.pp_rank = pp_rank
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Semi-PD PP模式: PP stage {pp_rank} using GPU {gpu_id}")
-        
+
         # 🔧 明确进程角色：decode为主进程，prefill为辅助进程
         if instance_role == InstanceRole.DECODE:
             logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE进程作为主进程，负责请求协调")
@@ -160,7 +160,7 @@ class SemiPDScheduler(Scheduler):
         elif instance_role == InstanceRole.PREFILL:
             logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PREFILL进程作为辅助进程，配合主进程工作")
             logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 职责包括: 预填充计算、共享主进程权重、配合主进程")
-        
+
         logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SemiPDScheduler初始化完成")
 
     def add_to_waiting_queue(self, req: Req):
@@ -355,7 +355,7 @@ class SemiPDScheduler(Scheduler):
         else:
             # SemiPD
             self.add_to_waiting_queue(req)
-    
+
     def get_ipc_info(self):
         return self.tp_worker.get_ipc_info()
 
@@ -495,11 +495,11 @@ def run_scheduler_process(
     pp_rank: int = 0,  # 🔧 添加pp_rank参数，设置默认值
 ):
     """Semi-PD specific scheduler process runner with PP support
-    
+
     Process Hierarchy:
     - DECODE进程: 主进程，负责请求接收、响应返回、整体协调
     - PREFILL进程: 辅助进程，负责预填充计算，配合主进程工作
-    
+
     Startup Sequence:
     1. DECODE进程先启动，加载模型权重，生成IPC信息
     2. PREFILL进程后启动，通过IPC共享模型权重，避免重复加载
@@ -510,14 +510,14 @@ def run_scheduler_process(
     os.environ["SGLANG_GPU_ID"] = str(gpu_id)
     # 🔧 添加PP_SIZE环境变量，确保原生pipeline并行机制能正确工作
     os.environ["SGLANG_PP_SIZE"] = str(server_args.pp_size)
-    
+
     # 🔧 验证环境变量设置
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 环境变量设置验证")
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_ENABLE_SEMI_PD={os.environ.get('SGLANG_ENABLE_SEMI_PD')}")
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_PP_RANK={os.environ.get('SGLANG_PP_RANK')}")
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_GPU_ID={os.environ.get('SGLANG_GPU_ID')}")
     logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: SGLANG_PP_SIZE={os.environ.get('SGLANG_PP_SIZE')}")
-    
+
     # 🔧 初始化多模态嵌入缓存（与原生路径保持一致）
     try:
         embedding_cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
@@ -537,13 +537,13 @@ def run_scheduler_process(
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 关键：检查模型类是否正确实现了pipeline并行层分配")
     else:
         logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 单PP模式，将创建完整模型")
-    
+
     # 🔧 SEMI-PD TP=2 详细初始化日志
     logger.info(f"🚀 [SEMI_PD_TP2] ========== Semi-PD TP=2 进程启动 ==========")
     logger.info(f"🚀 [SEMI_PD_TP2] 进程信息: instance_role={instance_role.name}, pp_rank={pp_rank}, tp_rank={tp_rank}, gpu_id={gpu_id}")
     logger.info(f"🚀 [SEMI_PD_TP2] 配置信息: tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, dp_size={server_args.dp_size}")
     logger.info(f"🚀 [SEMI_PD_TP2] 环境变量设置: SGLANG_ENABLE_SEMI_PD=1, SGLANG_PP_RANK={pp_rank}, SGLANG_GPU_ID={gpu_id}, SGLANG_PP_SIZE={server_args.pp_size}")
-    
+
     # Generate the prefix
     if dp_rank is None:
         prefix = f" {instance_role.name} PP{pp_rank} TP{tp_rank}"  # 🔧 添加PP信息
@@ -554,7 +554,7 @@ def run_scheduler_process(
     setproctitle.setproctitle(f"sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
-    
+
     logger.info(f"🚀 [SEMI_PD_TP2] 进程标题设置: sglang::semi_pd_scheduler{prefix.replace(' ', '_')}")
     logger.info(f"🚀 [SEMI_PD_TP2] 父进程PID: {parent_process.pid if parent_process else 'None'}")
 
@@ -593,7 +593,7 @@ def run_scheduler_process(
             server_args, prefix=f" {instance_role.name} DP{dp_rank} TP{tp_rank}"
         )
     suppress_other_loggers()
-    
+
     logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 日志配置完成")
 
     from sglang.semi_pd.utils import get_device_sm_count
@@ -631,7 +631,7 @@ def run_scheduler_process(
             ipc_info = scheduler.get_ipc_info()
             ipc_info_queue.put(ipc_info)
             logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程已生成IPC信息，等待PREFILL辅助进程连接")
-            
+
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
@@ -654,14 +654,74 @@ def run_scheduler_process(
         if bypass_load_weight and instance_role == InstanceRole.PREFILL:
             logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 通过IPC共享DECODE主进程的模型权重...")
             scheduler.share_params_from_ipc(ipc_info)
+            try:
+                setattr(scheduler, "_ipc_params_shared", True)
+            except Exception:
+                pass
+
             logger.info(f"✅ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PREFILL辅助进程成功通过IPC共享DECODE主进程的模型权重 (zero-copy)!")
+            # Debug mem snapshot right after IPC share (to detect duplication)
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                try:
+                    import torch
+                    torch.cuda.synchronize()
+                    dev = torch.cuda.current_device()
+                    mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                    mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+                    kv_ipc = False
+                    try:
+                        kv_ipc = bool(getattr(scheduler.tp_worker.model_runner, "_ipc_kv_mapped", False))
+                    except Exception:
+                        pass
+                    pass
+                except Exception:
+                    pass
+
 
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 初始化注意力后端...")
         scheduler.init_attention_backend()
-        
+
+        # After attention backend init, log again after CUDA graphs (for DECODE)
         if instance_role == InstanceRole.DECODE:
-            logger.info(f"🎯 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程初始化CUDA图...")
+            logger.info(f"🎯 [SEMI-PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程初始化CUDA图...")
             scheduler.init_cuda_graphs()
+        else:
+            # Non-DECODE roles do not init graphs
+            pass
+
+            try:
+                import torch
+                torch.cuda.synchronize()
+                dev = torch.cuda.current_device()
+                mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+                try:
+                    mem_max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
+                    mem_max_rsv = torch.cuda.max_memory_reserved(dev) / (1024**3)
+                except Exception:
+                    mem_max_alloc = mem_max_rsv = -1
+                kv_pages = None
+                kv_page_size = getattr(scheduler, "page_size", None)
+                avail_tokens = None
+                evictable_tokens = None
+                try:
+                    kvcache = scheduler.token_to_kv_pool_allocator.get_kvcache()
+                    kv_pages = getattr(kvcache, "size", None)
+                except Exception:
+                    pass
+                try:
+                    avail_tokens = scheduler.token_to_kv_pool_allocator.available_size()
+                except Exception:
+                    pass
+                try:
+                    evictable_tokens = scheduler.tree_cache.evictable_size()
+                except Exception:
+                    pass
+                ipc_flag = getattr(scheduler, "_ipc_params_shared", False)
+                pass
+            except Exception:
+                pass
+
 
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 发送就绪状态到父进程...")
         pipe_writer.send(
@@ -698,14 +758,14 @@ def run_scheduler_process(
 def get_pp_stage_ports(pp_rank: int, base_port: int = 40000) -> dict:
     """
     为PP stage分配独立端口范围
-    
+
     Args:
         pp_rank: Pipeline parallel rank (0, 1, ...)
         base_port: 基础端口号
-        
+
     Returns:
         包含各种端口配置的字典
-        
+
     Note:
         - decode进程是主进程，使用主端口号
         - prefill进程是辅助进程，使用辅助端口号
@@ -714,7 +774,7 @@ def get_pp_stage_ports(pp_rank: int, base_port: int = 40000) -> dict:
     # 每个PP stage分配1000个端口范围
     port_range = 1000
     start_port = base_port + pp_rank * port_range
-    
+
     return {
         "decode_port": start_port,        # 🔧 主进程端口 (decode)
         "prefill_port": start_port + 1,   # 🔧 辅助进程端口 (prefill)
@@ -728,23 +788,23 @@ def get_pp_stage_ports(pp_rank: int, base_port: int = 40000) -> dict:
 def create_pp_stage_port_args(pp_rank: int, base_port: int = 40000) -> PortArgs:
     """
     为PP stage创建PortArgs对象
-    
+
     Args:
         pp_rank: Pipeline parallel rank
         base_port: 基础端口号
-        
+
     Returns:
         PortArgs对象
     """
     ports = get_pp_stage_ports(pp_rank, base_port)
-    
+
     # 创建PortArgs对象，这里需要根据实际的PortArgs结构进行调整
     # 由于PortArgs的具体结构未知，这里返回一个包含端口信息的字典
     # 实际使用时需要根据PortArgs的构造函数进行调整
-    
+
     return {
         "decode_port": ports["decode_port"],
-        "prefill_port": ports["prefill_port"], 
+        "prefill_port": ports["prefill_port"],
         "scheduler_port": ports["scheduler_port"],
         "detokenizer_port": ports["detokenizer_port"],
         "nccl_port": ports["nccl_port"],

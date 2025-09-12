@@ -3,6 +3,8 @@ import concurrent.futures
 import dataclasses
 import multiprocessing as mp
 import os
+import logging
+
 import re
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -10,11 +12,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+try:
+    import torch.distributed as dist
+except Exception:  # pragma: no cover
+    dist = None
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
+
+logger = logging.getLogger(__name__)
 
 
 class MultimodalInputFormat(Enum):
@@ -103,6 +111,8 @@ class BaseMultimodalProcessor(ABC):
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
         )
+
+
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
