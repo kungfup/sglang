@@ -672,10 +672,13 @@ def run_scheduler_process(
                     try:
                         kv_ipc = bool(getattr(scheduler.tp_worker.model_runner, "_ipc_kv_mapped", False))
                     except Exception:
-                        pass
-                    pass
-                except Exception:
-                    pass
+                        kv_ipc = False
+                    logger.info(
+                        f"[SEMI-PD][MEM] after IPC share role={instance_role.name} PP{pp_rank} TP{tp_rank} "
+                        f"alloc={mem_alloc:.2f}GiB reserved={mem_rsv:.2f}GiB kv_ipc_mapped={kv_ipc}"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[SEMI-PD][MEM] after IPC share stats failed: {_e}")
 
 
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 初始化注意力后端...")
@@ -685,42 +688,63 @@ def run_scheduler_process(
         if instance_role == InstanceRole.DECODE:
             logger.info(f"🎯 [SEMI-PD_TP2] PP{pp_rank} TP{tp_rank}: DECODE主进程初始化CUDA图...")
             scheduler.init_cuda_graphs()
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                try:
+                    import torch
+                    dev = torch.cuda.current_device()
+                    mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                    mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+                    logger.info(
+                        f"[SEMI-PD][MEM] after graphs role={instance_role.name} PP{pp_rank} TP{tp_rank} alloc={mem_alloc:.2f}GiB reserved={mem_rsv:.2f}GiB"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[SEMI-PD][MEM] after graphs stats failed: {_e}")
         else:
             # Non-DECODE roles do not init graphs
             pass
 
-            try:
-                import torch
-                torch.cuda.synchronize()
-                dev = torch.cuda.current_device()
-                mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
-                mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
                 try:
-                    mem_max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
-                    mem_max_rsv = torch.cuda.max_memory_reserved(dev) / (1024**3)
-                except Exception:
-                    mem_max_alloc = mem_max_rsv = -1
-                kv_pages = None
-                kv_page_size = getattr(scheduler, "page_size", None)
-                avail_tokens = None
-                evictable_tokens = None
-                try:
-                    kvcache = scheduler.token_to_kv_pool_allocator.get_kvcache()
-                    kv_pages = getattr(kvcache, "size", None)
-                except Exception:
-                    pass
-                try:
-                    avail_tokens = scheduler.token_to_kv_pool_allocator.available_size()
-                except Exception:
-                    pass
-                try:
-                    evictable_tokens = scheduler.tree_cache.evictable_size()
-                except Exception:
-                    pass
-                ipc_flag = getattr(scheduler, "_ipc_params_shared", False)
-                pass
-            except Exception:
-                pass
+                    import torch
+                    torch.cuda.synchronize()
+                    dev = torch.cuda.current_device()
+                    mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                    mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
+                    try:
+                        mem_max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
+                        mem_max_rsv = torch.cuda.max_memory_reserved(dev) / (1024**3)
+                    except Exception:
+                        mem_max_alloc = mem_max_rsv = -1.0
+                    kv_pages = None
+                    kv_page_size = getattr(scheduler, "page_size", None)
+                    avail_tokens = None
+                    evictable_tokens = None
+                    try:
+                        kvcache = scheduler.token_to_kv_pool_allocator.get_kvcache()
+                        kv_pages = getattr(kvcache, "size", None)
+                    except Exception:
+                        pass
+                    try:
+                        avail_tokens = scheduler.token_to_kv_pool_allocator.available_size()
+                    except Exception:
+                        pass
+                    try:
+                        evictable_tokens = scheduler.tree_cache.evictable_size()
+                    except Exception:
+                        pass
+                    ipc_flag = getattr(scheduler, "_ipc_params_shared", False)
+                    kv_ipc = False
+                    try:
+                        kv_ipc = bool(getattr(scheduler.tp_worker.model_runner, "_ipc_kv_mapped", False))
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[SEMI-PD][MEM] role={instance_role.name} PP{pp_rank} TP{tp_rank} ipc_params_shared={ipc_flag} kv_ipc_mapped={kv_ipc} "
+                        f"alloc={mem_alloc:.2f}GiB reserved={mem_rsv:.2f}GiB max_alloc={mem_max_alloc:.2f}GiB max_reserved={mem_max_rsv:.2f}GiB "
+                        f"kv_pages={kv_pages} page_size={kv_page_size} avail_tokens={avail_tokens} evictable_tokens={evictable_tokens} max_total_tokens={getattr(scheduler,'max_total_num_tokens',None)}"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[SEMI-PD][MEM] failed to collect stats: {_e}")
 
 
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 发送就绪状态到父进程...")
