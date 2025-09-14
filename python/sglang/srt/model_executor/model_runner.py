@@ -62,7 +62,7 @@ from sglang.srt.layers.quantization import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm100_supported, PPMissingLayer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
@@ -713,6 +713,7 @@ class ModelRunner:
             kvcache_info=kvcache_info,
             req_to_token_handle=req_to_token_handles,
             req_to_token_info=req_to_token_info,
+            decode_max_total_num_tokens=int(getattr(self, 'max_total_num_tokens', 0)) or None,
         )
 
     def share_params_from_ipc(self, ipc_info: IPCInfo):
@@ -850,6 +851,39 @@ class ModelRunner:
 
         logger.info("🔍 [ORIGINAL SEMI-PD] Parameter sharing from IPC completed")
 
+        # Diagnostics: check visual module devices after IPC parameter sharing
+        try:
+            has_visual = hasattr(self.model, "visual")
+            visual_cls = type(getattr(self.model, "visual", None)).__name__ if has_visual else "<none>"
+            vis_param_cnt = 0
+            vis_param_bytes = 0
+            vis_devices = set()
+            if has_visual and not isinstance(getattr(self.model, "visual"), PPMissingLayer):
+                for n, p in self.model.named_parameters():
+                    if n.startswith("visual.") and hasattr(p, "data"):
+                        vis_param_cnt += p.numel()
+                        try:
+                            vis_param_bytes += p.numel() * p.element_size()
+                            vis_devices.add(str(p.device))
+                        except Exception:
+                            pass
+            logger.info(
+                (
+                    "[VLM_POST_IPC] role=%s PP%s/%s TP%s/%s visual=%s vis_params=%d (~%.2f MB) devices=%s"
+                ),
+                getattr(self.instance_role, "name", str(self.instance_role)),
+                self.pp_rank,
+                self.pp_size,
+                self.tp_rank,
+                self.tp_size,
+                visual_cls,
+                vis_param_cnt,
+                vis_param_bytes / (1024 * 1024),
+                sorted(list(vis_devices)) if vis_devices else [],
+            )
+        except Exception:
+            pass
+
     def notify_weights_shared(self):
         """Notify that weights have been shared via IPC for Semi-PD."""
         logger.info("🔍 [ORIGINAL SEMI-PD] Weights shared notification received")
@@ -941,6 +975,44 @@ class ModelRunner:
             else None
         )
         self.dtype = self.model_config.dtype
+
+        # Multimodal/VLM ownership diagnostics
+        try:
+            vlm_name = type(self.model).__name__
+            has_visual = hasattr(self.model, "visual")
+            visual_cls = type(getattr(self.model, "visual", None)).__name__ if has_visual else "<none>"
+            # Count params and devices for the vision module if present
+            vis_param_cnt = 0
+            vis_param_bytes = 0
+            vis_devices = set()
+            if has_visual and not isinstance(getattr(self.model, "visual"), PPMissingLayer):
+                for n, p in self.model.named_parameters():
+                    if n.startswith("visual.") and hasattr(p, "data"):
+                        vis_param_cnt += p.numel()
+                        try:
+                            vis_param_bytes += p.numel() * p.element_size()
+                            vis_devices.add(str(p.device))
+                        except Exception:
+                            pass
+            logger.info(
+                (
+                    "[VLM_LOADED] role=%s PP%s/%s TP%s/%s bypass_load_weight=%s "
+                    "model=%s visual=%s vis_params=%d (~%.2f MB) devices=%s"
+                ),
+                getattr(self.instance_role, "name", str(self.instance_role)),
+                self.pp_rank,
+                self.pp_size,
+                self.tp_rank,
+                self.tp_size,
+                self.bypass_load_weight,
+                vlm_name,
+                visual_cls,
+                vis_param_cnt,
+                vis_param_bytes / (1024 * 1024),
+                sorted(list(vis_devices)) if vis_devices else [],
+            )
+        except Exception:
+            pass
 
         if not self.bypass_load_weight:
             after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1272,6 +1344,32 @@ class ModelRunner:
             // self.server_args.page_size
             * self.server_args.page_size
         )
+
+        # Semi-PD: clamp PREFILL KV tokens by a ratio of DECODE tokens if provided via IPC/env
+        try:
+            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and self.bypass_load_weight:
+                # Prefer env ratio; default None (disabled)
+                ratio_str = os.environ.get("SGLANG_SEMIPD_PREFILL_KV_FRAC", None)
+                ratio = float(ratio_str) if ratio_str is not None else None
+                # If IPC has DECODE cap, we can clamp by ratio*decode_tokens
+                decode_tokens = None
+                try:
+                    # The scheduler sets ipc_info on PREFILL before calling init_memory_pool
+                    ipc_info = getattr(self, 'ipc_info', None)
+                    if ipc_info is not None:
+                        decode_tokens = getattr(ipc_info, 'decode_max_total_num_tokens', None)
+                except Exception:
+                    decode_tokens = None
+                if ratio is not None and decode_tokens is not None and ratio > 0:
+                    target_cap = int(decode_tokens * ratio)
+                    if target_cap > 0:
+                        old_cap = self.max_total_num_tokens
+                        self.max_total_num_tokens = max(self.server_args.page_size, min(self.max_total_num_tokens, target_cap))
+                        if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                            logger.info(f"[SEMI-PD][CFG] clamp prefill max_total_num_tokens by ratio: decode={decode_tokens} ratio={ratio} old={old_cap} new={self.max_total_num_tokens}")
+        except Exception as _e:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                logger.warning(f"[SEMI-PD][CFG] clamp by ratio failed: {_e}")
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(

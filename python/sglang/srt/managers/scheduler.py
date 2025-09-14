@@ -478,7 +478,6 @@ class Scheduler(
         # Low-risk GPU mem/KV stats after pool/cache ready (debug only)
         if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true"):
             try:
-                import torch
                 dev = torch.cuda.current_device()
                 mem_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
                 mem_rsv = torch.cuda.memory_reserved(dev) / (1024**3)
@@ -504,7 +503,11 @@ class Scheduler(
                     evictable_tokens = self.tree_cache.evictable_size()
                 except Exception:
                     pass
-                pass
+                logger.info(
+                    f"[SCHED][MEM] after init_pool role={getattr(self,'instance_role','NA')} pp={getattr(self,'pp_rank','?')} tp={self.tp_rank} "
+                    f"alloc={mem_alloc:.2f}GiB reserved={mem_rsv:.2f}GiB max_alloc={mem_max_alloc:.2f}GiB max_reserved={mem_max_rsv:.2f}GiB "
+                    f"kv_pages={kv_pages} page_size={kv_page_size} avail_tokens={avail_tokens} evictable_tokens={evictable_tokens} max_total_tokens={getattr(self,'max_total_num_tokens',None)}"
+                )
             except Exception:
                 pass
 

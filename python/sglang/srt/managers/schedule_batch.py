@@ -224,59 +224,65 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashing the data
+        Set the pad value after first hashing the data.
+        注意：为避免在GPU上进行大张量拼接引发的显存峰值，本函数的张量哈希全部在CPU上以流式方式进行。
         """
 
-        def data_hash(data) -> int:
-            hash_bytes = hashlib.sha256(data).digest()[:8]
+        def data_hash_from_bytes(data_bytes: bytes) -> int:
+            hash_bytes = hashlib.sha256(data_bytes).digest()[:8]
             return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
-        def tensor_hash(tensor_list) -> int:
+        def data_hash_from_numpy(arr: np.ndarray) -> int:
+            arr = np.ascontiguousarray(arr)
+            return data_hash_from_bytes(arr.tobytes())
+
+        def tensor_iter_bytes(t: torch.Tensor):
+            """Yield bytes of a tensor safely on CPU without large concatenations."""
+            # Detach and handle dtype
+            t = t.detach()
+            if t.dtype == torch.bfloat16:
+                t = t.float()
+            # Move to CPU if needed
+            if t.is_cuda:
+                t = t.cpu()
+            # Ensure contiguous and flatten to 1-D for predictable byte order
+            t = t.contiguous().view(-1)
+            yield memoryview(t.numpy()).tobytes()
+
+        def tensor_list_hash(tensor_list) -> int:
             """
-            hash a tensor or a tensor list
+            Hash a tensor or a list of (possibly nested) tensors using CPU hashing.
+            通过流式更新SHA256，避免任何GPU端的拼接/复制峰值。
             """
-            tensor = tensor_list
-            if isinstance(tensor_list, list):
-                tensor_list = flatten_nested_list(tensor_list)
-                tensor_list = [
-                    x.flatten() if isinstance(x, torch.Tensor) else x
-                    for x in tensor_list
-                ]
-                tensor = torch.concat(tensor_list)
-            if tensor.is_cuda:
-                try:
-                    return gpu_tensor_hash(tensor)
-                except Exception:
-                    # Fallback to CPU hashing if GPU hashing is unavailable (e.g., Triton cannot access pointer)
-                    pass
-            tensor = tensor.detach().contiguous()
+            # Normalize to a flat list
+            items = tensor_list
+            if not isinstance(items, list):
+                items = [items]
+            items = flatten_nested_list(items)
 
-            if tensor.dtype == torch.bfloat16:
-                # memoryview() doesn't support PyTorch's BFloat16 dtype
-                tensor = tensor.float()
-
-            assert isinstance(tensor, torch.Tensor)
-            if tensor.is_cuda:
-                # TODO: improve this
-                tensor_cpu = tensor.cpu()
-            else:
-                tensor_cpu = tensor
-
-            mv = memoryview(tensor_cpu.numpy())
-            return data_hash(mv.tobytes())
+            hasher = hashlib.sha256()
+            for x in items:
+                if isinstance(x, torch.Tensor):
+                    for chunk in tensor_iter_bytes(x):
+                        hasher.update(chunk)
+                elif isinstance(x, np.ndarray):
+                    hasher.update(np.ascontiguousarray(x).tobytes())
+                else:
+                    # Fallback for scalars or other types: hash their string repr
+                    hasher.update(str(x).encode("utf-8"))
+            return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
 
         def hash_feature(f):
             if isinstance(f, list):
-                if isinstance(f[0], torch.Tensor):
-                    return tensor_hash(f)
-                return data_hash(tuple(flatten_nested_list(f)))
+                # If list contains tensors, hash all tensors; otherwise hash flattened list tuple
+                if len(f) > 0 and isinstance(f[0], torch.Tensor):
+                    return tensor_list_hash(f)
+                return data_hash_from_bytes(str(tuple(flatten_nested_list(f))).encode("utf-8"))
             elif isinstance(f, np.ndarray):
-                arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
-                return data_hash(arr_bytes)
+                return data_hash_from_numpy(f)
             elif isinstance(f, torch.Tensor):
-                return tensor_hash([f])
-            return data_hash(f)
+                return tensor_list_hash([f])
+            return data_hash_from_bytes(str(f).encode("utf-8"))
 
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
@@ -1309,15 +1315,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
+        # Do not move pixel_values here. Keep them on CPU to avoid redundant large tensor
+        # transfers. The first PP stage will move them inside model.get_image_feature()
+        # only when needed.
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
-            for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "pixel_values", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.pixel_values = pixel_values.to(
-                        self.device, non_blocking=True
-                    )
+            # no device move here; leave pixel_values as-is (usually CPU tensors)
+            pass
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)

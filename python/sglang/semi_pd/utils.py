@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 import torch
 import zmq
@@ -45,6 +45,8 @@ class IPCInfo:
     kvcache_info: dict
     req_to_token_handle: list
     req_to_token_info: dict
+    # New: allow passing decode's token cap for prefill proportional clamp
+    decode_max_total_num_tokens: Optional[int] = None
 
 
 class InstanceRole(Enum):

@@ -271,8 +271,10 @@ class SemiPDScheduler(Scheduler):
                 for _i, _item in enumerate(image_inputs.mm_items):
                     _pv = getattr(_item, "pixel_values", None)
                     if hasattr(_pv, "device"):
+                        role = getattr(self, "instance_role", None)
+                        role_name = getattr(role, "name", str(role))
                         logger.info(
-                            f"[PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
+                            f"[{role_name}] [PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
                             f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
                         )
             except Exception:
@@ -585,6 +587,27 @@ def run_scheduler_process(
                 logger.error(f"❌ [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 接收IPC信息失败: {e}")
                 raise
 
+            # Prefill KV proportional clamp before scheduler/model init
+            try:
+                ratio_str = os.environ.get("SGLANG_SEMIPD_PREFILL_KV_FRAC", None)
+                if ratio_str is not None and hasattr(ipc_info, "decode_max_total_num_tokens"):
+                    ratio = float(ratio_str)
+                    decode_tokens = getattr(ipc_info, "decode_max_total_num_tokens", None)
+                    if decode_tokens is not None and ratio > 0:
+                        clamp_tokens = int(decode_tokens * ratio)
+                        if clamp_tokens > 0:
+                            old_max = getattr(server_args, "max_total_tokens", None)
+                            server_args.max_total_tokens = clamp_tokens
+                            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                                logger.info(
+                                    f"[SEMI-PD][CFG] prefill kv cap by ratio before init: decode_tokens={decode_tokens} ratio={ratio} "
+                                    f"clamp_tokens={clamp_tokens} old_server_max_total_tokens={old_max}"
+                                )
+            except Exception as _e:
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                    logger.warning(f"[SEMI-PD][CFG] failed to apply prefill kv ratio before init: {_e}")
+
+
     # Configure the logger
     if dp_rank is None:
         configure_logger(server_args, prefix=f" {instance_role.name} TP{tp_rank}")
@@ -647,12 +670,27 @@ def run_scheduler_process(
                 dp_rank,
                 bypass_load_weight,
             )
+            # Debug-only: dump PREFILL init config to ensure no local KV intended
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true"):
+                try:
+                    logger.info(
+                        f"[SEMI-PD][CFG] prefill_init tp={tp_rank} pp={pp_rank} bypass_load_weight={bypass_load_weight} "
+                        f"disable_radix_cache={getattr(server_args,'disable_radix_cache',None)} kv_cache_dtype={getattr(server_args,'kv_cache_dtype',None)} "
+                        f"context_len={getattr(server_args,'context_length',None)} page_size={getattr(server_args,'page_size',None)}"
+                    )
+                except Exception:
+                    pass
         else:
             raise ValueError(f"Invalid instance role: {instance_role}")
 
         # 🔧 辅助进程通过IPC共享主进程的模型权重
         if bypass_load_weight and instance_role == InstanceRole.PREFILL:
             logger.info(f"🔧 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: 通过IPC共享DECODE主进程的模型权重...")
+            # Make ipc_info available to PREFILL model_runner for ratio-based clamp
+            try:
+                scheduler.tp_worker.model_runner.ipc_info = ipc_info
+            except Exception:
+                pass
             scheduler.share_params_from_ipc(ipc_info)
             try:
                 setattr(scheduler, "_ipc_params_shared", True)

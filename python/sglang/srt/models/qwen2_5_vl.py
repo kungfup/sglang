@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import os
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -53,6 +54,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    embed_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -491,6 +493,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         else:
             self.visual = PPMissingLayer()
 
+        # Log vision tower ownership for PP diagnostics
+        try:
+            vis_is_missing = isinstance(self.visual, PPMissingLayer)
+            vis_cls = type(self.visual).__name__
+            vis_params = 0
+            if not vis_is_missing:
+                for n, p in self.named_parameters():
+                    if n.startswith("visual."):
+                        vis_params += p.numel()
+            logger.info(
+                f"[VLM_PP_OWNERSHIP] pp_world={self.pp_group.world_size} pp_first={self.pp_group.is_first_rank} "
+                f"pp_last={self.pp_group.is_last_rank} visual_cls={vis_cls} visual_params={vis_params}"
+            )
+        except Exception:
+            pass
+
         self.model = Qwen2Model(
             config,
             quant_config,
@@ -548,27 +566,80 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # ensure data on correct device
+        # Build on CPU first to avoid per-item GPU transfers; move once to GPU.
+        pv_list = []
+        grid_list = []
         for item in items:
-            if item.pixel_values is not None and item.pixel_values.device != self.device:
-                item.pixel_values = item.pixel_values.to(device=self.device)
-            if item.image_grid_thw is not None and item.image_grid_thw.device != self.device:
-                item.image_grid_thw = item.image_grid_thw.to(device=self.device)
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(self.visual.dtype)
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+            pv = item.pixel_values
+            grid = item.image_grid_thw
+            if isinstance(pv, torch.Tensor) and pv.is_cuda:
+                pv = pv.cpu()
+            if isinstance(grid, torch.Tensor) and grid.is_cuda:
+                grid = grid.cpu()
+            pv_list.append(pv)
+            grid_list.append(grid)
+        # In qwen-vl, the last dimension is the same
+        pixel_values = torch.cat(pv_list, dim=0)
+        image_grid_thw = torch.concat(grid_list, dim=0)
+        # Move once to target device with proper dtypes
+        pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype, non_blocking=True)
+        image_grid_thw = image_grid_thw.to(device=self.device, non_blocking=True)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
                 _dev = pixel_values.device
                 _dtype = pixel_values.dtype
+                pv_shape = tuple(pixel_values.shape)
+                grid_shape = tuple(image_grid_thw.shape)
+                # Estimate patch/token and pixel budgets for visibility
+                # total patches across items: should equal pixel_values.shape[0]
+                try:
+                    total_patches_from_grid = (
+                        (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2])
+                        .sum()
+                        .item()
+                    )
+                except Exception:
+                    total_patches_from_grid = -1
+                # Approximate pixel budget using IMAGE_FACTOR=28 (see Qwen2_5VLImageProcessor)
+                try:
+                    approx_pixels_28 = (
+                        (image_grid_thw[:, 1] * image_grid_thw[:, 2]).sum().item() * (28 * 28)
+                    )
+                except Exception:
+                    approx_pixels_28 = -1
+                # Memory snapshot before vision forward
+                if _dev.type == "cuda":
+                    dev_index = _dev.index if _dev.index is not None else torch.cuda.current_device()
+                    mem_alloc_pre = torch.cuda.memory_allocated(dev_index) / (1024 ** 3)
+                    mem_rsv_pre = torch.cuda.memory_reserved(dev_index) / (1024 ** 3)
+                else:
+                    mem_alloc_pre = mem_rsv_pre = 0.0
                 logger.info(
-                    f"[QWEN2_5_VL_GET_IMAGE_FEATURE] pv_dev={_dev} pv_dtype={_dtype} pv_shape={tuple(pixel_values.shape)}"
+                    "[QWEN2_5_VL_VISION_MEM][pre] dev=%s dtype=%s pv_shape=%s grid_shape=%s "
+                    "alloc=%.2fGiB reserved=%.2fGiB patches(pv/grid)=%s/%s approx_pixels_28=%s (IMAGE_FACTOR=28)",
+                    str(_dev), str(_dtype), pv_shape, grid_shape,
+                    mem_alloc_pre, mem_rsv_pre, pv_shape[0], total_patches_from_grid, approx_pixels_28,
                 )
         except Exception:
             pass
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                _dev = pixel_values.device
+                if _dev.type == "cuda":
+                    dev_index = _dev.index if _dev.index is not None else torch.cuda.current_device()
+                    mem_alloc_post = torch.cuda.memory_allocated(dev_index) / (1024 ** 3)
+                    mem_rsv_post = torch.cuda.memory_reserved(dev_index) / (1024 ** 3)
+                else:
+                    mem_alloc_post = mem_rsv_post = 0.0
+                logger.info(
+                    "[QWEN2_5_VL_VISION_MEM][post] dev=%s alloc=%.2fGiB reserved=%.2fGiB",
+                    str(_dev), mem_alloc_post, mem_rsv_post,
+                )
+        except Exception:
+            pass
         return image_embeds.contiguous()
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
@@ -581,6 +652,46 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def _prepare_initial_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """首段准备多模态/文本混合的 input_embeds，并清理 mm_inputs 以避免传递到后段。"""
+        embed_tokens = self.get_input_embeddings()
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_mm_inputs()
+        ):
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            extend_prefix_lens = [
+                prefix_len
+                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            extend_seq_lens = [
+                seq_len
+                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            inputs_embeds = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                input_embedding=embed_tokens,
+                image_data_embedding_func=self.get_image_feature,
+                audio_data_embedding_func=None,
+                placeholder_tokens=None,
+            )
+            # 嵌入完成后，避免把原始多模态数据传到后段
+            forward_batch.mm_inputs = None
+        else:
+            inputs_embeds = embed_tokens(input_ids)
+        return inputs_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -589,50 +700,41 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ):
-        """Run forward pass for Qwen2_5-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
+        """Run forward pass for Qwen2_5-VL with PP-aware multimodal embedding.
+        首段：准备 input_embeds 并传入 self.model；后段：仅接收 hidden_states。
+        末段：计算 logits/pooling。
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
+        # 仅首段构建多模态嵌入，后段不再触发任何多模态嵌入逻辑
+        input_embeds = None
+        if self.pp_group.is_first_rank:
+            input_embeds = self._prepare_initial_embeddings(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+            )
 
-        hidden_states = general_mm_embed_routine(
+        # 模型前向：传入 positions/forward_batch/input_embeds/pp_proxy_tensors
+        hidden_states = self.model(
             input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            image_data_embedding_func=(self.get_image_feature if self.pp_group.is_first_rank else None),
             positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
                 logger.info(
                     f"[QWEN2_5_VL_FWD] mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'} "
-                    f"mm={forward_batch.contains_mm_inputs()} pp_first={self.pp_group.is_first_rank} pp_last={self.pp_group.is_last_rank} "
-                    f"hs_dev={hidden_states.device} hs_shape={tuple(hidden_states.shape)}"
+                    f"mm={'N/A' if forward_batch.mm_inputs is None else True} "
+                    f"pp_first={self.pp_group.is_first_rank} pp_last={self.pp_group.is_last_rank} "
+                    f"hs_dev={getattr(hidden_states, 'device', 'cpu')} hs_shape={getattr(hidden_states, 'shape', None)}"
                 )
         except Exception:
             pass
 
-        # For non-last PP stages, return proxy tensors to the next stage.
+        # 非末段直接返回 hidden_states
         if not self.pp_group.is_last_rank:
             return hidden_states
 

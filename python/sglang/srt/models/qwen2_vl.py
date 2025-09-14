@@ -467,6 +467,22 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         else:
             self.visual = PPMissingLayer()
 
+        # Log vision tower ownership for PP diagnostics
+        try:
+            vis_is_missing = isinstance(self.visual, PPMissingLayer)
+            vis_cls = type(self.visual).__name__
+            vis_params = 0
+            if not vis_is_missing:
+                for n, p in self.named_parameters():
+                    if n.startswith("visual."):
+                        vis_params += p.numel()
+            logger.info(
+                f"[VLM_PP_OWNERSHIP] pp_world={self.pp_group.world_size} pp_first={self.pp_group.is_first_rank} "
+                f"pp_last={self.pp_group.is_last_rank} visual_cls={vis_cls} visual_params={vis_params}"
+            )
+        except Exception:
+            pass
+
         self.model = Qwen2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
