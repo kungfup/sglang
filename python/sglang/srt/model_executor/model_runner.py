@@ -941,6 +941,14 @@ class ModelRunner:
                 device_config=device_config,
                 bypass_load_weight=self.bypass_load_weight,
             )
+            # Propagate instance role to model and its language submodule (if any)
+            try:
+                setattr(self.model, "instance_role", self.instance_role)
+                if hasattr(self.model, "model"):
+                    setattr(self.model.model, "instance_role", self.instance_role)
+            except Exception:
+                pass
+
 
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)

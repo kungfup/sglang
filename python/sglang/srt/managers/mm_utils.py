@@ -19,6 +19,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.semi_pd.utils import InstanceRole
+
 from sglang.utils import logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -582,14 +584,34 @@ def general_mm_embed_routine(
         Hidden states from language model forward pass
     """
     assert hasattr(language_model, "get_input_embeddings")
-    # 如果是下游PP分段（非首段），才跳过embedding；首段即使传入pp_proxy_tensors（如CUDA图捕获阶段）也应正常构建embedding。
+    # 仅在 Semi-PD 的 PREFILL 且 PP 首段执行多模态嵌入；其余场景一律跳过
     skip_embedding = pp_proxy_tensors is not None
+    allow_mm = None
     try:
+        role = getattr(language_model, "instance_role", None)
         pp_group = getattr(language_model, "pp_group", None)
-        if pp_group is not None and getattr(pp_group, "is_first_rank", False):
-            skip_embedding = False
+        if role is not None:
+            allow_mm = (role == InstanceRole.PREFILL) and (
+                pp_group is None or getattr(pp_group, "is_first_rank", False)
+            )
     except Exception:
-        pass
+        allow_mm = None
+
+    if allow_mm is False:
+        # 强制跳过（DECODE 或 非首段 PP）
+        skip_embedding = True
+        try:
+            forward_batch.mm_inputs = None
+        except Exception:
+            pass
+    else:
+        # 保持原有行为：若是 PP 首段，不因 pp_proxy_tensors 而强制跳过
+        try:
+            pp_group = getattr(language_model, "pp_group", None)
+            if pp_group is not None and getattr(pp_group, "is_first_rank", False):
+                skip_embedding = False
+        except Exception:
+            pass
 
     if skip_embedding:
         inputs_embeds = None
