@@ -954,13 +954,22 @@ class Scheduler(
                 if self.cur_batch:
 
                     server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
-                    # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
-                    if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-                        try:
-                            self.process_batch_result(self.cur_batch, result)
-                        except Exception:
-                            logger.exception("[SEMI_PD_PP] PREFILL handoff failed; continue loop")
+                    is_semi_pd_prefill = (
+                        getattr(self.server_args, 'enable_semi_pd', False)
+                        and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                    )
+                    is_idle_batch = getattr(self.cur_batch, 'forward_mode', None) and self.cur_batch.forward_mode.is_idle()
+
+                    if is_semi_pd_prefill and is_idle_batch:
+                        result = None  # Skip any model forward for idle placeholder batches
+                    else:
+                        result = self.run_batch(self.cur_batch)
+                        # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
+                        if is_semi_pd_prefill:
+                            try:
+                                self.process_batch_result(self.cur_batch, result)
+                            except Exception:
+                                logger.exception("[SEMI_PD_PP] PREFILL handoff failed; continue loop")
 
                 # (last rank) send the outputs to the next step
                 # Semi-PD: Only DECODE instance is responsible for cross-stage token send.
@@ -974,7 +983,7 @@ class Scheduler(
                         or getattr(self, "instance_role", None) == InstanceRole.DECODE
                     )
                 ):
-                    if self.cur_batch:
+                    if self.cur_batch and result is not None:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
                             result.bid,
@@ -994,12 +1003,26 @@ class Scheduler(
                                     }
                                     if result.logits_output is not None
                                     else {}
+
                                 )
                             )
                         else:
                             send_tok = {"next_token_ids": next_token_ids}
                         self.pp_group.send_tensor_dict(
                             send_tok,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+
+                # For Semi-PD PREFILL: send proxy tensors early before any recv to avoid both sides waiting on recv
+                if (
+                    getattr(self.server_args, 'enable_semi_pd', False)
+                    and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                    and self.pp_group is not None and not self.pp_group.is_last_rank
+                ):
+                    if self.cur_batch and (result is not None) and (getattr(result, 'pp_hidden_states_proxy_tensors', None) is not None):
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
@@ -1012,19 +1035,22 @@ class Scheduler(
                             all_gather_group=self.attn_tp_group
                         )
                     )
+
+
                     # In PP, only the stage following the last rank receives tokens.
                     # Other stages will receive hidden-state proxies without 'next_token_ids'.
-                    if "next_token_ids" in next_pp_outputs.tensors:
+                    if next_pp_outputs is not None and "next_token_ids" in next_pp_outputs.tensors:
                         mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                         logits_output_args = {
                             k[len("logits_output.") :]: v
                             for k, v in next_pp_outputs.tensors.items()
                             if k.startswith("logits_output.")
                         }
-                        if len(logits_output_args) > 0:
-                            logits_output = LogitsProcessorOutput(**logits_output_args)
-                        else:
-                            logits_output = None
+                        logits_output = (
+                            LogitsProcessorOutput(**logits_output_args)
+                            if len(logits_output_args) > 0
+                            else None
+                        )
                         output_result = GenerationBatchResult(
                             logits_output=logits_output,
                             pp_hidden_states_proxy_tensors=None,
@@ -1043,7 +1069,7 @@ class Scheduler(
 
                 # (not last rank)
                 if self.pp_group is not None and not self.pp_group.is_last_rank:
-                    if self.cur_batch:
+                    if self.cur_batch and (result is not None):
                         bids[mb_id] = result.bid
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
@@ -1065,7 +1091,16 @@ class Scheduler(
                         )
 
                     # send out proxy tensors to the next stage
-                    if self.cur_batch:
+                    # For Semi-PD PREFILL, this is already sent earlier to avoid deadlock.
+                    if (
+                        self.cur_batch
+                        and (result is not None)
+                        and (getattr(result, 'pp_hidden_states_proxy_tensors', None) is not None)
+                        and not (
+                            getattr(self.server_args, 'enable_semi_pd', False)
+                            and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                        )
+                    ):
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,

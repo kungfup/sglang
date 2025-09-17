@@ -450,6 +450,12 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         if self.server_args.enable_dp_attention:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
+        # If no authorized work yet, return an idle micro-batch to keep PP send/recv aligned
+        if ret is None and getattr(self, 'pp_size', 1) > 1:
+            try:
+                ret = self.get_idle_batch()
+            except Exception:
+                ret = None
         logger.debug(
             f"[PREFILL-PP{self.pp_rank}] Returning batch with {len(ret.reqs) if ret else 0} requests"
         )
