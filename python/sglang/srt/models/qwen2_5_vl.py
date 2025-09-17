@@ -62,6 +62,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.utils import add_prefix
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,22 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        # ViT forward entry: precise marker + optional call stack
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                role_name = getattr(getattr(self, "instance_role", None), "name", None)
+                pp_first = getattr(getattr(self, "pp_group", None), "is_first_rank", None)
+                pp_last = getattr(getattr(self, "pp_group", None), "is_last_rank", None)
+                logger.info(
+                    f"[QWEN2_5_VIT_CALL] role={role_name} pp_first={pp_first} pp_last={pp_last} "
+                    f"dev={self.device} x_dtype={getattr(x, 'dtype', None)} x_shape={tuple(x.shape)} grid_shape={tuple(getattr(grid_thw, 'shape', ())) }"
+                )
+                try:
+                    logger.info("[QWEN2_5_VIT_CALL_STACK]\n%s", "".join(traceback.format_stack(limit=12)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -616,12 +633,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     mem_rsv_pre = torch.cuda.memory_reserved(dev_index) / (1024 ** 3)
                 else:
                     mem_alloc_pre = mem_rsv_pre = 0.0
+                role_name = getattr(getattr(self, "instance_role", None), "name", None)
+                pp_first = getattr(getattr(self, "pp_group", None), "is_first_rank", None)
                 logger.info(
-                    "[QWEN2_5_VL_VISION_MEM][pre] dev=%s dtype=%s pv_shape=%s grid_shape=%s "
+                    "[QWEN2_5_VL_VISION_MEM][pre] role=%s pp_first=%s dev=%s dtype=%s pv_shape=%s grid_shape=%s "
                     "alloc=%.2fGiB reserved=%.2fGiB patches(pv/grid)=%s/%s approx_pixels_28=%s (IMAGE_FACTOR=28)",
-                    str(_dev), str(_dtype), pv_shape, grid_shape,
+                    role_name, pp_first, str(_dev), str(_dtype), pv_shape, grid_shape,
                     mem_alloc_pre, mem_rsv_pre, pv_shape[0], total_patches_from_grid, approx_pixels_28,
                 )
+                try:
+                    if role_name == 'DECODE':
+                        logger.info("[QWEN2_5_VISION_MEM_STACK][pre]\n%s", "".join(traceback.format_stack(limit=10)))
+                except Exception:
+                    pass
         except Exception:
             pass
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -634,10 +658,17 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     mem_rsv_post = torch.cuda.memory_reserved(dev_index) / (1024 ** 3)
                 else:
                     mem_alloc_post = mem_rsv_post = 0.0
+                role_name = getattr(getattr(self, "instance_role", None), "name", None)
+                pp_first = getattr(getattr(self, "pp_group", None), "is_first_rank", None)
                 logger.info(
-                    "[QWEN2_5_VL_VISION_MEM][post] dev=%s alloc=%.2fGiB reserved=%.2fGiB",
-                    str(_dev), mem_alloc_post, mem_rsv_post,
+                    "[QWEN2_5_VL_VISION_MEM][post] role=%s pp_first=%s dev=%s alloc=%.2fGiB reserved=%.2fGiB",
+                    role_name, pp_first, str(_dev), mem_alloc_post, mem_rsv_post,
                 )
+                try:
+                    if role_name == 'DECODE':
+                        logger.info("[QWEN2_5_VISION_MEM_STACK][post]\n%s", "".join(traceback.format_stack(limit=10)))
+                except Exception:
+                    pass
         except Exception:
             pass
         return image_embeds.contiguous()
@@ -659,6 +690,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """首段准备多模态/文本混合的 input_embeds，并清理 mm_inputs 以避免传递到后段。"""
         embed_tokens = self.get_input_embeddings()
+        used_mm = False
         if (
             not forward_batch.forward_mode.is_decode()
             and forward_batch.contains_mm_inputs()
@@ -688,8 +720,27 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             )
             # 嵌入完成后，避免把原始多模态数据传到后段
             forward_batch.mm_inputs = None
+            used_mm = True
+            try:
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                    role_name = getattr(getattr(self, "instance_role", None), "name", None)
+                    logger.info(
+                        f"[QWEN2_5_MM_EMBED] role={role_name} pp_first={getattr(self.pp_group, 'is_first_rank', False)} "
+                        f"mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'} used_mm=True"
+                    )
+                    try:
+                        logger.info("[QWEN2_5_MM_EMBED_STACK]\n%s", "".join(traceback.format_stack(limit=12)))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         else:
             inputs_embeds = embed_tokens(input_ids)
+        # 标记本次是否使用多模态嵌入
+        try:
+            setattr(forward_batch, "_used_mm_embed", used_mm)
+        except Exception:
+            pass
         return inputs_embeds
 
     def forward(
@@ -725,12 +776,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         )
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                role_name = getattr(getattr(self, "instance_role", None), "name", None)
+                mm_used = bool(getattr(forward_batch, "_used_mm_embed", False))
+                mode_str = 'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'
                 logger.info(
-                    f"[QWEN2_5_VL_FWD] mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'} "
-                    f"mm={'N/A' if forward_batch.mm_inputs is None else True} "
+                    f"[QWEN2_5_VL_FWD] role={role_name} mode={mode_str} mm_used={mm_used} "
                     f"pp_first={self.pp_group.is_first_rank} pp_last={self.pp_group.is_last_rank} "
                     f"hs_dev={getattr(hidden_states, 'device', 'cpu')} hs_shape={getattr(hidden_states, 'shape', None)}"
                 )
+                if role_name == 'DECODE' and mode_str == 'EXTEND':
+                    try:
+                        logger.warning("[QWEN2_5_VL_DECODE_EXTEND_STACK]\n%s", "".join(traceback.format_stack(limit=14)))
+                    except Exception:
+                        pass
         except Exception:
             pass
 

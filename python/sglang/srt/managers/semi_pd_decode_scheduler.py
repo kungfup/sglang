@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import logging
+import traceback
 from collections import deque
 import threading
 import time
@@ -124,7 +125,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             context = zmq.Context(2)
 
             assert isinstance(port_args, SemiPDPortArgs)
-            
+
             # 🔧 同PP stage内的IPC通信（与PREFILL进程）
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PUSH, self.port_args.bridge_ipc_name, False
@@ -148,7 +149,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     self.recv_from_p_instance = None
             except Exception:
                 self.recv_from_p_instance = None
-            
+
             # 🔧 PP stage间通信：与下一个stage的DECODE进程通信
             # 使用SGLang原生的NCCL通信机制，不需要额外的socket
             if hasattr(self.port_args, 'next_stage_decode_port') and self.port_args.next_stage_decode_port:
@@ -284,18 +285,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         batch.prepare_for_decode()
         return batch
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        if not self.running_batch.is_empty():
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
-        else:
-            ret = None
-
-        # Handle DP attention
-        if self.server_args.enable_dp_attention:
-            ret, _ = self.prepare_dp_attn_batch(ret)
-
-        return ret
 
     def get_new_batch_prefill(self, rids: Optional[List[str]] = None) -> Optional[ScheduleBatch]:
         """
@@ -304,6 +293,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
           - disable mixed-style chunked prefill
           - skip requests that not in rids
         """
+        # Safety: if called without explicit candidates (e.g., by parent), do nothing
+        if rids is None:
+            return None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -414,8 +406,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if self.chunked_req:
             self.chunked_req.is_chunked += 1
 
-        # Print stats
-        if self.attn_tp_rank == 0:
+        # Print stats (optional): avoid confusing DECODE logs as if executing prefill
+        if self.attn_tp_rank == 0 and get_bool_env_var("SGLANG_SEMIPD_D_LOG_PREFILL_STATS", default="0"):
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -429,6 +421,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
         )
+        # Semi-PD: D-side pre-allocation and metadata setup (does NOT execute model)
         new_batch.prepare_for_extend()
         # Semi-PD
         self.scheduled_prefill_batches.append(new_batch)
@@ -462,6 +455,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         - If no capacity or no matching requests are available, send an empty
           authorization to let PREFILL clear its awaiting flag and retry later.
         """
+        # Optional trace: who requested authorization and with which candidate rids
+        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+            try:
+                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE get_next_prefill_batch rids={recv_req.rids}\n" + "".join(traceback.format_stack(limit=12)))
+            except Exception:
+                pass
+
         # quiet
 
         # Release unfinished chunk if any, mirroring semipd_nopp behavior
@@ -482,6 +482,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
                 )
                 self.bridge_socket.send_pyobj(empty)
+                try:
+                    semi_pd_log_info_throttle(
+                        logger,
+                        key=f"pp{self.pp_rank}.p2d.gnp.send",
+                        msg=f"[DECODE-PP{self.pp_rank}] →P GetNextPrefillBatchOutput(sync): #rids=0",
+                    )
+                except Exception:
+                    pass
             else:
                 approved_rids = [r.rid for r in batch.reqs]
                 req_pool_indices = [r.req_pool_idx for r in batch.reqs]
@@ -496,6 +504,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     extend_input_lens=extend_input_lens,
                 )
                 self.bridge_socket.send_pyobj(msg)
+                try:
+                    semi_pd_log_info_throttle(
+                        logger,
+                        key=f"pp{self.pp_rank}.p2d.gnp.send",
+                        msg=f"[DECODE-PP{self.pp_rank}] →P GetNextPrefillBatchOutput(sync): #rids={len(approved_rids)}",
+                    )
+                except Exception:
+                    pass
         except Exception:
             # Fall back silently; PREFILL will retry via resend logic.
             pass
@@ -509,6 +525,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             try:
                 msg = self._spd_authorize_outbox[0]
                 self.bridge_socket.send_pyobj(msg)
+                if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                    try:
+                        logger.info(f"[DECODE-PP{self.pp_rank}] TRACE _maybe_authorize_prefill send queued msg(#rids={len(msg.rids)})\n" + "".join(traceback.format_stack(limit=12)))
+                    except Exception:
+                        pass
                 self._spd_authorize_outbox.popleft()
                 semi_pd_log_info_throttle(
                     logger,
@@ -562,6 +583,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
             )
             self._spd_authorize_outbox.append(empty)
+            try:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.d.auth.queue",
+                    msg=f"[DECODE-PP{self.pp_rank}] queue empty GetNextPrefillBatchOutput to unblock P",
+                )
+            except Exception:
+                pass
             return
         approved_rids = [r.rid for r in batch.reqs]
         for rid in approved_rids:
@@ -585,6 +614,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             extend_input_lens=extend_input_lens,
         )
         self._spd_authorize_outbox.append(msg)
+        try:
+            semi_pd_log_info_throttle(
+                logger,
+                key=f"pp{self.pp_rank}.d.auth.queue",
+                msg=f"[DECODE-PP{self.pp_rank}] queue GetNextPrefillBatchOutput: #rids={len(approved_rids)}",
+            )
+        except Exception:
+            pass
+
 
     def process_prefill_result(self, recv_req: BatchProcessPrefillResultReq):
         """
@@ -610,6 +648,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 ),
                 hidden_states=None,
             )
+
+        # Optional trace: who delivered tokens back to DECODE
+        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+            try:
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] TRACE process_prefill_result tokens={num_tokens}\n" + "".join(traceback.format_stack(limit=12)))
+            except Exception:
+                pass
+
 
         result = GenerationBatchResult(
             next_token_ids=recv_req.next_token_ids,
@@ -697,14 +743,42 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         return super().run_batch(batch)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        # D-driven: proactively authorize prefill when candidates exist
+        # Semi-PD decode-only loop:
+        # - proactively authorize PREFILL
+        # - never call super().get_next_batch_to_run() to avoid PREFILL execution on DECODE
         self._maybe_authorize_prefill()
-        # If event_loop_pp reset running_batch to an empty slot, but we have a
-        # ready decode batch prepared by process_prefill_result, move it in.
+
+        # If we have a ready decode batch queued from PREFILL result, adopt it
         if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
             if len(self._ready_decode_batches) > 0:
                 self.running_batch = self._ready_decode_batches.popleft()
-        return super().get_next_batch_to_run()
+
+        # Update/return decode batch only
+        ret = None
+        if not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(self.running_batch)
+            if not self.running_batch.is_empty():
+                ret = self.running_batch
+
+        # If still nothing to run, return an IDLE batch to keep PP synchronization
+        if ret is None and self.pp_size > 1:
+            idle = ScheduleBatch.init_new(
+                [],
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                self.server_args.enable_custom_logit_processor,
+            )
+            idle.prepare_for_idle()
+            ret = idle
+
+        # Handle DP attention if enabled
+        if self.server_args.enable_dp_attention:
+            ret, _ = self.prepare_dp_attn_batch(ret)
+        return ret
 
     def recv_requests(self):
         """Extend parent's recv to also poll local PULL from PREFILL on non-PP0 stages."""

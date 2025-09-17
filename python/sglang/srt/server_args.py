@@ -1831,8 +1831,9 @@ class SemiPDPortArgs:
                 nccl_port = 40000 + random.randint(100, 199)
 
             # Create unified IPC addresses - all processes use the same addresses
-            # Generate unique prefix based on server port and pp_rank to avoid conflicts
-            ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_pp{pp_rank}"
+            # IMPORTANT: Do NOT include PID here; different processes must share the same path
+            # Use only server port and pp_rank to generate a stable, shared prefix
+            ipc_prefix = f"/tmp/semipd_{server_args.port}_pp{pp_rank}"
 
             return SemiPDPortArgs(
                 tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",

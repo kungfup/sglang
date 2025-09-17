@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, MultimodalInputs
 
+from sglang.srt.utils import semi_pd_log_info_throttle
+
 # Compatibility layer for ImageInputs (v0.4.8 uses MultimodalInputs)
 try:
     from sglang.srt.managers.schedule_batch import ImageInputs
@@ -262,39 +264,49 @@ class SemiPDScheduler(Scheduler):
                 self.add_to_waiting_queue(req)
                 return
 
-        # Handle multimodal inputs (reuse native SGLang pipeline)
-        if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-
-            # Debug-only: inspect mm tensors residency
-            try:
-                for _i, _item in enumerate(image_inputs.mm_items):
-                    _pv = getattr(_item, "pixel_values", None)
-                    if hasattr(_pv, "device"):
-                        role = getattr(self, "instance_role", None)
-                        role_name = getattr(role, "name", str(role))
-                        logger.info(
-                            f"[{role_name}] [PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
-                            f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
+        # Handle multimodal inputs only on PREFILL@PP0 in Semi-PD mode
+        if recv_req.mm_inputs is not None and getattr(self.server_args, "enable_semi_pd", False):
+            is_prefill_pp0 = (getattr(self, "instance_role", None) == InstanceRole.PREFILL) and (getattr(self, "pp_rank", 0) == 0)
+            if is_prefill_pp0:
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+                # Debug-only: inspect mm tensors residency
+                try:
+                    for _i, _item in enumerate(image_inputs.mm_items):
+                        _pv = getattr(_item, "pixel_values", None)
+                        if hasattr(_pv, "device"):
+                            logger.info(
+                                f"[PREFILL] [PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
+                                f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
+                            )
+                except Exception:
+                    pass
+                # Expand special multimodal tokens in input_ids and attach inputs
+                req.origin_input_ids = self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                req.extend_image_inputs(image_inputs)
+                # Length validation after expansion
+                if len(req.origin_input_ids) >= self.max_req_input_len:
+                    req.set_finish_with_abort(
+                        error_msg=(
+                            "Multimodal prompt is too long after expanding multimodal tokens. "
+                            f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                         )
-            except Exception:
-                pass
-
-            # Expand special multimodal tokens in input_ids and attach inputs
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
-            req.extend_image_inputs(image_inputs)
-
-            # Length validation after expansion
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                     )
-                )
-                # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
+                    # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
+                    self.add_to_waiting_queue(req)
+                    return
+            else:
+                # In Semi-PD, DECODE and non-PP0 PREFILL defer MM parsing
+                pass
+        elif recv_req.mm_inputs is not None:
+            # Non-Semi-PD mode: keep native behavior
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            req.origin_input_ids = self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+            req.extend_image_inputs(image_inputs)
+            if len(req.origin_input_ids) >= self.max_req_input_len:
+                req.set_finish_with_abort(error_msg=(
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                ))
                 self.add_to_waiting_queue(req)
                 return
 
@@ -357,6 +369,24 @@ class SemiPDScheduler(Scheduler):
         else:
             # SemiPD
             self.add_to_waiting_queue(req)
+            # Semi-PD PP: On DECODE side, enqueue this rid as a candidate for PREFILL authorization
+            try:
+                if getattr(self, "instance_role", None) == InstanceRole.DECODE:
+                    if hasattr(self, "_spd_candidate_set"):
+                        self._spd_candidate_set.add(req.rid)
+                    if hasattr(self, "_spd_prealloc_queue"):
+                        self._spd_prealloc_queue.append(req.rid)
+                    try:
+                        semi_pd_log_info_throttle(
+                            logger,
+                            key=f"pp{getattr(self,'pp_rank','?')}.d.candidate.enq",
+                            msg=f"[DECODE-PP{getattr(self,'pp_rank','?')}] candidate+=1 rid={req.rid}",
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
 
     def get_ipc_info(self):
         return self.tp_worker.get_ipc_info()
