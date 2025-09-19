@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
+import logging
 
 from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -38,6 +39,13 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+logger = logging.getLogger(__name__)
+
+# Global FP8 verbose logging flag (opt-in)
+_FP8_DEBUG = get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG")
+# Best-effort de-dup for hot-path debug logs
+_FP8_DEBUG_SEEN = set()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -532,6 +540,44 @@ def apply_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
+    if _FP8_DEBUG:
+        try:
+            K_in = int(input_2d.shape[1])
+            w_shape = tuple(weight.shape)
+            w0 = int(w_shape[0]) if len(w_shape) >= 1 else None
+            w1 = int(w_shape[1]) if len(w_shape) >= 2 else None
+            ws_numel = int(getattr(weight_scale, 'numel', lambda: 0)())
+            ws_shape = tuple(getattr(weight_scale, 'shape', []))
+            ws_dtype = str(getattr(weight_scale, 'dtype', None))
+            suspect_transposed = (w0 is not None and w1 is not None and (w0 != K_in and w1 == K_in))
+            suspect_scale_axis = None
+            if ws_numel > 1 and w0 is not None and w1 is not None:
+                if ws_numel == w0:
+                    suspect_scale_axis = 'K-dim (expected N)'
+                elif ws_numel == w1:
+                    suspect_scale_axis = 'N-dim (expected)'
+                else:
+                    suspect_scale_axis = 'mismatch'
+            key = (id(weight), K_in, w_shape)
+            if key not in _FP8_DEBUG_SEEN:
+                _FP8_DEBUG_SEEN.add(key)
+                logger.info(
+                "[FP8_DEBUG][enter] in.shape=%s in.dtype=%s in.dev=%s in.stride=%s in.contig=%s "
+                "W.shape=%s W.dtype=%s W.dev=%s W.stride=%s W.contig=%s cutlass=%s pad_out=%s compressed=%s K_in=%s "
+                "W0=%s W1=%s suspect_transposed=%s W_scale.shape=%s numel=%s dtype=%s suspect_scale_axis=%s",
+                tuple(input.shape), str(input.dtype), str(input.device), tuple(input.stride()), input.is_contiguous(),
+                tuple(weight.shape), str(weight.dtype), str(weight.device), tuple(weight.stride()), weight.is_contiguous(),
+                cutlass_fp8_supported, (output_padding is not None), compressed_tensor_quant, K_in,
+                w0, w1, str(suspect_transposed), ws_shape, ws_numel, ws_dtype, suspect_scale_axis,
+                )
+            if input_scale is not None:
+                logger.info(
+                    "[FP8_DEBUG] input_scale.shape=%s numel=%s dtype=%s",
+                    tuple(getattr(input_scale, 'shape', [])), int(getattr(input_scale, 'numel', lambda: 0)()), str(getattr(input_scale, 'dtype', None))
+                )
+        except Exception:
+            pass
+
     if compressed_tensor_quant:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
@@ -541,6 +587,14 @@ def apply_fp8_linear(
                 input_scale,
                 use_per_token_if_dynamic=use_per_token_if_dynamic,
             )
+            if _FP8_DEBUG:
+                try:
+                    logger.info(
+                        "[FP8_DEBUG][quant CT] qinput.shape=%s dtype=%s contig=%s x_scale.shape=%s numel=%s",
+                        tuple(qinput.shape), str(qinput.dtype), qinput.is_contiguous(), tuple(getattr(x_scale, 'shape', [])), int(getattr(x_scale, 'numel', lambda: 0)()),
+                    )
+                except Exception:
+                    pass
 
             # Fused GEMM_DQ
             if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
@@ -586,6 +640,15 @@ def apply_fp8_linear(
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
             )
+
+            if _FP8_DEBUG:
+                try:
+                    logger.info(
+                        "[FP8_DEBUG][quant fallback CT] qinput.shape=%s dtype=%s contig=%s x_scale.shape=%s numel=%s",
+                        tuple(qinput.shape), str(qinput.dtype), qinput.is_contiguous(), tuple(getattr(x_scale, 'shape', [])), int(getattr(x_scale, 'numel', lambda: 0)()),
+                    )
+                except Exception:
+                    pass
 
             per_tensor_weights = weight_scale.numel() == 1
             per_tensor_activations = x_scale.numel() == 1
@@ -677,6 +740,15 @@ def apply_fp8_linear(
                         input_2d, group_size=input_2d.shape[1]
                     )
 
+        if _FP8_DEBUG:
+            try:
+                logger.info(
+                    "[FP8_DEBUG][quant dyn] qinput.shape=%s dtype=%s contig=%s x_scale.shape=%s numel=%s",
+                    tuple(qinput.shape), str(qinput.dtype), qinput.is_contiguous(), tuple(getattr(x_scale, 'shape', [])), int(getattr(x_scale, 'numel', lambda: 0)()),
+                )
+            except Exception:
+                pass
+
         if cutlass_fp8_supported:
             try:
                 if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
@@ -693,6 +765,18 @@ def apply_fp8_linear(
                     assert (
                         weight_scale.numel() == weight.shape[1]
                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                    if _FP8_DEBUG:
+                        try:
+                            M, K_a = int(qinput.shape[0]), int(qinput.shape[1])
+                            K_b, N = int(weight.shape[0]), int(weight.shape[1])
+                            logger.info(
+                                "[FP8_DEBUG][fp8_scaled_mm CT] A[M,K]=(%d,%d) B[K,N]=(%d,%d) x_scale.shape=%s w_scale.shape=%s out_dtype=%s bias=%s compat_K=%s",
+                                M, K_a, K_b, N,
+                                tuple(getattr(x_scale, 'shape', [])), tuple(getattr(weight_scale, 'shape', [])),
+                                str(input.dtype), str(bias is not None), K_a == K_b,
+                            )
+                        except Exception:
+                            pass
                     output = fp8_scaled_mm(
                         qinput,
                         weight,

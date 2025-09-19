@@ -29,7 +29,10 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, next_power_of_2, get_bool_env_var
+import logging
+
+logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -198,6 +201,15 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                logger.info(
+                    "[FP8_DEBUG][process ModelOpt before] prefix=%s W.shape=%s dtype=%s dev=%s W_scale.shape=%s numel=%s",
+                    getattr(layer, "prefix", None), tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device),
+                    tuple(getattr(layer, "weight_scale").shape), int(getattr(layer, "weight_scale").numel()),
+                )
+        except Exception:
+            pass
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
@@ -207,6 +219,16 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                logger.info(
+                    "[FP8_DEBUG][process ModelOpt after] prefix=%s W.shape=%s dtype=%s dev=%s W_scale.shape=%s numel=%s has_input_scale=%s",
+                    getattr(layer, "prefix", None), tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device),
+                    tuple(getattr(layer, "weight_scale").shape), int(getattr(layer, "weight_scale").numel()), True,
+                )
+                setattr(layer, "_fp8_weight_processed", True)
+        except Exception:
+            pass
 
     def apply(
         self,
@@ -215,6 +237,19 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        try:
+            if (get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG")) and not getattr(layer, "_fp8_debug_logged", False):
+                layer._fp8_debug_logged = True
+                logger.info(
+                    "[FP8_DEBUG][layer ModelOpt] prefix=%s tp_rank=%s cutlass=%s x.shape=%s x.dtype=%s W.shape=%s W.dtype=%s W.dev=%s W_scale.shape=%s numel=%s has_input_scale=%s",
+                    getattr(layer, "prefix", None), getattr(layer, "tp_rank", None), self.cutlass_fp8_supported,
+                    tuple(x.shape), str(x.dtype), tuple(layer.weight.shape), str(layer.weight.dtype), str(layer.weight.device),
+                    tuple(getattr(layer, "weight_scale", torch.tensor([])).shape) if hasattr(layer, "weight_scale") else None,
+                    int(getattr(layer, "weight_scale", torch.tensor([])).numel()) if hasattr(layer, "weight_scale") else 0,
+                    hasattr(layer, "input_scale") and (getattr(layer, "input_scale") is not None),
+                )
+        except Exception:
+            pass
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,

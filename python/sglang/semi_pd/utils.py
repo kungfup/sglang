@@ -47,6 +47,10 @@ class IPCInfo:
     req_to_token_info: dict
     # New: allow passing decode's token cap for prefill proportional clamp
     decode_max_total_num_tokens: Optional[int] = None
+    # New: extra attribute tensor handles (non-parameter/non-buffer attributes)
+    # e.g., FP8 metadata like weight_scale when not registered as Parameter, workspace, etc.
+    extra_attr_handles: dict | None = None
+    extra_attr_info: dict | None = None
 
 
 class InstanceRole(Enum):

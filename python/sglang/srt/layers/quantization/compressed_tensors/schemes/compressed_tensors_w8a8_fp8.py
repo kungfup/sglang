@@ -21,6 +21,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.utils import get_bool_env_var
+import logging
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -149,6 +153,19 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        try:
+            if (get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG")) and not getattr(layer, "_fp8_debug_logged", False):
+                layer._fp8_debug_logged = True
+                logger.info(
+                    "[FP8_DEBUG][layer CT] prefix=%s tp_rank=%s strategy=%s static_in_scale=%s x.shape=%s x.dtype=%s W.shape=%s W.dtype=%s W.dev=%s W_scale.shape=%s numel=%s has_input_scale=%s",
+                    getattr(layer, "prefix", None), getattr(layer, "tp_rank", None), str(self.strategy), self.is_static_input_scheme,
+                    tuple(x.shape), str(x.dtype), tuple(layer.weight.shape), str(layer.weight.dtype), str(layer.weight.device),
+                    tuple(getattr(layer, "weight_scale", torch.tensor([])).shape) if hasattr(layer, "weight_scale") else None,
+                    int(getattr(layer, "weight_scale", torch.tensor([])).numel()) if hasattr(layer, "weight_scale") else 0,
+                    hasattr(layer, "input_scale") and (getattr(layer, "input_scale") is not None),
+                )
+        except Exception:
+            pass
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,

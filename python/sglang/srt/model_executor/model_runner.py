@@ -624,6 +624,7 @@ class ModelRunner:
                 param_tensor.shape,
                 param_tensor.dtype,
                 param_tensor.device,
+                tuple(param_tensor.stride()),
             )
 
         # Get Non-Parameter Buffers, eg. cos_sin_cache
@@ -659,6 +660,7 @@ class ModelRunner:
                 buffer_tensor.shape,
                 buffer_tensor.dtype,
                 buffer_tensor.device,
+                tuple(buffer_tensor.stride()),
             )
 
         # Get KV Cache Handles
@@ -705,6 +707,99 @@ class ModelRunner:
             "req_to_token_device": req_to_token_tensor.device,
         }
 
+        # Collect extra attribute tensors for FP8 metadata or workspaces that are not
+        # registered as parameters/buffers (e.g., workspace for marlin/MoE).
+        extra_attr_handles = {}
+        extra_attr_info = {}
+        try:
+            import torch
+            CANDIDATE_ATTRS = {
+                # Only the minimal FP8 metadata needed for standard Linear/Attention
+                "weight_scale",
+                "weight_scale_inv",
+                "input_scale",
+            }
+            # Build a quick set for fast skip of those already in params/buffers
+            known_param_names = set(weight_handles.keys())
+            known_buffer_names = set(register_buffer_handles.keys())
+
+            for mod_name, mod in self.model.named_modules():
+                # Only consider modules that likely need FP8 metadata
+                try:
+                    w = getattr(mod, "weight", None)
+                    w_dtype = str(getattr(w, "dtype", ""))
+                    likely_fp8 = (w is not None) and ("float8" in w_dtype)
+                except Exception:
+                    likely_fp8 = False
+                if not likely_fp8:
+                    # Also consider if module explicitly has any candidate attrs
+                    if not any(hasattr(mod, a) for a in CANDIDATE_ATTRS):
+                        continue
+                for attr in CANDIDATE_ATTRS:
+                    if not hasattr(mod, attr):
+                        continue
+                    t = getattr(mod, attr)
+                    if not isinstance(t, torch.Tensor):
+                        continue
+                    if t.numel() == 0:
+                        continue
+                    full_name = f"{mod_name}.{attr}" if mod_name else attr
+                    if (full_name in known_param_names) or (full_name in known_buffer_names):
+                        # already captured via named_parameters/buffers
+                        continue
+                    try:
+                        handle = get_ipc_handle(t)
+                        extra_attr_handles[full_name] = handle
+                        extra_attr_info[full_name] = (tuple(t.shape), t.dtype, t.device)
+                    except Exception:
+                        # Best-effort; skip non-shareable tensors
+                        continue
+            # Optional DECODE-side diagnostics for FP8 layers
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                trace_filter = os.environ.get("SGLANG_SEMIPD_FP8_TRACE_LAYER", "")
+                printed = 0
+                for name, module in self.model.named_modules():
+                    try:
+                        w = getattr(module, "weight")
+                    except Exception:
+                        continue
+                    if not hasattr(w, "dtype"):
+                        continue
+                    if "float8" not in str(w.dtype):
+                        continue
+                    has_ws = hasattr(module, "weight_scale")
+                    ws = getattr(module, "weight_scale", None) if has_ws else None
+                    ws_shape = tuple(getattr(ws, "shape", [])) if ws is not None else None
+                    ws_numel = int(getattr(ws, "numel", lambda: 0)()) if ws is not None else 0
+                    ws_dev = str(getattr(ws, "device", "<na>")) if ws is not None else "<na>"
+                    ptr = hex(w.data_ptr()) if hasattr(w, "data_ptr") else "<na>"
+                    logger.info("[SEMI-PD][FP8][DECODE] layer=%s w.dtype=%s has_weight_scale=%s ws_shape=%s ws_numel=%s ws_dev=%s w_ptr=%s",
+                                name, str(w.dtype), has_ws, ws_shape, ws_numel, ws_dev, ptr)
+                    # Extra: list present FP8-related attrs on this module
+                    if trace_filter and trace_filter in name:
+                        cand = [
+                            "weight_scale","weight_scale_inv","input_scale","workspace",
+                            "w13_weight_scale","w2_weight_scale","w13_weight_scale_inv","w2_weight_scale_inv",
+                            "w13_weight_scale1","w2_weight_scale1","w13_input_scale","w2_input_scale",
+                        ]
+                        present = []
+                        for a in cand:
+                            if hasattr(module, a):
+                                t = getattr(module, a)
+                                if isinstance(t, torch.Tensor):
+                                    present.append(f"{a}:{tuple(t.shape)}/{t.dtype}")
+                                else:
+                                    present.append(f"{a}:<non-tensor>")
+                        if present:
+                            logger.info("[SEMI-PD][FP8][DECODE-ATTRS] layer=%s %s", name, ", ".join(present))
+                    printed += 1
+                    if trace_filter and trace_filter not in name:
+                        continue
+                    if printed >= 8 and not trace_filter:
+                        break
+        except Exception:
+            pass
+
         return IPCInfo(
             params_info=tensor_info,
             weight_handles=weight_handles,
@@ -714,12 +809,15 @@ class ModelRunner:
             req_to_token_handle=req_to_token_handles,
             req_to_token_info=req_to_token_info,
             decode_max_total_num_tokens=int(getattr(self, 'max_total_num_tokens', 0)) or None,
+            extra_attr_handles=extra_attr_handles or {},
+            extra_attr_info=extra_attr_info or {},
         )
 
     def share_params_from_ipc(self, ipc_info: IPCInfo):
         # Reconstruct parameters from IPC handles
         logger.info("🔍 [ORIGINAL SEMI-PD] Starting parameter sharing from IPC...")
 
+        # 1) Map all parameters that exist locally
         for name, _ in self.model.named_parameters():
             # Get the path to the parameter
             path = name.split(".")
@@ -736,7 +834,12 @@ class ModelRunner:
             param_name = path[-1]
 
             share_param_handle = ipc_info.weight_handles.get(name, None)
-            shape, dtype, device = ipc_info.params_info[name]
+            info = ipc_info.params_info[name]
+            if len(info) == 4:
+                shape, dtype, device, stride = info
+            else:
+                shape, dtype, device = info
+                stride = None
             size = reduce(lambda x, y: x * y, shape)
 
             assert (
@@ -747,16 +850,68 @@ class ModelRunner:
                 if shape == torch.Size([0]):
                     share_param_tensor = torch.empty(0, dtype=dtype, device=device)
                 else:
-                    share_param_tensor = convert_ipc_handle_to_tensor(
+                    base_tensor = convert_ipc_handle_to_tensor(
                         share_param_handle, size, dtype, device
-                    ).view(shape)
-            except Exception as e:
-                raise NotImplementedError(f"Parameter {name, size, dtype, device} is not supported in Semi-PD")
+                    )
+                    share_param_tensor = (
+                        base_tensor.as_strided(size=shape, stride=stride)
+                        if stride is not None
+                        else base_tensor.view(shape)
+                    )
+            except Exception:
+                raise NotImplementedError(f"Parameter {(name, size, dtype, device)} is not supported in Semi-PD")
 
             new_param = nn.Parameter(share_param_tensor, requires_grad=False)
             setattr(module, param_name, new_param)
 
-        # Reconstruct registered buffers from IPC handles
+        # 2) Map extra parameters that exist in DECODE but not defined locally (e.g., FP8 weight_scale)
+        try:
+            local_param_names = set(n for n, _ in self.model.named_parameters())
+            extra_param_names = [n for n in ipc_info.weight_handles.keys() if n not in local_param_names]
+            if extra_param_names:
+                logger.info("[SEMI-PD][IPC] Adding %d extra params from DECODE (e.g., FP8 metadata)", len(extra_param_names))
+            for name in extra_param_names:
+                path = name.split(".")
+                module = self.model
+                for p in path[:-1]:
+                    module = module[int(p)] if p.isdigit() else getattr(module, p)
+                param_name = path[-1]
+
+                share_param_handle = ipc_info.weight_handles.get(name, None)
+                info = ipc_info.params_info[name]
+                if info is None:
+                    continue
+                if len(info) == 4:
+                    shape, dtype, device, stride = info
+                else:
+                    shape, dtype, device = info
+                    stride = None
+                if shape is None:
+                    # Should not happen for params, but guard anyway
+                    continue
+                size = reduce(lambda x, y: x * y, shape)
+                if shape == torch.Size([0]):
+                    share_param_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    base_tensor = convert_ipc_handle_to_tensor(
+                        share_param_handle, size, dtype, device
+                    )
+                    share_param_tensor = (
+                        base_tensor.as_strided(size=shape, stride=stride)
+                        if stride is not None
+                        else base_tensor.view(shape)
+                    )
+                new_param = nn.Parameter(share_param_tensor, requires_grad=False)
+                setattr(module, param_name, new_param)
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                    try:
+                        logger.info("[SEMI-PD][IPC][EXTRA] param=%s shape=%s dtype=%s dev=%s", name, tuple(shape), str(dtype), str(device))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("[SEMI-PD][IPC] Failed to add extra params from DECODE")
+
+        # Reconstruct registered buffers from IPC handles (existing locally)
         for name, _ in self.model.named_buffers():
             # Get the path to the parameter
             path = name.split(".")
@@ -773,7 +928,12 @@ class ModelRunner:
             buffer_name = path[-1]
 
             share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
-            shape, dtype, device = ipc_info.params_info[name]
+            info = ipc_info.params_info[name]
+            if len(info) == 4:
+                shape, dtype, device, stride = info
+            else:
+                shape, dtype, device = info
+                stride = None
 
             if shape is None:
                 continue
@@ -785,11 +945,112 @@ class ModelRunner:
             if shape == torch.Size([0]):
                 share_buffer_tensor = torch.empty(0, dtype=dtype, device=device)
             else:
-                share_buffer_tensor = convert_ipc_handle_to_tensor(
+                base_tensor = convert_ipc_handle_to_tensor(
                     share_buffer_handle, size, dtype, device
-                ).view(shape)
+                )
+                share_buffer_tensor = (
+                    base_tensor.as_strided(size=shape, stride=stride)
+                    if stride is not None
+                    else base_tensor.view(shape)
+                )
 
             module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+
+        # 2b) Map extra buffers present only in DECODE (e.g., weight_scale_inv/workspace if registered as buffers)
+        try:
+            local_buffer_names = set(n for n, _ in self.model.named_buffers())
+            extra_buffer_names = [n for n in ipc_info.register_buffer_handles.keys() if n not in local_buffer_names]
+            for name in extra_buffer_names:
+                path = name.split(".")
+                module = self.model
+                for p in path[:-1]:
+                    module = module[int(p)] if p.isdigit() else getattr(module, p)
+                buffer_name = path[-1]
+
+                share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
+                shape, dtype, device = ipc_info.params_info[name]
+                if shape is None:
+                    continue
+                size = reduce(lambda x, y: x * y, shape)
+                if shape == torch.Size([0]):
+                    share_buffer_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    share_buffer_tensor = convert_ipc_handle_to_tensor(
+                        share_buffer_handle, size, dtype, device
+                    ).view(shape)
+                module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                    try:
+                        logger.info("[SEMI-PD][IPC][EXTRA-BUF] buffer=%s shape=%s dtype=%s dev=%s", name, tuple(shape), str(dtype), str(device))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("[SEMI-PD][IPC] Failed to add extra buffers from DECODE")
+        # 3) Map extra attribute tensors (non-parameter/non-buffer) from DECODE
+        #    e.g., FP8 metadata that are plain attributes (weight_scale if not registered, workspace, etc.)
+        try:
+            extra_attr_handles = getattr(ipc_info, "extra_attr_handles", {}) or {}
+            extra_attr_info = getattr(ipc_info, "extra_attr_info", {}) or {}
+            if extra_attr_handles:
+                logger.info("[SEMI-PD][IPC] Mapping %d extra attribute tensors from DECODE", len(extra_attr_handles))
+            # Attributes that we should register as Parameters for consistency
+            # Minimal set for Qwen2.5-VL (standard Linear/Attention)
+            PARAM_LIKE_ATTRS = {
+                "weight_scale",
+                "weight_scale_inv",
+                "input_scale",
+            }
+            for full_name, handle in extra_attr_handles.items():
+                # full_name format: "module_path.attr"
+                parts = full_name.split(".")
+                attr_name = parts[-1]
+                mod_path = parts[:-1]
+                module = self.model
+                for p in mod_path:
+                    module = module[int(p)] if p.isdigit() else getattr(module, p)
+                shape, dtype, device = extra_attr_info.get(full_name, (None, None, None))
+                if shape is None:
+                    continue
+                size = 1
+                for d in shape:
+                    size *= d
+                tensor = convert_ipc_handle_to_tensor(handle, size, dtype, device).view(shape)
+                if attr_name in PARAM_LIKE_ATTRS:
+                    setattr(module, attr_name, nn.Parameter(tensor, requires_grad=False))
+                else:
+                    # plain attribute
+                    setattr(module, attr_name, tensor)
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                    try:
+                        logger.info("[SEMI-PD][IPC][EXTRA-ATTR] %s shape=%s dtype=%s dev=%s as_param=%s", full_name, tuple(shape), str(dtype), str(device), attr_name in PARAM_LIKE_ATTRS)
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("[SEMI-PD][IPC] Failed to map extra attribute tensors from DECODE")
+
+        # Finalize: ensure FP8-required attrs exist on PREFILL side
+        try:
+            fixed = 0
+            missing_scales = 0
+            for name, module in self.model.named_modules():
+                w = getattr(module, "weight", None)
+                if w is None or not hasattr(w, "dtype"):
+                    continue
+                if "float8" not in str(w.dtype):
+                    continue
+                # Ensure input_scale attribute exists (dynamic scheme uses None)
+                if not hasattr(module, "input_scale"):
+                    setattr(module, "input_scale", None)
+                    fixed += 1
+                # Sanity: at least one of weight_scale or weight_scale_inv should exist
+                if not (hasattr(module, "weight_scale") or hasattr(module, "weight_scale_inv")):
+                    missing_scales += 1
+                    if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                        logger.warning("[SEMI-PD][FP8] layer=%s has float8 weight but no weight_scale/_inv attribute", name)
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                logger.info("[SEMI-PD][FP8] sanitized modules: input_scale_added=%d missing_scale_warn=%d", fixed, missing_scales)
+        except Exception:
+            pass
 
         # Reconstruct KV Cache from IPC handles
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
@@ -881,6 +1142,54 @@ class ModelRunner:
                 vis_param_bytes / (1024 * 1024),
                 sorted(list(vis_devices)) if vis_devices else [],
             )
+        except Exception:
+            pass
+
+        # Extra diagnostics for FP8 metadata presence on PREFILL side
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                trace_filter = os.environ.get("SGLANG_SEMIPD_FP8_TRACE_LAYER", "")
+                printed = 0
+                for name, module in self.model.named_modules():
+                    if not hasattr(module, "weight"):
+                        continue
+                    try:
+                        w = getattr(module, "weight")
+                        w_dtype = str(getattr(w, "dtype", "<unk>"))
+                        if "float8" not in w_dtype:
+                            continue
+                        has_ws = hasattr(module, "weight_scale")
+                        ws = getattr(module, "weight_scale", None) if has_ws else None
+                        ws_shape = tuple(getattr(ws, "shape", [])) if ws is not None else None
+                        ws_numel = int(getattr(ws, "numel", lambda: 0)()) if ws is not None else 0
+                        ws_dev = str(getattr(ws, "device", "<na>")) if ws is not None else "<na>"
+                        logger.info("[SEMI-PD][FP8][PREFILL] layer=%s w.dtype=%s has_weight_scale=%s ws_shape=%s ws_numel=%s ws_dev=%s w_ptr=%s",
+                                    name, w_dtype, has_ws, ws_shape, ws_numel, ws_dev,
+                                    hex(w.data_ptr()) if hasattr(w, "data_ptr") else "<na>")
+                        # Extra: list present FP8-related attrs on this module
+                        if trace_filter and trace_filter in name:
+                            cand = [
+                                "weight_scale","weight_scale_inv","input_scale","workspace",
+                                "w13_weight_scale","w2_weight_scale","w13_weight_scale_inv","w2_weight_scale_inv",
+                                "w13_weight_scale1","w2_weight_scale1","w13_input_scale","w2_input_scale",
+                            ]
+                            present = []
+                            for a in cand:
+                                if hasattr(module, a):
+                                    t = getattr(module, a)
+                                    if isinstance(t, torch.Tensor):
+                                        present.append(f"{a}:{tuple(t.shape)}/{t.dtype}")
+                                    else:
+                                        present.append(f"{a}:<non-tensor>")
+                            if present:
+                                logger.info("[SEMI-PD][FP8][PREFILL-ATTRS] layer=%s %s", name, ", ".join(present))
+                        printed += 1
+                        if trace_filter and trace_filter not in name:
+                            continue
+                        if printed >= 8 and not trace_filter:
+                            break
+                    except Exception:
+                        continue
         except Exception:
             pass
 
