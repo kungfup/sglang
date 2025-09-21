@@ -1215,6 +1215,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
+            # Attach request id onto multimodal_inputs for downstream diagnostics
+            try:
+                if req.multimodal_inputs is not None:
+                    setattr(req.multimodal_inputs, "_rid", req.rid)
+            except Exception:
+                pass
             multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
@@ -1321,8 +1327,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
-            # no device move here; leave pixel_values as-is (usually CPU tensors)
-            pass
+            # Defensive: ensure pixel_values stay on CPU; do not pre-move to CUDA here.
+            try:
+                pv = getattr(mm_input, "pixel_values", None)
+                if isinstance(pv, torch.Tensor):
+                    if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                        logger.info(
+                            "[MM_PREPROC] pixel_values before_move device=%s dtype=%s shape=%s",
+                            str(pv.device), str(pv.dtype), tuple(pv.shape),
+                        )
+                    if pv.is_cuda:
+                        # Move back to CPU to avoid PP cross-device bounces; model will move when needed
+                        pv = pv.cpu()
+                        setattr(mm_input, "pixel_values", pv)
+                        if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                            logger.info("[MM_PREPROC] pixel_values after_move device=%s", str(pv.device))
+            except Exception:
+                pass
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)

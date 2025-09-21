@@ -283,6 +283,7 @@ def _get_chunked_prefill_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    rid_list: Optional[List] = None,
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
@@ -298,7 +299,10 @@ def _get_chunked_prefill_embedding(
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
             # Try to assemble from request-local per-item features first (no ViT recompute)
-            _per_item_feats = [getattr(it, "_req_local_mm_feat", None) for it in embedding_items_per_req]
+            _per_item_feats = [
+                getattr(it, "precomputed_features", None) or getattr(it, "_req_local_mm_feat", None)
+                for it in embedding_items_per_req
+            ]
             if all(f is not None for f in _per_item_feats) and len(_per_item_feats) > 0:
                 try:
                     embedding_per_req = torch.concat(_per_item_feats, dim=0)
@@ -321,7 +325,7 @@ def _get_chunked_prefill_embedding(
                     _item_lengths = [(oe - os + 1) for (os, oe) in items_offset]
                     _pos = 0
                     for _it, _L in zip(embedding_items_per_req, _item_lengths):
-                        _it._req_local_mm_feat = _embed2d[_pos : _pos + _L]
+                        _it.precomputed_features = _embed2d[_pos : _pos + _L]
                         _pos += _L
                 except Exception:
                     pass
@@ -344,12 +348,13 @@ def _get_chunked_prefill_embedding(
             else embedding_per_req.shape[0] * embedding_per_req.shape[1]
         )
         if end_index == embedding_per_req_length:
+            # Free embedding from process-level cache
             embedding_cache.free(embedding_items_hash)
-            # Clear request-local per-item features at the end of the last chunk to release memory
+            # Free per-request precomputed features once all mm tokens are consumed
             try:
                 for _it in embedding_items_per_req:
-                    if hasattr(_it, "_req_local_mm_feat"):
-                        _it._req_local_mm_feat = None
+                    if hasattr(_it, "precomputed_features"):
+                        _it.precomputed_features = None
             except Exception:
                 pass
         embedding_list.append(embedding_per_req_chunk)
@@ -425,8 +430,35 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
     """
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items)
-    if embedding is None:
+    # Prefer request-local precomputed features if all items have them, and still do chunk slicing
+    if all(getattr(item, "precomputed_features", None) is not None for item in embedding_items):
+        embedding_list = []
+        for i in range(len(prefix_length)):
+            start = items_size[i]
+            end = items_size[i + 1]
+            req_items = embedding_items[start:end]
+            if len(req_items) == 0:
+                continue
+            try:
+                embedding_per_req = torch.concat(
+                    [it.precomputed_features for it in req_items], dim=0
+                )
+            except Exception:
+                # Fallback: if concat fails, skip this req
+                continue
+            items_offset = items_offset_list[i]
+            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+                embedding_per_req,
+                prefix_length[i],
+                extend_length[i],
+                items_offset,
+            )
+            if embedding_per_req_chunk is not None and embedding_per_req_chunk.numel() > 0:
+                embedding_list.append(embedding_per_req_chunk)
+        if len(embedding_list) == 0:
+            return None, None
+        embedding = torch.concat(embedding_list, dim=0)
+    else:
         embedding = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
