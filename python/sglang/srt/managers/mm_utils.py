@@ -297,21 +297,39 @@ def _get_chunked_prefill_embedding(
             continue
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
-            try:
-                logger.info(
-                    "[MM_EMBED_CALL] pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
-                    os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
-                    int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
-                    int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
-                )
-            except Exception:
-                pass
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
-                )
+            # Try to assemble from request-local per-item features first (no ViT recompute)
+            _per_item_feats = [getattr(it, "_req_local_mm_feat", None) for it in embedding_items_per_req]
+            if all(f is not None for f in _per_item_feats) and len(_per_item_feats) > 0:
+                try:
+                    embedding_per_req = torch.concat(_per_item_feats, dim=0)
+                except Exception:
+                    embedding_per_req = None
+            if embedding_per_req is None:
+                try:
+                    logger.info(
+                        "[MM_EMBED_CALL] pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
+                        os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
+                        int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
+                        int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
+                    )
+                except Exception:
+                    pass
+                embedding_per_req = data_embedding_func(embedding_items_per_req)
+                # Store request-local per-item features (flattened) for later chunks
+                try:
+                    _embed2d = embedding_per_req.reshape(-1, embedding_per_req.shape[-1])
+                    _item_lengths = [(oe - os + 1) for (os, oe) in items_offset]
+                    _pos = 0
+                    for _it, _L in zip(embedding_items_per_req, _item_lengths):
+                        _it._req_local_mm_feat = _embed2d[_pos : _pos + _L]
+                        _pos += _L
+                except Exception:
+                    pass
+                if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+                    print_warning_once(
+                        "Multimodal embedding cache is full. Consider increasing the "
+                        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
+                    )
 
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
@@ -327,6 +345,13 @@ def _get_chunked_prefill_embedding(
         )
         if end_index == embedding_per_req_length:
             embedding_cache.free(embedding_items_hash)
+            # Clear request-local per-item features at the end of the last chunk to release memory
+            try:
+                for _it in embedding_items_per_req:
+                    if hasattr(_it, "_req_local_mm_feat"):
+                        _it._req_local_mm_feat = None
+            except Exception:
+                pass
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None
