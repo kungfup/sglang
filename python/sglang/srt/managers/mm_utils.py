@@ -310,9 +310,15 @@ def _get_chunked_prefill_embedding(
                     embedding_per_req = None
             if embedding_per_req is None:
                 try:
+                    _rid = None
+                    try:
+                        if rid_list is not None:
+                            _rid = rid_list[i] if i < len(rid_list) else None
+                    except Exception:
+                        _rid = None
                     logger.info(
-                        "[MM_EMBED_CALL] pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
-                        os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
+                        "[MM_EMBED_CALL] rid=%s pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
+                        str(_rid), os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
                         int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
                         int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
                     )
@@ -410,6 +416,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    rid_list: Optional[List] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -466,6 +473,7 @@ def get_embedding_and_mask(
             prefix_length,
             extend_length,
             items_offset_list,
+            rid_list=rid_list,
         )
         if embedding is None:
             return None, None
@@ -518,6 +526,12 @@ def embed_mm_inputs(
 
     embeddings, masks = [], []
 
+    # Build rid list for diagnostics if available (attached in ScheduleBatch)
+    try:
+        rid_list = [getattr(mm, "_rid", None) for mm in mm_inputs_list]
+    except Exception:
+        rid_list = None
+
     # 2. Get multimodal embedding separately
     # TODO: make this more generic
     # Try get image embedding if any
@@ -556,6 +570,7 @@ def embed_mm_inputs(
             prefix_length=extend_prefix_lens,
             extend_length=extend_seq_lens,
             items_offset_list=items_offsets,
+            rid_list=rid_list,
         )
         embeddings += [embedding]
         masks += [mask]
@@ -596,6 +611,7 @@ def embed_mm_inputs(
             prefix_length=extend_prefix_lens,
             extend_length=extend_seq_lens,
             items_offset_list=items_offsets,
+            rid_list=rid_list,
         )
         embeddings += [embedding]
         masks += [mask]

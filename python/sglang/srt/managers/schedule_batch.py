@@ -38,6 +38,9 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
+import os
+from sglang.utils import logger
+
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1602,7 +1605,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.output_ids.to(torch.int64)
                 )
         # Update fields
-        
+
         self.input_ids = self.output_ids
         self.output_ids = None
 
