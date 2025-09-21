@@ -132,20 +132,45 @@ class BaseMultimodalProcessor(ABC):
             kwargs["audios"] = audios
 
         processor = self._processor
-        if hasattr(processor, "image_processor") and isinstance(
-            processor.image_processor, BaseImageProcessorFast
-        ):
+        try:
+            is_fast = hasattr(processor, "image_processor") and isinstance(
+                processor.image_processor, BaseImageProcessorFast
+            )
+        except Exception:
+            is_fast = False
+        if is_fast:
             kwargs["device"] = "cuda"
+        logger.info(
+            "[MM_PREPROC] pid=%s fast_image_processor=%s set_device=%s arch=%s",
+            os.getpid(),
+            is_fast,
+            kwargs.get("device", None),
+            self.arch,
+        )
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
-        if "pixel_values" in result and isinstance(
-            result["pixel_values"], torch.Tensor
-        ):
+        if "pixel_values" in result and isinstance(result["pixel_values"], torch.Tensor):
+            try:
+                logger.info(
+                    "[MM_PREPROC] pixel_values before_move device=%s dtype=%s shape=%s",
+                    getattr(result["pixel_values"], "device", "n/a"),
+                    getattr(result["pixel_values"], "dtype", "n/a"),
+                    tuple(result["pixel_values"].shape),
+                )
+            except Exception:
+                pass
             result["pixel_values"] = result["pixel_values"].to("cpu")
+            try:
+                logger.info(
+                    "[MM_PREPROC] pixel_values after_move device=%s",
+                    getattr(result["pixel_values"], "device", "n/a"),
+                )
+            except Exception:
+                pass
         return result
 
     @abstractmethod

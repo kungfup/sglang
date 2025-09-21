@@ -42,7 +42,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_tp_group
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -584,6 +584,35 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # Move once to target device with proper dtypes
         pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype, non_blocking=True)
         image_grid_thw = image_grid_thw.to(device=self.device, non_blocking=True)
+        # Lightweight visibility for vision device usage (always on)
+        try:
+            logger.info(
+                "[VLM_VISION] pp_first=%s target_dev=%s pv_shape=%s grid_shape=%s dtype=%s",
+                getattr(getattr(self, "pp_group", None), "is_first_rank", None),
+                str(self.device),
+                tuple(pixel_values.shape),
+                tuple(image_grid_thw.shape),
+                str(self.visual.dtype),
+            )
+        except Exception:
+            pass
+
+        # Detailed audit log to confirm who really runs ViT
+        try:
+            role = getattr(self.model, "instance_role", None)
+            pp_rank = getattr(getattr(self, "pp_group", None), "rank_in_group", None)
+            try:
+                tp_rank = get_tp_group().rank_in_group
+            except Exception:
+                tp_rank = None
+            logger.info(
+                "[VLM_VIT_FORWARD] pid=%d role=%s pp_first=%s pp_rank=%s tp_rank=%s dev=%s items=%d",
+                os.getpid(), str(role), getattr(getattr(self, "pp_group", None), "is_first_rank", None),
+                str(pp_rank), str(tp_rank), str(self.device), len(items)
+            )
+        except Exception:
+            pass
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         try:

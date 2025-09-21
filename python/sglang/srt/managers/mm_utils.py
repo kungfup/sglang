@@ -4,6 +4,7 @@ Multi-modality utils
 
 import dataclasses
 import logging
+import os
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
@@ -296,6 +297,15 @@ def _get_chunked_prefill_embedding(
             continue
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
+            try:
+                logger.info(
+                    "[MM_EMBED_CALL] pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
+                    os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
+                    int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
+                    int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
+                )
+            except Exception:
+                pass
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
@@ -612,6 +622,20 @@ def general_mm_embed_routine(
                 skip_embedding = False
         except Exception:
             pass
+
+    # Decision audit log — confirm whether we will call image embedding at this step
+    try:
+        logger.info(
+            "[MM_EMBED_DECISION] pid=%d mode=%s contains_mm=%s allow_mm=%s skip=%s pp_first=%s",
+            os.getpid(),
+            getattr(getattr(forward_batch, "forward_mode", None), "name", str(forward_batch.forward_mode)),
+            forward_batch.contains_mm_inputs(),
+            str(allow_mm),
+            str(skip_embedding),
+            getattr(getattr(language_model, "pp_group", None), "is_first_rank", None),
+        )
+    except Exception:
+        pass
 
     if skip_embedding:
         inputs_embeds = None
