@@ -262,38 +262,63 @@ class SemiPDScheduler(Scheduler):
                 self.add_to_waiting_queue(req)
                 return
 
-        # Handle multimodal inputs (reuse native SGLang pipeline)
+        # Handle multimodal inputs:
+        #   - Attach/expand only once at PP0 (preferably on DECODE), so PREFILL can compute ViT later
+        #   - Skip on PP1 to avoid duplicate handling
         if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            is_pp0 = getattr(self, "pp_rank", 0) == 0
+            role = getattr(self, "instance_role", None)
+            role_name = getattr(role, "name", str(role))
 
-            # Debug-only: inspect mm tensors residency
-            try:
-                for _i, _item in enumerate(image_inputs.mm_items):
-                    _pv = getattr(_item, "pixel_values", None)
-                    if hasattr(_pv, "device"):
-                        role = getattr(self, "instance_role", None)
-                        role_name = getattr(role, "name", str(role))
-                        logger.info(
-                            f"[{role_name}] [PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
-                            f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
-                        )
-            except Exception:
-                pass
+            # PP0: Materialize mm_inputs only on the side that actually runs ViT (DECODE in our current setup).
+            # PP1 and beyond: always skip to avoid duplication.
+            allow_attach_here = (is_pp0 and role == InstanceRole.DECODE)
+            if allow_attach_here:
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+                try:
+                    for _i, _item in enumerate(image_inputs.mm_items):
+                        _pv = getattr(_item, "pixel_values", None)
+                        if hasattr(_pv, "device"):
+                            logger.info(
+                                f"[{role_name}] [PP{self.pp_rank}] [MM_FROM_DICT] item#{_i} pixel_values device={getattr(_pv,'device',None)} "
+                                f"is_cuda={getattr(_pv,'is_cuda',False)} is_contig={getattr(_pv,'is_contiguous',lambda:False)()}"
+                            )
+                except Exception:
+                    pass
 
-            # Expand special multimodal tokens in input_ids and attach inputs
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
-            req.extend_image_inputs(image_inputs)
-
-            # Length validation after expansion
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
+                # Expand special multimodal tokens in input_ids and attach inputs
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
                 )
+                req.extend_image_inputs(image_inputs)
+
+                # Length validation after expansion
+                if len(req.origin_input_ids) >= self.max_req_input_len:
+                    req.set_finish_with_abort(
+                        error_msg=(
+                            "Multimodal prompt is too long after expanding multimodal tokens. "
+                            f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        )
+                    )
+                try:
+                    import os as _os
+                    if _os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true","yes"):
+                        logger.info(f"[MM_ATTACH] role={role_name} pp={self.pp_rank} attached_on_decode_pp0=True")
+                except Exception:
+                    pass
+            else:
+                # Skip mm inputs on non-PP0, or on PREFILL (since DECODE@PP0 already attached)
+                try:
+                    import os as _os
+                    if _os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                        logger.info(
+                            f"[SKIP_MM_INPUTS] role={role_name} pp_rank={getattr(self,'pp_rank',None)} allow_attach_here=False"
+                        )
+                except Exception:
+                    pass
+                # Do not clear here for DECODE@PP0 (handled above); for others it's safe to clear
+                if not is_pp0 or role != InstanceRole.DECODE:
+                    recv_req.mm_inputs = None
                 # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)
                 return

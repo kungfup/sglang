@@ -1257,14 +1257,29 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # Handle multimodal inputs
+        # Handle multimodal inputs only on PREFILL instance and PP first rank
         if recv_req.mm_inputs is not None:
-            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
+            allow_mm_here = (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and getattr(self.pp_group, "is_first_rank", False)
             )
-            req.extend_image_inputs(image_inputs)
+            if allow_mm_here:
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+                # Expand a single image token into multiple dummy tokens for receiving image embeddings
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
+                req.extend_image_inputs(image_inputs)
+            else:
+                # Skip mm inputs in non-PREFILL or non-PP0 stages to avoid duplicate handling
+                try:
+                    if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                        logger.info(
+                            f"[SKIP_MM_INPUTS] role={self.disaggregation_mode} pp_first={getattr(self.pp_group, 'is_first_rank', False)}"
+                        )
+                except Exception:
+                    pass
+                recv_req.mm_inputs = None
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1457,6 +1472,18 @@ class Scheduler(
         else:
             f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
+
+        # Diagnostics: how many new requests can be admitted to the next prefill microbatch
+        try:
+            admit_cap = self.get_num_allocatable_reqs(running_bs)
+            token_pool_avail = self.req_to_token_pool.available_size() if self.pp_size > 1 else None
+            max_mb = global_server_args_dict.get("max_micro_batch_size")
+            if token_pool_avail is not None:
+                f += f", admit_cap={admit_cap}, token_pool_avail={token_pool_avail}, max_mb={max_mb}"
+            else:
+                f += f", admit_cap={admit_cap}, max_mb={max_mb}"
+        except Exception:
+            pass
 
         logger.info(f)
 

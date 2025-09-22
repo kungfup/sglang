@@ -688,9 +688,29 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """首段准备多模态/文本混合的 input_embeds，并清理 mm_inputs 以避免传递到后段。"""
         embed_tokens = self.get_input_embeddings()
+        # 在 PP 首段执行多模态嵌入（无论实例角色），仅在 prefill 阶段触发
+        try:
+            pp_first = getattr(getattr(self, "pp_group", None), "is_first_rank", False)
+        except Exception:
+            pp_first = False
+        allow_mm = pp_first
+
+        if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+            try:
+                rid_dbg = None
+                if forward_batch.mm_inputs is not None and len(forward_batch.mm_inputs) > 0:
+                    rid_dbg = getattr(forward_batch.mm_inputs[0], "_rid", None)
+                logger.info(
+                    f"[MM_EMBED_DECISION_QWEN] rid={rid_dbg} role={getattr(self,'instance_role',None)} "
+                    f"pp_first={pp_first} allow_mm={allow_mm} "
+                    f"mode={'DECODE' if forward_batch.forward_mode.is_decode() else 'EXTEND'}"
+                )
+            except Exception:
+                pass
+
         if (
-            not forward_batch.forward_mode.is_decode()
-            and forward_batch.contains_mm_inputs()
+            forward_batch.contains_mm_inputs()
+            and allow_mm
         ):
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
@@ -719,6 +739,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             forward_batch.mm_inputs = None
         else:
             inputs_embeds = embed_tokens(input_ids)
+            # If this instance is not allowed to process multimodal inputs, drop them to avoid downstream misuse
+            try:
+                if forward_batch.contains_mm_inputs() and not allow_mm:
+                    forward_batch.mm_inputs = None
+            except Exception:
+                pass
         return inputs_embeds
 
     def forward(

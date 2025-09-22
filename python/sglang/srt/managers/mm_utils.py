@@ -454,7 +454,7 @@ def get_embedding_and_mask(
                 # Fallback: if concat fails, skip this req
                 continue
             items_offset = items_offset_list[i]
-            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+            embedding_per_req_chunk, _, end_index = get_embedding_chunk(
                 embedding_per_req,
                 prefix_length[i],
                 extend_length[i],
@@ -462,6 +462,19 @@ def get_embedding_and_mask(
             )
             if embedding_per_req_chunk is not None and embedding_per_req_chunk.numel() > 0:
                 embedding_list.append(embedding_per_req_chunk)
+            # If this chunk reaches the end of the per-request embedding, free request-local features
+            try:
+                embedding_per_req_length = (
+                    embedding_per_req.shape[0]
+                    if embedding_per_req.dim() == 2
+                    else embedding_per_req.shape[0] * embedding_per_req.shape[1]
+                )
+                if end_index == embedding_per_req_length:
+                    for _it in req_items:
+                        if hasattr(_it, "precomputed_features"):
+                            _it.precomputed_features = None
+            except Exception:
+                pass
         if len(embedding_list) == 0:
             return None, None
         embedding = torch.concat(embedding_list, dim=0)
