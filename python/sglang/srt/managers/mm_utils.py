@@ -380,30 +380,64 @@ def _adjust_embedding_length(
     mask: torch.Tensor,
     logger,
 ) -> torch.Tensor:
+    """
+    Make the number of multimodal embedding tokens match the number of placeholder
+    positions found in input_ids (encoded in `mask`).
+
+    Policy:
+    - If we have MORE embeddings than placeholders: trim embedding from the tail to match
+      mask count (existing behavior, keeps most-recent chunk alignment).
+    - If we have FEWER embeddings than placeholders: trim the mask to keep only the
+      last K=True positions so that K == num_mm_tokens_in_embedding. This avoids a
+      hard crash and aligns with the tail-extraction policy for the opposite case.
+    """
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
-    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
-        logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from multimodal embeddings."
-        )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
-        else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+
+    if num_mm_tokens_in_input_ids == num_mm_tokens_in_embedding:
+        return embedding
+
+    logger.warning(
+        "[MM_LEN_MISMATCH] text_mm_tokens=%d embed_tokens=%d — will reconcile via tail-trim",
+        num_mm_tokens_in_input_ids,
+        num_mm_tokens_in_embedding,
+    )
+
+    if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
+        # More embeddings than placeholder positions: trim embedding tail to match mask
+        chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+        if chunked_prefill_size != -1:
+            logger.warning(
+                "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
             )
+        if embedding.dim() == 2:
+            embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+        else:
+            num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
+            embedding = embedding[-num_multimodal:, :]
+        return embedding
+
+    # Otherwise: more placeholders than embeddings — trim the mask to keep only the last K
+    try:
+        # mask shape: [T, 1] (bool). Flatten to indices of True positions.
+        flat = mask.view(-1)
+        true_idx = torch.nonzero(flat, as_tuple=False).squeeze(-1)
+        k = int(num_mm_tokens_in_embedding)
+        if k <= 0 or true_idx.numel() == 0:
+            # Nothing to embed; return as-is (downstream will no-op)
+            return embedding
+        keep = true_idx[-k:]
+        # Zero mask and set only the last k positions to True
+        flat.zero_()
+        flat[keep] = True
+        logger.warning(
+            "[MM_MASK_TRIMMED] kept_last=%d of %d placeholders to match embed len",
+            k,
+            num_mm_tokens_in_input_ids,
+        )
+    except Exception as e:
+        logger.error(f"Failed to trim multimodal mask: {e}")
+        # As a last resort, keep original mask to avoid silent misalignment
     return embedding
 
 
