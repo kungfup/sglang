@@ -1,5 +1,6 @@
 import asyncio
 import math
+import os
 import re
 from typing import Dict, List, Union
 
@@ -138,9 +139,41 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             # Note(Xinyuan): This is the case where image loading fails.
             return None
 
+        # --- Optional no-loss expansion of <|image_pad|> (opt-in) ---
+        # Enable with: SGLANG_MM_EXPAND_TOKENS=1
+        if os.environ.get("SGLANG_MM_EXPAND_TOKENS", "0").lower() in ("1", "true", "yes"):
+            try:
+                grid = combined_mm_item.image_grid_thw
+                if isinstance(grid, torch.Tensor):
+                    per_image_tokens = (grid[:, 0] * grid[:, 1] * grid[:, 2]).tolist()
+                else:
+                    g = torch.as_tensor(grid)
+                    per_image_tokens = (g[:, 0] * g[:, 1] * g[:, 2]).tolist()
+                # Replace each IMAGE_TOKEN occurrence in the original text with
+                # <|vision_start|><|image_pad|>*N_i<|vision_end|>
+                idx = 0
+                def _repl(_m):
+                    nonlocal idx
+                    n = int(per_image_tokens[idx]) if idx < len(per_image_tokens) else int(per_image_tokens[-1])
+                    idx += 1
+                    return "<|vision_start|>" + ("<|image_pad|>" * n) + "<|vision_end|>"
+                expanded_text = self.IMAGE_TOKEN_REGEX.sub(_repl, base_output.input_text)
+                # Re-tokenize with expanded text
+                input_ids = self._processor.tokenizer(
+                    expanded_text, return_tensors="pt", add_special_tokens=True
+                ).input_ids.flatten()
+                # Keep offsets consistent with expanded input_ids
+                combined_mm_item.image_offsets = SGLangBaseProcessor.get_mm_items_offset(
+                    input_ids=input_ids, mm_token_id=self.IM_TOKEN_ID
+                )
+            except Exception:
+                # Fallback: keep original input_ids and offsets
+                pass
+
         video_grid_thw = None  # TODO
         second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
+        # Recompute mRoPE positions using the (possibly) updated input_ids
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.IM_TOKEN_ID,

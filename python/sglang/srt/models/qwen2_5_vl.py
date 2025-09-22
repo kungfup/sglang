@@ -693,7 +693,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             pp_first = getattr(getattr(self, "pp_group", None), "is_first_rank", False)
         except Exception:
             pp_first = False
-        allow_mm = pp_first
+        # Only allow multimodal embedding on PP first rank in PREFILL (non-decode) instances
+        try:
+            role_str = str(getattr(self, "instance_role", ""))
+        except Exception:
+            role_str = ""
+        is_prefill_role = role_str.endswith("PREFILL")
+        allow_mm = bool(pp_first and (not forward_batch.forward_mode.is_decode()) and is_prefill_role)
 
         if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
             try:

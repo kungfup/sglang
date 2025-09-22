@@ -424,7 +424,12 @@ def _adjust_embedding_length(
         true_idx = torch.nonzero(flat, as_tuple=False).squeeze(-1)
         k = int(num_mm_tokens_in_embedding)
         if k <= 0 or true_idx.numel() == 0:
-            # Nothing to embed; return as-is (downstream will no-op)
+            # No visual tokens available: clear mask to avoid masked_scatter assert
+            flat.zero_()
+            logger.warning(
+                "[MM_MASK_CLEARED] embed len is 0; cleared %d placeholder positions",
+                num_mm_tokens_in_input_ids,
+            )
             return embedding
         keep = true_idx[-k:]
         # Zero mask and set only the last k positions to True
