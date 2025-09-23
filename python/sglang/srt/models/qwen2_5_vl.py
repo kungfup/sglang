@@ -699,7 +699,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         except Exception:
             role_str = ""
         is_prefill_role = role_str.endswith("PREFILL")
-        allow_mm = bool(pp_first and (not forward_batch.forward_mode.is_decode()) and is_prefill_role)
+        is_decode_role = role_str.endswith("DECODE")
+        semi_pd_enabled = os.environ.get("SGLANG_ENABLE_SEMI_PD", "0").lower() in ("1", "true", "yes")
+        # In Semi-PD, ViT runs on DECODE@PP0; otherwise, allow on PP-first regardless of role
+        allow_mm = bool(pp_first and (not forward_batch.forward_mode.is_decode()) and ((semi_pd_enabled and is_decode_role) or (not semi_pd_enabled)))
 
         if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
             try:
@@ -745,9 +748,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             forward_batch.mm_inputs = None
         else:
             inputs_embeds = embed_tokens(input_ids)
-            # If this instance is not allowed to process multimodal inputs, drop them to avoid downstream misuse
+            # If this instance is not allowed to process multimodal inputs under Semi-PD, drop them to avoid downstream misuse
             try:
-                if forward_batch.contains_mm_inputs() and not allow_mm:
+                semi_pd_enabled = os.environ.get("SGLANG_ENABLE_SEMI_PD", "0").lower() in ("1", "true", "yes")
+                if semi_pd_enabled and forward_batch.contains_mm_inputs() and not allow_mm:
                     forward_batch.mm_inputs = None
             except Exception:
                 pass

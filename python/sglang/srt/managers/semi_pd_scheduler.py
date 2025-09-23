@@ -272,7 +272,7 @@ class SemiPDScheduler(Scheduler):
 
             # PP0: Materialize mm_inputs only on the side that actually runs ViT (DECODE in our current setup).
             # PP1 and beyond: always skip to avoid duplication.
-            allow_attach_here = (is_pp0 and role == InstanceRole.PREFILL)
+            allow_attach_here = (is_pp0 and role == InstanceRole.DECODE)
             if allow_attach_here:
                 image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
                 try:
@@ -303,11 +303,11 @@ class SemiPDScheduler(Scheduler):
                 try:
                     import os as _os
                     if _os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true","yes"):
-                        logger.info(f"[MM_ATTACH] role={role_name} pp={self.pp_rank} attached_on_prefill_pp0=True")
+                        logger.info(f"[MM_ATTACH] role={role_name} pp={self.pp_rank} attached_on_decode_pp0=True")
                 except Exception:
                     pass
             else:
-                # Skip mm inputs on non-PP0, or on DECODE (since PREFILL@PP0 will attach)
+                # Skip mm inputs on non-PP0, or on PREFILL (DECODE@PP0 will attach)
                 try:
                     import os as _os
                     if _os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
@@ -317,7 +317,7 @@ class SemiPDScheduler(Scheduler):
                 except Exception:
                     pass
                 # Do not clear here for PREFILL@PP0 (handled above); for others it's safe to clear
-                if not is_pp0 or role != InstanceRole.PREFILL:
+                if not is_pp0 or role != InstanceRole.DECODE:
                     recv_req.mm_inputs = None
                 # 🔧 MIGRATION: 使用原版Semi-PD的队列管理
                 self.add_to_waiting_queue(req)

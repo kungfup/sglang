@@ -198,18 +198,103 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         2. P-Scheduler通过resp.req_pool_indices使用这些预分配的资源
         3. 通过pre_allocated_req_pool_indices参数控制ScheduleBatch的行为
         """
-        can_run_list = [r for r in self.waiting_queue if r.rid in resp.rids]
-        # Sort by the order of resp.rids
-        can_run_list.sort(key=lambda r: resp.rids.index(r.rid))
+        # Align can_run_list strictly to resp order and drop any missing rids to avoid length mismatch
+        def _align_now():
+            rid_to_req_local = {r.rid: r for r in self.waiting_queue}
+            _aligned_reqs = []
+            _aligned_req_pool_indices = []
+            _aligned_prefix_lens = []
+            _aligned_extend_input_lens = []
+            for i, rid in enumerate(resp.rids):
+                r = rid_to_req_local.get(rid)
+                if r is None:
+                    continue
+                _aligned_reqs.append(r)
+                _aligned_req_pool_indices.append(resp.req_pool_indices[i])
+                _aligned_prefix_lens.append(resp.prefix_lens[i])
+                _aligned_extend_input_lens.append(resp.extend_input_lens[i])
+            return (
+                rid_to_req_local,
+                _aligned_reqs,
+                _aligned_req_pool_indices,
+                _aligned_prefix_lens,
+                _aligned_extend_input_lens,
+            )
 
-        # 🔧 MIGRATION: 原版Semi-PD的等待队列管理逻辑
+        rid_to_req, aligned_reqs, aligned_req_pool_indices, aligned_prefix_lens, aligned_extend_input_lens = _align_now()
+
+        # Micro-wait to reduce auth/queue skew if aligned count is too small
+        try:
+            wait_ms = int(os.environ.get("SGLANG_SEMIPD_PREFILL_ALIGN_WAIT_MS", "10"))
+        except Exception:
+            wait_ms = 10
+        try:
+            min_aligned = int(os.environ.get("SGLANG_SEMIPD_AUTH_MIN_ALIGNED", "1"))
+        except Exception:
+            min_aligned = 1
+
+        if len(aligned_reqs) < max(0, min_aligned) and wait_ms > 0:
+            deadline = time.time() + (wait_ms / 1000.0)
+            retries = 0
+            while time.time() < deadline and len(aligned_reqs) < max(0, min_aligned):
+                # Drain forwarded requests to populate waiting_queue
+                try:
+                    if getattr(self, 'recv_from_decode_forwarded', None) is not None:
+                        from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+                        while True:
+                            try:
+                                obj = self.recv_from_decode_forwarded.recv_pyobj(zmq.NOBLOCK)
+                            except Exception:
+                                break
+                            try:
+                                if isinstance(obj, TokenizedGenerateReqInput):
+                                    self.handle_generate_request(obj)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                # Re-align after potential queue updates
+                rid_to_req, aligned_reqs, aligned_req_pool_indices, aligned_prefix_lens, aligned_extend_input_lens = _align_now()
+                retries += 1
+                # small sleep to yield
+                time.sleep(0.001)
+            try:
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS","0").lower() in ("1","true","yes"):
+                    logger.info(
+                        f"[PREFILL_AUTH_ALIGN_WAIT] resp_rids={len(resp.rids)} aligned={len(aligned_reqs)} "
+                        f"min_aligned={min_aligned} waited_ms={wait_ms} retries={retries}"
+                    )
+            except Exception:
+                pass
+
+        try:
+            if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true","yes"):
+                dropped = [rid for rid in resp.rids if rid not in rid_to_req]
+                logger.info(
+                    f"[PREFILL_AUTH_ALIGN] resp_rids={len(resp.rids)} aligned={len(aligned_reqs)} dropped={len(dropped)} dropped_sample={dropped[:8]}"
+                )
+        except Exception:
+            pass
+        can_run_list = aligned_reqs
+
+        # If nothing aligns this round, skip building a batch to avoid empty cat/asserts
+        if len(can_run_list) == 0:
+            try:
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true","yes"):
+                    logger.info("[PREFILL_AUTH_ALIGN] no aligned reqs this round; skip batch building")
+            except Exception:
+                pass
+            return None
+
+        # 🔧 MIGRATION: 原版Semi-PD的等待队列管理逻辑（基于对齐后的rid集合）
+        aligned_rids = [r.rid for r in can_run_list]
         if self.chunked_rid != resp.chunked_rid:
             # Last chunked req has finished prefilling, remove it from waiting queue
             new_waiting_queue = []
             for r in self.waiting_queue:
                 if r.rid == self.chunked_rid:
                     continue
-                if r.rid in resp.rids and r.rid != resp.chunked_rid:
+                if r.rid in aligned_rids and r.rid != resp.chunked_rid:
                     continue
                 new_waiting_queue.append(r)
             self.waiting_queue = new_waiting_queue
@@ -218,15 +303,14 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.waiting_queue = [
                 r
                 for r in self.waiting_queue
-                if r.rid not in resp.rids or r.rid == resp.chunked_rid
+                if r.rid not in aligned_rids or r.rid == resp.chunked_rid
             ]
 
         # 🔧 MIGRATION: 原版Semi-PD的关键设计 - 使用D-Scheduler预分配的资源
         for i, r in enumerate(can_run_list):
-            assert r.rid == resp.rids[i]
-            r.extend_input_len = resp.extend_input_lens[i]
-            req_pool_idx = resp.req_pool_indices[i]
-            pre_len = resp.prefix_lens[i]
+            r.extend_input_len = aligned_extend_input_lens[i]
+            req_pool_idx = aligned_req_pool_indices[i]
+            pre_len = aligned_prefix_lens[i]
             # 🔑 关键：P-Scheduler直接读取D-Scheduler分配的token pool
             r.prefix_indices = self.req_to_token_pool.req_to_token[
                 req_pool_idx, :pre_len
@@ -246,7 +330,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.server_args.enable_custom_logit_processor,
         )
         # 🔑 关键：通过pre_allocated_req_pool_indices告诉ScheduleBatch使用预分配的资源
-        batch.prepare_for_extend(pre_allocated_req_pool_indices=resp.req_pool_indices)
+        batch.prepare_for_extend(pre_allocated_req_pool_indices=aligned_req_pool_indices)
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
