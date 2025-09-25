@@ -70,11 +70,18 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        try:
+            if residual is not None:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            return out
+        except Exception as e:
+            try:
+                logger.warning(f"[RMSNorm] CUDA kernel failed, falling back to native: {e}")
+            except Exception:
+                pass
+            return self.forward_native(x, residual)
 
     def forward_aiter(
         self,

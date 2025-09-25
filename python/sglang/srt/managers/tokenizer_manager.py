@@ -297,10 +297,21 @@ class TokenizerManager:
             )
 
         # Communicators
-        # Semi-PD: Calculate correct fan_out for P and D instances
+        # Semi-PD fan-out notes:
+        # - Most control RPCs (flush_cache, weight update, etc.) should fan out to all
+        #   scheduler instances the TokenizerManager actually sends to via `send_to_scheduler`.
+        # - In current Semi-PD+PP wiring, TokenizerManager routes control messages only to
+        #   DECODE schedulers (self.send_to_scheduler = self.send_to_d_scheduler) and does not
+        #   directly address PREFILL.
+        # - Previous code assumed fan_out=2*dp_size (P and D), which causes profile calls to
+        #   wait for a non-existent second reply and appear to “hang”. This prevented
+        #   /start_profile and /stop_profile from returning, even though DECODE may have acted.
+        #
+        # To match the actual send target and avoid hangs, set the default communicator fan_out
+        # to dp_size, and specialize the profile communicator to fan_out=dp_size under Semi-PD
+        # (i.e., only DECODE needs to reply). If in the future we aggregate to multiple PP stages
+        # or include PREFILL, we should bump the fan_out and use an AggregatedSocket.
         fan_out = server_args.dp_size
-        if server_args.enable_semi_pd:
-            fan_out = 2 * server_args.dp_size  # P and D
 
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, fan_out
@@ -326,8 +337,47 @@ class TokenizerManager:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, fan_out
         )
+        # Profile to all schedulers (P & D) across PP stages so each saves its own trace.
+        # Build an AggregatedSocket to broadcast to every PP stage's P/D scheduler.
+        profile_sender = self.send_to_scheduler
+        profile_fan_out = server_args.dp_size
+        try:
+            if server_args.enable_semi_pd and server_args.dp_size == 1:
+                pp_size = getattr(server_args, "pp_size", 1)
+                if pp_size > 1:
+                    sockets = []
+                    for pp_rank in range(pp_size):
+                        ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_pp{pp_rank}"
+                        # decode scheduler
+                        d_addr = f"ipc://{ipc_prefix}_d_scheduler"
+                        sockets.append(
+                            get_zmq_socket(context, zmq.PUSH, d_addr, False)
+                        )
+                        # prefill scheduler
+                        p_addr = f"ipc://{ipc_prefix}_p_scheduler"
+                        sockets.append(
+                            get_zmq_socket(context, zmq.PUSH, p_addr, False)
+                        )
+                    profile_sender = AggregatedSocket(sockets)
+                    # Only wait for DECODE@PP0 reply (single DP replica) to avoid blocking,
+                    # because TokenizerManager listens on a single tokenizer IPC.
+                    profile_fan_out = server_args.dp_size
+                else:
+                    # Semi-PD single PP: include both P & D of PP0
+                    ipc_prefix = f"/tmp/semipd_{server_args.port}_{os.getpid()}_pp0"
+                    sockets = [
+                        get_zmq_socket(context, zmq.PUSH, f"ipc://{ipc_prefix}_d_scheduler", False),
+                        get_zmq_socket(context, zmq.PUSH, f"ipc://{ipc_prefix}_p_scheduler", False),
+                    ]
+                    profile_sender = AggregatedSocket(sockets)
+                    profile_fan_out = server_args.dp_size
+        except Exception:
+            # Fallback to default (DECODE only)
+            profile_sender = self.send_to_scheduler
+            profile_fan_out = server_args.dp_size
+
         self.profile_communicator = _Communicator(
-            self.send_to_scheduler, fan_out
+            profile_sender, profile_fan_out
         )
         self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
@@ -1674,6 +1724,10 @@ class _Communicator(Generic[T]):
         return result_values
 
     def handle_recv(self, recv_obj: T):
+        # If no in-flight call is waiting, drop stray replies (can happen when
+        # we broadcast to multiple schedulers but only wait for a subset).
+        if self._result_values is None or self._result_event is None:
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()

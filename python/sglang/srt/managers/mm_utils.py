@@ -322,6 +322,11 @@ def _get_chunked_prefill_embedding(
                         int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
                         int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
                     )
+                    try:
+                        _pre_n = sum(1 for _it in embedding_items_per_req if getattr(_it, "precomputed_features", None) is not None)
+                        logger.info("[MM_EMBED_DO_VIT] rid=%s precomputed_items=%d/%d", str(_rid), int(_pre_n), int(len(embedding_items_per_req)))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 embedding_per_req = data_embedding_func(embedding_items_per_req)

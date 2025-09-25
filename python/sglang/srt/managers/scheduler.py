@@ -2699,9 +2699,10 @@ class Scheduler(
                     role_suffix = role_suffix.name
 
                 # Save Chrome trace with role information
+                # Include PP rank in filename to distinguish pipeline stages
                 trace_filename = (
                     self.profile_id
-                    + f"-{role_suffix}-TP-{self.tp_rank}"
+                    + f"-{role_suffix}-PP-{self.pp_rank}-TP-{self.tp_rank}"
                     + stage_suffix
                     + ".trace.json.gz"
                 )
@@ -2712,7 +2713,7 @@ class Scheduler(
                 # Save statistics with role information
                 stats_file = os.path.join(
                     self.torch_profiler_output_dir,
-                    f"stats_semipd_{role_suffix}_{int(time.time())}.txt"
+                    f"stats_semipd_{role_suffix}_PP{self.pp_rank}_TP{self.tp_rank}_{int(time.time())}.txt"
                 )
                 with open(stats_file, "w") as f:
                     print(f"Semi-PD Profiling Stats - {role_suffix} Process", file=f)

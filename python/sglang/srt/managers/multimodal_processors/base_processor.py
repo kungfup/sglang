@@ -138,8 +138,18 @@ class BaseMultimodalProcessor(ABC):
             )
         except Exception:
             is_fast = False
-        if is_fast:
+        # Choose processor output device.
+        # Default to CPU to avoid GPU->CPU->GPU round trips under PP/Semi-PD; allow override via env.
+        preferred_dev = os.environ.get("SGLANG_MM_PREPROC_DEVICE", "cpu").lower()
+        if preferred_dev not in ("cpu", "cuda"):
+            preferred_dev = "cpu"
+        if preferred_dev == "cuda" and not torch.cuda.is_available():
+            preferred_dev = "cpu"
+        if preferred_dev == "cuda" and is_fast:
             kwargs["device"] = "cuda"
+        else:
+            # Ensure processor returns CPU tensors
+            kwargs["device"] = "cpu"
         logger.info(
             "[MM_PREPROC] pid=%s fast_image_processor=%s set_device=%s arch=%s",
             os.getpid(),
@@ -163,7 +173,15 @@ class BaseMultimodalProcessor(ABC):
                 )
             except Exception:
                 pass
-            result["pixel_values"] = result["pixel_values"].to("cpu")
+            # If somehow not on CPU (e.g., user forced cuda), move back to CPU as staging.
+            if result["pixel_values"].is_cuda:
+                result["pixel_values"] = result["pixel_values"].to("cpu")
+            # Optionally pin memory to accelerate later HtoD copies
+            try:
+                if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                    result["pixel_values"] = result["pixel_values"].pin_memory()
+            except Exception:
+                pass
             try:
                 logger.info(
                     "[MM_PREPROC] pixel_values after_move device=%s",

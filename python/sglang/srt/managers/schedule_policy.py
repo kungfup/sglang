@@ -383,6 +383,36 @@ class PrefillAdder:
             self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+        # Multimodal safety: do not authorize partial encoder (e.g., image) in a chunk
+        try:
+            mm_total = 0
+            mm = getattr(req, "multimodal_inputs", None)
+            if mm is not None:
+                mm_total = int(getattr(mm, "num_image_tokens", 0) or 0)
+                if mm_total == 0:
+                    items = getattr(mm, "mm_items", None) or []
+                    for it in items:
+                        grid = getattr(it, "image_grid_thw", None)
+                        if grid is None:
+                            continue
+                        try:
+                            g = torch.as_tensor(grid)
+                            if g.dim() == 2 and g.shape[1] >= 3:
+                                mm_total += int((g[:, 0] * g[:, 1] * g[:, 2]).sum().item())
+                        except Exception:
+                            pass
+            pre_len = len(req.prefix_indices)
+            mm_remaining = max(0, mm_total - pre_len)
+            if self.rem_chunk_tokens is not None and mm_remaining > self.rem_chunk_tokens:
+                # Skip this request this round; encoder should be taken as a whole
+                if get_bool_env_var("SGLANG_ENABLE_DEBUG_LOGS", default="0"):
+                    logger.info(
+                        f"[D/AUTH_SKIP_MM_PARTIAL] rid={getattr(req,'rid',None)} pre_len={pre_len} "
+                        f"mm_total={mm_total} mm_remaining={mm_remaining} chunk_cap={self.rem_chunk_tokens}"
+                    )
+                return AddReqResult.OTHER
+        except Exception:
+            pass
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -462,6 +492,36 @@ class PrefillAdder:
     def add_one_req(self, req: Req, has_chunked_req: bool):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
+
+        # Multimodal safety: avoid authorizing partial encoder (e.g., image tokens) when chunking.
+        try:
+            mm_total = 0
+            mm = getattr(req, "multimodal_inputs", None)
+            if mm is not None:
+                mm_total = int(getattr(mm, "num_image_tokens", 0) or 0)
+                if mm_total == 0:
+                    items = getattr(mm, "mm_items", None) or []
+                    for it in items:
+                        grid = getattr(it, "image_grid_thw", None)
+                        if grid is None:
+                            continue
+                        try:
+                            g = torch.as_tensor(grid)
+                            if g.dim() == 2 and g.shape[1] >= 3:
+                                mm_total += int((g[:, 0] * g[:, 1] * g[:, 2]).sum().item())
+                        except Exception:
+                            pass
+            pre_len = len(req.prefix_indices)
+            mm_remaining = max(0, mm_total - pre_len)
+            if self.rem_chunk_tokens is not None and mm_remaining > self.rem_chunk_tokens:
+                if get_bool_env_var("SGLANG_ENABLE_DEBUG_LOGS", default="0"):
+                    logger.info(
+                        f"[D/AUTH_SKIP_MM_PARTIAL] rid={getattr(req,'rid',None)} pre_len={pre_len} "
+                        f"mm_total={mm_total} mm_remaining={mm_remaining} chunk_cap={self.rem_chunk_tokens}"
+                    )
+                return AddReqResult.OTHER
+        except Exception:
+            pass
 
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION

@@ -80,7 +80,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         # Glue-only: let DECODE be the single source of streaming.
         # Prevent PREFILL from calling stream_output in scheduler_output_processor_mixin.
         self.skip_stream_for_pp = True
-        
+
         # （移除临时PP通信测试导入，避免环境缺模块导致噪声告警）
 
         # 🔧 PP并行修复：每个PP stage都需要独立的IPC连接
@@ -317,6 +317,20 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             ]
             r.fill_ids = r.origin_input_ids[: pre_len + r.extend_input_len]
 
+
+            # Reconcile extend length based on actual tokens to avoid mismatch with DECODE auth
+            actual_extend = len(r.fill_ids) - pre_len
+            if actual_extend != r.extend_input_len:
+                try:
+                    logger.warning(
+                        f"[SEMI_PD_PREFILL] Adjusting extend_input_len for rid={r.rid}: "
+                        f"D-auth={r.extend_input_len} -> P-actual={actual_extend} "
+                        f"(pre_len={pre_len}, origin_len={len(r.origin_input_ids)})"
+                    )
+                except Exception:
+                    pass
+                r.extend_input_len = actual_extend
+
         # 🔧 MIGRATION: 原版Semi-PD的ScheduleBatch创建
         # P-Scheduler有资源引用，但通过pre_allocated_req_pool_indices控制分配行为
         batch = ScheduleBatch.init_new(
@@ -455,7 +469,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         # 仅 PP0 主动向 DECODE 请求授权；其他 PP 段不从 DECODE 拉批次
         resp = None
-        
+
         if self.waiting_queue and self.attn_tp_rank == 0 and getattr(self, 'pp_rank', 0) == 0:
             # Do not gate on HELLO; proceed to send candidates
 
@@ -525,13 +539,13 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
     ):
         """
         🔧 PP模式下的Semi-PD PREFILL处理逻辑
-        
+
         关键修改：
         1. PP0 PREFILL: 不发送token给DECODE，但必须调用父类方法触发PP通信
         2. PP1 PREFILL: 产生next_token_ids，发送给PP1 DECODE
         """
         import os
-        
+
         # 获取PP配置（优先使用已建立的pp_group/self.pp_rank/self.pp_size）
         try:
             if hasattr(self, 'pp_group') and self.pp_group is not None:
@@ -546,9 +560,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             pp_rank = int(os.environ.get('SGLANG_PP_RANK', 0))
             pp_size = int(os.environ.get('SGLANG_PP_SIZE', 1))
             is_last_pp_stage = (pp_rank == pp_size - 1)
-        
+
         # keep logs minimal
-        
+
         # 简化：如果本轮产生了token（仅最后PP段会有），则直接发给同段DECODE；否则走父类逻辑
         if result.next_token_ids is not None:
             try:
