@@ -2541,7 +2541,11 @@ class Scheduler(
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage:
-                return self.init_profile(
+                # Initialize staged profiling. By default, start_profile() is triggered
+                # lazily on the first matching batch (EXTEND/DECODE). To support cases
+                # where a role sees few/zero staged batches (e.g., PREFILL under certain
+                # pipelines), allow forcing an immediate start via env.
+                out = self.init_profile(
                     recv_req.output_dir,
                     recv_req.num_steps,
                     recv_req.activities,
@@ -2550,6 +2554,14 @@ class Scheduler(
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                 )
+                try:
+                    import os as _os
+                    if _os.environ.get("SGLANG_PROFILE_FORCE_START", "0").lower() in ("1", "true", "yes"):
+                        # Start without waiting for a staged batch; stage=None logs a generic message
+                        self.start_profile(None)
+                except Exception:
+                    pass
+                return out
             else:
                 self.init_profile(
                     recv_req.output_dir,

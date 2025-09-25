@@ -47,6 +47,8 @@ from sglang.srt.utils import (
     semi_pd_log_every,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+from sglang.srt.managers.copy_audit import CopyAudit
+
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Semi-PD D-side queues for candidate/prealloc/authorize stages
         self._spd_candidate_set = set()
         self._spd_prealloc_queue = deque()
+        # Lightweight copy audit controls (PP0 DECODE only; enabled via env)
+        self._copy_audit_enabled = os.environ.get("SGLANG_COPY_AUDIT", "0").lower() in ("1", "true", "yes")
+        self._copy_audit_steps_remaining = int(os.environ.get("SGLANG_COPY_AUDIT_STEPS", "2")) if self._copy_audit_enabled else 0
+
         self._spd_authorize_outbox = deque()
         self._spd_max_auth_rids = int(os.environ.get("SGLANG_SEMIPD_AUTH_MAX_RIDS", "64"))
 
@@ -124,7 +130,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             context = zmq.Context(2)
 
             assert isinstance(port_args, SemiPDPortArgs)
-            
+
             # 🔧 同PP stage内的IPC通信（与PREFILL进程）
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PUSH, self.port_args.bridge_ipc_name, False
@@ -148,7 +154,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     self.recv_from_p_instance = None
             except Exception:
                 self.recv_from_p_instance = None
-            
+
             # 🔧 PP stage间通信：与下一个stage的DECODE进程通信
             # 使用SGLang原生的NCCL通信机制，不需要额外的socket
             if hasattr(self.port_args, 'next_stage_decode_port') and self.port_args.next_stage_decode_port:
@@ -694,7 +700,21 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         except Exception:
             logger.exception("[PP_DECODE] pending-token fastpath failed; fallback to default run")
         # fallback to the default run
-        return super().run_batch(batch)
+        if (
+            getattr(self, "pp_rank", 0) == 0
+            and getattr(self, "_copy_audit_enabled", False)
+            and getattr(self, "_copy_audit_steps_remaining", 0) > 0
+        ):
+            # Only audit a few decode batches on PP0 to keep overhead small
+            with CopyAudit(scope=f"DECODE-PP{self.pp_rank}", log_fn=logger.info):
+                result = super().run_batch(batch)
+            CopyAudit.dump_summary(top_k=10, log_fn=logger.info)
+            self._copy_audit_steps_remaining -= 1
+            if self._copy_audit_steps_remaining <= 0:
+                CopyAudit.reset()
+            return result
+        else:
+            return super().run_batch(batch)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # D-driven: proactively authorize prefill when candidates exist

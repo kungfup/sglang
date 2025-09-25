@@ -173,12 +173,14 @@ class BaseMultimodalProcessor(ABC):
                 )
             except Exception:
                 pass
-            # If somehow not on CPU (e.g., user forced cuda), move back to CPU as staging.
-            if result["pixel_values"].is_cuda:
-                result["pixel_values"] = result["pixel_values"].to("cpu")
-            # Optionally pin memory to accelerate later HtoD copies
+            # Do NOT force CPU staging here. Honor the processor's output device to
+            # avoid redundant D2H/H2D round-trips.
+            # If the tensor is on CPU and pinning is enabled, pin to accelerate H2D later.
             try:
-                if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                if (
+                    getattr(result["pixel_values"], "device", torch.device("cpu")).type == "cpu"
+                    and os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes")
+                ):
                     result["pixel_values"] = result["pixel_values"].pin_memory()
             except Exception:
                 pass

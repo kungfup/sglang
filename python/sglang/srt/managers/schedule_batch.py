@@ -1324,29 +1324,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        # Do not move pixel_values here. Keep them on CPU to avoid redundant large tensor
-        # transfers. The first PP stage will move them inside model.get_image_feature()
-        # only when needed.
-        for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
-            # Defensive: ensure pixel_values stay on CPU; do not pre-move to CUDA here.
-            try:
-                pv = getattr(mm_input, "pixel_values", None)
-                if isinstance(pv, torch.Tensor):
-                    if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
-                        logger.info(
-                            "[MM_PREPROC] pixel_values before_move device=%s dtype=%s shape=%s",
-                            str(pv.device), str(pv.dtype), tuple(pv.shape),
-                        )
-                    if pv.is_cuda:
-                        # Move back to CPU to avoid PP cross-device bounces; model will move when needed
-                        pv = pv.cpu()
-                        setattr(mm_input, "pixel_values", pv)
-                        if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
-                            logger.info("[MM_PREPROC] pixel_values after_move device=%s", str(pv.device))
-            except Exception:
-                pass
+        # Do not alter pixel_values device here. Let the model handle placement/copies.
+        # This avoids D2H/H2D round-trips and enables earlier/async prefetch if implemented.
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)

@@ -566,24 +566,68 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # Build on CPU first to avoid per-item GPU transfers; move once to GPU.
-        pv_list = []
-        grid_list = []
-        for item in items:
-            pv = item.pixel_values
-            grid = item.image_grid_thw
-            if isinstance(pv, torch.Tensor) and pv.is_cuda:
-                pv = pv.cpu()
-            if isinstance(grid, torch.Tensor) and grid.is_cuda:
-                grid = grid.cpu()
-            pv_list.append(pv)
-            grid_list.append(grid)
-        # In qwen-vl, the last dimension is the same
+        # Move per-item tensors directly to the target device (cuda if available),
+        # avoid forced CPU staging to reduce large H->D bursts on EXTEND.
+        tgt_dev = self.device
+        pv_list: List[torch.Tensor] = []
+        grid_list: List[torch.Tensor] = []
+
+        use_copy_stream = False
+        try:
+            use_copy_stream = (isinstance(tgt_dev, torch.device) and tgt_dev.type == "cuda") or str(tgt_dev).startswith("cuda")
+        except Exception:
+            use_copy_stream = False
+
+        if use_copy_stream:
+            copy_stream = torch.cuda.Stream(device=tgt_dev)
+            with torch.cuda.stream(copy_stream):
+                for item in items:
+                    pv = item.pixel_values
+                    grid = item.image_grid_thw
+                    if isinstance(pv, torch.Tensor):
+                        if pv.device != tgt_dev:
+                            pv = pv.to(device=tgt_dev, dtype=self.visual.dtype, non_blocking=True)
+                        else:
+                            if pv.dtype != self.visual.dtype:
+                                pv = pv.to(dtype=self.visual.dtype)
+                        pv_list.append(pv)
+                    else:
+                        # Fallback: convert to torch then move
+                        pv = torch.as_tensor(pv).to(device=tgt_dev, dtype=self.visual.dtype, non_blocking=True)
+                        pv_list.append(pv)
+                    if isinstance(grid, torch.Tensor):
+                        if grid.device != tgt_dev:
+                            grid = grid.to(device=tgt_dev, non_blocking=True)
+                        grid_list.append(grid)
+                    else:
+                        grid = torch.as_tensor(grid).to(device=tgt_dev, non_blocking=True)
+                        grid_list.append(grid)
+            torch.cuda.current_stream(device=tgt_dev).wait_stream(copy_stream)
+        else:
+            for item in items:
+                pv = item.pixel_values
+                grid = item.image_grid_thw
+                if isinstance(pv, torch.Tensor):
+                    if pv.device != tgt_dev:
+                        pv = pv.to(device=tgt_dev, dtype=self.visual.dtype)
+                    elif pv.dtype != self.visual.dtype:
+                        pv = pv.to(dtype=self.visual.dtype)
+                    pv_list.append(pv)
+                else:
+                    pv = torch.as_tensor(pv).to(device=tgt_dev, dtype=self.visual.dtype)
+                    pv_list.append(pv)
+                if isinstance(grid, torch.Tensor):
+                    if grid.device != tgt_dev:
+                        grid = grid.to(device=tgt_dev)
+                    grid_list.append(grid)
+                else:
+                    grid = torch.as_tensor(grid).to(device=tgt_dev)
+                    grid_list.append(grid)
+
+        # In qwen-vl, the last dimension is the same; concat on target device
         pixel_values = torch.cat(pv_list, dim=0)
         image_grid_thw = torch.concat(grid_list, dim=0)
-        # Move once to target device with proper dtypes
-        pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype, non_blocking=True)
-        image_grid_thw = image_grid_thw.to(device=self.device, non_blocking=True)
+
         # Lightweight visibility for vision device usage (always on)
         try:
             logger.info(
@@ -622,7 +666,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 pv_shape = tuple(pixel_values.shape)
                 grid_shape = tuple(image_grid_thw.shape)
                 # Estimate patch/token and pixel budgets for visibility
-                # total patches across items: should equal pixel_values.shape[0]
                 try:
                     total_patches_from_grid = (
                         (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2])
@@ -631,14 +674,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     )
                 except Exception:
                     total_patches_from_grid = -1
-                # Approximate pixel budget using IMAGE_FACTOR=28 (see Qwen2_5VLImageProcessor)
                 try:
                     approx_pixels_28 = (
                         (image_grid_thw[:, 1] * image_grid_thw[:, 2]).sum().item() * (28 * 28)
                     )
                 except Exception:
                     approx_pixels_28 = -1
-                # Memory snapshot before vision forward
                 if _dev.type == "cuda":
                     dev_index = _dev.index if _dev.index is not None else torch.cuda.current_device()
                     mem_alloc_pre = torch.cuda.memory_allocated(dev_index) / (1024 ** 3)
@@ -646,8 +687,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 else:
                     mem_alloc_pre = mem_rsv_pre = 0.0
                 logger.info(
-                    "[QWEN2_5_VL_VISION_MEM][pre] dev=%s dtype=%s pv_shape=%s grid_shape=%s "
-                    "alloc=%.2fGiB reserved=%.2fGiB patches(pv/grid)=%s/%s approx_pixels_28=%s (IMAGE_FACTOR=28)",
+                    "[QWEN2_5_VL_VISION_MEM][pre] dev=%s dtype=%s pv_shape=%s grid_shape=%s alloc=%.2fGiB reserved=%.2fGiB patches(pv/grid)=%s/%s approx_pixels_28=%s (IMAGE_FACTOR=28)",
                     str(_dev), str(_dtype), pv_shape, grid_shape,
                     mem_alloc_pre, mem_rsv_pre, pv_shape[0], total_patches_from_grid, approx_pixels_28,
                 )
@@ -701,8 +741,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         is_prefill_role = role_str.endswith("PREFILL")
         is_decode_role = role_str.endswith("DECODE")
         semi_pd_enabled = os.environ.get("SGLANG_ENABLE_SEMI_PD", "0").lower() in ("1", "true", "yes")
-        # In Semi-PD, ViT runs on DECODE@PP0; otherwise, allow on PP-first regardless of role
-        allow_mm = bool(pp_first and (not forward_batch.forward_mode.is_decode()) and ((semi_pd_enabled and is_decode_role) or (not semi_pd_enabled)))
+        # Allow multimodal embedding on PP-first during EXTEND (PREFILL). This matches stable behavior and avoids shape mismatches downstream.
+        allow_mm = bool(pp_first and (not forward_batch.forward_mode.is_decode()))
 
         if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
             try:
@@ -779,6 +819,43 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 input_ids=input_ids,
                 forward_batch=forward_batch,
             )
+
+        # 在首段，确保 RoPE positions 与输入长度一致，避免 view 形状不匹配
+        try:
+            if positions is not None:
+                # 目标 token 数：优先使用首段已构建的 input_embeds 长度，否则用 input_ids 长度
+                tgt_tokens = (
+                    int(input_embeds.shape[0]) if input_embeds is not None else int(input_ids.shape[0])
+                )
+                if positions.ndim == 2:
+                    cur = int(positions.shape[-1])
+                    if cur != tgt_tokens:
+                        if cur > tgt_tokens:
+                            # 过长：取末尾对齐（与多模态 tail-trim 策略一致）
+                            positions = positions[:, -tgt_tokens:]
+                        else:
+                            # 过短：重复最后一列以补齐，保证形状匹配（仅作防御；正常应不触发）
+                            pad = positions[:, -1:].expand(positions.shape[0], tgt_tokens - cur)
+                            positions = torch.cat([positions, pad], dim=1)
+                        logger.warning(
+                            "[POS_FIX] Adjusted MRoPE positions length from %d to %d", cur, tgt_tokens
+                        )
+                elif positions.ndim == 1:
+                    cur = int(positions.shape[0])
+                    if cur != tgt_tokens:
+                        if cur > tgt_tokens:
+                            positions = positions[-tgt_tokens:]
+                        else:
+                            pad = positions.new_full((tgt_tokens - cur,), int(positions[-1].item()))
+                            positions = torch.cat([positions, pad], dim=0)
+                        logger.warning(
+                            "[POS_FIX] Adjusted RoPE positions length from %d to %d", cur, tgt_tokens
+                        )
+        except Exception as e:
+            try:
+                logger.error(f"[POS_FIX] Failed to align positions: {e}")
+            except Exception:
+                pass
 
         # 模型前向：传入 positions/forward_batch/input_embeds/pp_proxy_tensors
         hidden_states = self.model(

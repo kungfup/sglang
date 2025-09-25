@@ -786,8 +786,11 @@ def apply_fp8_linear(
                         bias=bias,
                     )
                 return output.view(*output_shape)
-            except (ImportError, NameError, AttributeError):
-                pass
+            except (ImportError, NameError, AttributeError, RuntimeError) as e:
+                try:
+                    logger.warning("[FP8_FALLBACK] cutlass fp8_scaled_mm failed, falling back to torch scaled_mm/unfused dq. err=%s", str(e))
+                except Exception:
+                    pass
 
         # torch.scaled_mm supports per tensor weights + activations only
         # so fallback to naive if per channel or per token

@@ -691,7 +691,8 @@ def embed_mm_inputs(
             mask,
             embedding.to(inputs_embeds.device, inputs_embeds.dtype),
         )
-    return inputs_embeds
+    # Ensure contiguous memory for downstream FP8 linear kernels
+    return inputs_embeds.contiguous()
 
 
 def general_mm_embed_routine(
