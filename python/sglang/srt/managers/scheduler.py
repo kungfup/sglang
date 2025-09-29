@@ -1284,12 +1284,17 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # Handle multimodal inputs only on PREFILL instance and PP first rank
+        # Handle multimodal inputs on PP first rank (always), and restrict to PREFILL instance only when disaggregated.
         if recv_req.mm_inputs is not None:
-            allow_mm_here = (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and getattr(self.pp_group, "is_first_rank", False)
-            )
+            pp_first = getattr(self.pp_group, "is_first_rank", True)
+            is_disagg_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+            is_disagg_decode = self.disaggregation_mode == DisaggregationMode.DECODE
+
+            # Policy:
+            # - Disaggregated: only PREFILL instance + PP first rank consumes mm inputs.
+            # - Non-disaggregated: PP first rank (or no PP) consumes mm inputs.
+            allow_mm_here = (pp_first and not is_disagg_decode) and (is_disagg_prefill or self.disaggregation_mode == DisaggregationMode.NULL)
+
             if allow_mm_here:
                 image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
                 # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -1298,11 +1303,11 @@ class Scheduler(
                 )
                 req.extend_image_inputs(image_inputs)
             else:
-                # Skip mm inputs in non-PREFILL or non-PP0 stages to avoid duplicate handling
+                # Skip mm inputs in non-first PP stages or on DECODE instance (disaggregation)
                 try:
                     if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
                         logger.info(
-                            f"[SKIP_MM_INPUTS] role={self.disaggregation_mode} pp_first={getattr(self.pp_group, 'is_first_rank', False)}"
+                            f"[SKIP_MM_INPUTS] role={self.disaggregation_mode} pp_first={pp_first}"
                         )
                 except Exception:
                     pass
