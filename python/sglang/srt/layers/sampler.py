@@ -1,4 +1,6 @@
 import logging
+import os
+
 from typing import List
 
 import torch
@@ -22,6 +24,10 @@ if is_cuda():
 
 
 logger = logging.getLogger(__name__)
+DEBUG_SAMPLER = os.environ.get("DEBUG_SAMPLER", "0").lower() in ("1", "true", "yes")
+if DEBUG_SAMPLER:
+    logger.info("[DBG_SAMPLER] module_loaded path=%s", __file__)
+
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 
@@ -56,6 +62,14 @@ class Sampler(nn.Module):
                 performs sampling in draft workers.
         """
         logits = logits_output.next_token_logits
+        if DEBUG_SAMPLER:
+            try:
+                logger.info(
+                    f"[DBG_SAMPLER] enter logits_shape={tuple(logits.shape)} dev={str(logits.device)} dtype={str(logits.dtype)}"
+                )
+            except Exception:
+                pass
+
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
@@ -147,6 +161,14 @@ class Sampler(nn.Module):
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
+
+        if DEBUG_SAMPLER:
+            try:
+                logger.info(
+                    f"[DBG_SAMPLER] next_token_ids shape={tuple(batch_next_token_ids.shape)} dev={str(batch_next_token_ids.device)} dtype={str(batch_next_token_ids.dtype)}"
+                )
+            except Exception:
+                pass
 
         return batch_next_token_ids
 

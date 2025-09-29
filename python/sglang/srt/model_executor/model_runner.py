@@ -1802,6 +1802,25 @@ class ModelRunner:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
+        # Debug which backend is actually selected
+        try:
+            import os
+            if os.environ.get("DEBUG_ATTENTION", "0").lower() in ("1", "true", "yes"):
+                msg = (
+                    f"[DBG_ATTN] backend_selected cls={type(self.attn_backend).__name__} "
+                    f"module={type(self.attn_backend).__module__} arg={self.server_args.attention_backend}"
+                )
+                try:
+                    logger.info(msg)
+                except Exception:
+                    pass
+                try:
+                    print(msg)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     # TODO unify with 6338
     def _get_attention_backend(self):

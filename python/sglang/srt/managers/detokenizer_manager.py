@@ -163,6 +163,13 @@ class DetokenizerManager:
                         _txt = self.tokenizer.decode(_heads[0])
                         if DEBUG_LOGS_ENABLED:
                             logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
+                            # optional: dump bytes for diagnosing garbled characters
+                            if os.environ.get("SGLANG_DEBUG_DETOK_BYTES", "0").lower() in ("1", "true", "yes"):
+                                try:
+                                    _b = _txt.encode("utf-8", errors="backslashreplace")
+                                    logger.info(f"[DBG_DETOKENIZER_BYTES] bytes_head={_b[:64]!r} len={len(_b)}")
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
         except Exception:
@@ -291,6 +298,15 @@ class DetokenizerManager:
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
+                if DEBUG_LOGS_ENABLED:
+                    try:
+                        _h = final_full[:80]
+                        _t = final_full[-80:]
+                        logger.info(
+                            f"[DBG_DETOKENIZER_FINAL] rid={str(recv_obj.rids[i])[:8]} len={len(final_full)} head={_h!r} tail={_t!r}"
+                        )
+                    except Exception:
+                        pass
                 # Delta relative to accumulated decoded_text
                 output_chunk = final_full[len(s.decoded_text) :]
                 # Commit state to final

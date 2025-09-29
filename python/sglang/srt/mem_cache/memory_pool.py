@@ -72,6 +72,8 @@ class ReqToTokenPool:
             logger.info("Bypass creating req_to_token")
             self.req_to_token = None
         self.free_slots = list(range(size))
+        # Track the most recent CUDA write completion to req_to_token for precise graph sync
+        self.last_write_event = None
 
     def write(self, req_pool_idx, token_indices=None, values=None):
         # Semi-PD: Support both old tuple format and new separate parameters
@@ -85,6 +87,13 @@ class ReqToTokenPool:
         else:
             # Fallback to original format
             self.req_to_token[req_pool_idx] = token_indices
+        # Record a CUDA event on the current stream to mark visibility of req_to_token writes
+        try:
+            evt = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
+            evt.record(torch.cuda.current_stream())
+            self.last_write_event = evt
+        except Exception:
+            pass
 
     def available_size(self):
         return len(self.free_slots)

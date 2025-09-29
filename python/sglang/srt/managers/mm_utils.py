@@ -299,10 +299,12 @@ def _get_chunked_prefill_embedding(
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
             # Try to assemble from request-local per-item features first (no ViT recompute)
-            _per_item_feats = [
-                getattr(it, "precomputed_features", None) or getattr(it, "_req_local_mm_feat", None)
-                for it in embedding_items_per_req
-            ]
+            _per_item_feats = []
+            for it in embedding_items_per_req:
+                _feat = getattr(it, "precomputed_features", None)
+                if _feat is None:
+                    _feat = getattr(it, "_req_local_mm_feat", None)
+                _per_item_feats.append(_feat)
             if all(f is not None for f in _per_item_feats) and len(_per_item_feats) > 0:
                 try:
                     embedding_per_req = torch.concat(_per_item_feats, dim=0)

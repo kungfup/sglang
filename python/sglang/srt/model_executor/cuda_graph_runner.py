@@ -240,6 +240,8 @@ class CudaGraphRunner:
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        # Debug uid for correlating logs across streams/components during replay
+        self._replay_uid = 0
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_two_batch_overlap = (
@@ -307,19 +309,16 @@ class CudaGraphRunner:
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            # pipeline parallelism
+            # pipeline parallelism (align to origin: batch-level, not token-level)
             if self.pp_size > 1:
-                # NOTE: PP跨stage传递的是token级hidden_states/residual，因此容量应为max_num_token
-                # 使用模型实际dtype，避免copy_发生隐式dtype转换
-                dtype = getattr(self.model_runner, "dtype", torch.bfloat16)
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (self.max_num_token, self.model_runner.model_config.hidden_size),
-                        dtype=dtype,
+                        (self.max_bs, self.model_runner.model_config.hidden_size),
+                        dtype=torch.bfloat16,
                     ),
                     "residual": torch.zeros(
-                        (self.max_num_token, self.model_runner.model_config.hidden_size),
-                        dtype=dtype,
+                        (self.max_bs, self.model_runner.model_config.hidden_size),
+                        dtype=torch.bfloat16,
                     ),
                 }
 
@@ -599,15 +598,9 @@ class CudaGraphRunner:
                 self.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
-                # 仅在非首段传入pp代理，避免首段在捕获阶段误走代理路径
-                try:
-                    is_first_rank = getattr(self.model_runner.pp_group, "is_first_rank", False)
-                except Exception:
-                    is_first_rank = False
-                if not is_first_rank:
-                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                    )
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -683,6 +676,13 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
         self._log_streams("replay_prepare:entry")
 
+        # Increment and propagate a debug uid to correlate with attention backend logs
+        try:
+            self._replay_uid = int(getattr(self, "_replay_uid", 0)) + 1
+            setattr(self.model_runner.attn_backend, "debug_replay_uid", self._replay_uid)
+        except Exception:
+            pass
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
@@ -698,9 +698,34 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        # Run all buffer updates and metadata init on the captured stream to avoid cross-stream deps
-        with torch.cuda.stream(self.stream):
+        # By default, run buffer updates/metadata init on the current (default) stream to match origin behavior.
+        # Set CG_PREPARE_IN_GRAPH_STREAM=1 to force using the captured stream for preparation.
+        _use_default_stream = True
+        try:
+            import os
+            _use_default_stream = os.environ.get("CG_PREPARE_IN_GRAPH_STREAM", "0").lower() not in ("1", "true", "yes")
+        except Exception:
+            pass
+        _prep_stream = torch.cuda.current_stream() if _use_default_stream else self.stream
+        with torch.cuda.stream(_prep_stream):
             self._log_streams("replay_prepare:in_stream_before_copy")
+            # Visibility barriers: default ON to stabilize Semi-PD + PP under concurrency.
+            try:
+                import os
+                dev = self.model_runner.device if hasattr(self.model_runner, 'device') else None
+                flag = os.environ.get("CG_REPLAY_WAIT_BARRIERS", None)
+                # Default to enabled when flag is unset; allow explicit opt-out via 0/false/no
+                do_wait = True if flag is None else (flag.lower() in ("1", "true", "yes"))
+                if do_wait:
+                    # 1) Wait on precise req_to_token write event if available
+                    rttp = getattr(self.model_runner, 'req_to_token_pool', None)
+                    evt = getattr(rttp, 'last_write_event', None) if rttp is not None else None
+                    if evt is not None:
+                        torch.cuda.current_stream(device=dev).wait_event(evt)
+                    # 2) Also wait on default stream to ensure host-side producers are visible
+                    torch.cuda.current_stream(device=dev).wait_stream(torch.cuda.default_stream(device=dev))
+            except Exception:
+                pass
             # Pad related state
             if bs != raw_bs:
                 self.seq_lens.fill_(self.seq_len_fill_value)
@@ -709,33 +734,123 @@ class CudaGraphRunner:
             # Common inputs (robust to input_ids longer than expected in decode)
             n_id = min(raw_num_token, forward_batch.input_ids.shape[0])
             if n_id > 0:
-                # take the last n_id tokens to match decode semantics
-                self.input_ids[:n_id].copy_(forward_batch.input_ids[-n_id:])
-            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices[:raw_bs])
+                # Align with origin: copy from the head (exact scheduling order)
+                self.input_ids[:n_id].copy_(forward_batch.input_ids[:n_id])
+            self.req_pool_indices[:raw_bs].copy_(
+                forward_batch.req_pool_indices[:raw_bs]
+            )
+            # Do NOT populate padding rows in req_pool_indices.
+            # Keeping padding rows untouched avoids accidental cross-request coupling
+            # when PP + CUDA graph are enabled under concurrency.
             self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens[:raw_bs])
             n_loc = min(raw_num_token, forward_batch.out_cache_loc.shape[0])
             if n_loc > 0:
-                self.out_cache_loc[:n_loc].copy_(forward_batch.out_cache_loc[-n_loc:])
+                self.out_cache_loc[:n_loc].copy_(forward_batch.out_cache_loc[:n_loc])
             n_pos = min(raw_num_token, forward_batch.positions.shape[0])
             if n_pos > 0:
-                self.positions[:n_pos].copy_(forward_batch.positions[-n_pos:])
+                self.positions[:n_pos].copy_(forward_batch.positions[:n_pos])
+
+            # Force positions to be consistent with seq_lens-1 for normal decode (stabilize under concurrency)
+            try:
+                import os
+                force_pos = os.environ.get("FORCE_POSITIONS_FROM_SEQLEN", "0").lower() in ("1", "true", "yes")
+                if force_pos and self.capture_forward_mode.name == "DECODE" and forward_batch.spec_info is None:
+                    rows = int(raw_bs)
+                    if rows > 0:
+                        pos_fix = torch.clamp(self.seq_lens[:rows] - 1, min=0).to(self.positions.dtype)
+                        self.positions[:rows].copy_(pos_fix)
+                        # Optional: small head log to confirm
+                        if os.environ.get("DEBUG_CG_INPUTS", "0").lower() in ("1", "true", "yes"):
+                            uid = int(getattr(self, "_replay_uid", -1))
+                            fix_head = pos_fix[: min(4, rows)].clone().to("cpu", non_blocking=True).tolist()
+                            logger.info(f"[CG-REPLAY-POS-FIX] uid={uid} pos_fix_head={fix_head}")
+            except Exception:
+                pass
 
             if forward_batch.seq_lens_cpu is not None:
                 if bs != raw_bs:
                     self.seq_lens_cpu.fill_(self.seq_len_fill_value)
                 self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu[:raw_bs])
+            # Optional input-head diagnostics for concurrency issues
+            try:
+                import os
+                dbg = os.environ.get("DEBUG_CG_INPUTS", "0").lower() in ("1", "true", "yes")
+                if dbg:
+                    uid = int(getattr(self, "_replay_uid", -1))
+                    h_pos = min(8, int(n_pos)) if 'n_pos' in locals() else 0
+                    h_loc = min(8, int(n_loc)) if 'n_loc' in locals() else 0
+                    pos_head = self.positions[:h_pos].clone().to("cpu", non_blocking=True).tolist() if h_pos > 0 else []
+                    loc_head = self.out_cache_loc[:h_loc].clone().to("cpu", non_blocking=True).tolist() if h_loc > 0 else []
+                    logger.info(f"[CG-REPLAY-INPUT] uid={uid} n_id={int(n_id)} n_pos={int(n_pos)} n_loc={int(n_loc)} pos_head={pos_head} out_loc_head={loc_head}")
+            except Exception:
+                pass
+
+            # Optional mapping verification: last-token cache loc vs req_to_token, and positions vs seq_len-1
+            try:
+                import os
+                dbg = os.environ.get("DEBUG_CG_INPUTS", "0").lower() in ("1", "true", "yes")
+                if dbg:
+                    uid = int(getattr(self, "_replay_uid", -1))
+                    rows = int(min(4, raw_bs))
+                    if rows > 0:
+                        rpi = self.req_pool_indices[:rows].clone()
+                        sl = self.seq_lens[:rows].clone()
+                        # Guard sl-1 from going negative
+                        slm1 = torch.clamp(sl - 1, min=0)
+                        rt = self.model_runner.req_to_token_pool.req_to_token
+                        rt_last = rt[rpi, slm1]
+                        pos_head = self.positions[:rows].clone()
+                        loc_head = self.out_cache_loc[:rows].clone()
+                        # Move small heads to CPU for logging only
+                        # Ensure debug reads reflect the latest writes by syncing the stream
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        rpi_l = rpi.to("cpu", non_blocking=False).tolist()
+                        sl_l = sl.to("cpu", non_blocking=False).tolist()
+                        slm1_l = slm1.to("cpu", non_blocking=False).tolist()
+                        rt_last_l = rt_last.to("cpu", non_blocking=False).tolist()
+                        pos_l = pos_head.to("cpu", non_blocking=False).tolist()
+                        loc_l = loc_head.to("cpu", non_blocking=False).tolist()
+                        logger.info(f"[CG-REPLAY-MAP] uid={uid} rpi_head={rpi_l} pos_head={pos_l} sl_head={sl_l} slm1_head={slm1_l} rt_last_head={rt_last_l} out_loc_head={loc_l}")
+                        # Soft check: positions should equal sl-1 and rt_last should equal out_cache_loc
+                        try:
+                            pos_ok = all(int(a) == int(b) for a, b in zip(pos_l, slm1_l))
+                            loc_ok = all(int(a) == int(b) for a, b in zip(loc_l, rt_last_l))
+                            if (not pos_ok) or (not loc_ok):
+                                logger.warning(f"[CG-REPLAY-MAP-MISMATCH] uid={uid} pos_ok={pos_ok} loc_ok={loc_ok}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             if pp_proxy_tensors:
-                # 在DECODE图中，期望的pp代理张量长度是`raw_num_token`（=bs）。
-                # 若来源是prefill chunk（长度>>bs），仅拷贝末尾`copy_len=min(raw_num_token, src_len)`行，避免尺寸不匹配。
-                expect = raw_num_token
                 for key in self.pp_proxy_tensors.keys():
-                    src = pp_proxy_tensors[key]
-                    src_len = int(src.shape[0])
-                    copy_len = min(expect, src_len)
-                    if copy_len > 0:
-                        # 取末尾 copy_len 行（每序列最后一个token语义）
-                        self.pp_proxy_tensors[key][:copy_len].copy_(src[-copy_len:])
+                    dim = int(pp_proxy_tensors[key].shape[0])
+                    if dim > 0:
+                        self.pp_proxy_tensors[key][:dim].copy_(pp_proxy_tensors[key])
+                    # Proactively zero padded rows to prevent stale carry-over across replays
+                    if self.pp_size > 1 and self.capture_forward_mode.is_decode_or_idle():
+                        bs_lim = int(bs)
+                        if dim < bs_lim:
+                            self.pp_proxy_tensors[key][dim:bs_lim].zero_()
+                # Optional: PP proxy tensors lightweight diagnostics
+                try:
+                    import os
+                    dbg = os.environ.get("DEBUG_CG_INPUTS", "0").lower() in ("1", "true", "yes")
+                    if dbg and self.pp_size > 1:
+                        uid = int(getattr(self, "_replay_uid", -1))
+                        for k, v in self.pp_proxy_tensors.items():
+                            try:
+                                shape = tuple(v.shape)
+                                # Flatten a tiny head for visibility without spamming logs
+                                flat_head = v.flatten()[:4].clone().to("cpu", non_blocking=False).tolist() if v.numel() > 0 else []
+                                logger.info(f"[CG-REPLAY-PP] uid={uid} key={k} shape={shape} head={flat_head}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens[:raw_bs])
@@ -743,6 +858,8 @@ class CudaGraphRunner:
                 self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
             if self.require_gathered_buffer:
                 self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+
+
             if enable_num_token_non_padded(self.model_runner.server_args):
                 self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
             if self.enable_two_batch_overlap:
@@ -765,9 +882,36 @@ class CudaGraphRunner:
                 forward_batch.spec_info,
                 seq_lens_cpu=self.seq_lens_cpu[:bs],
             )
+            # Optional: synchronize graph stream after metadata init to rule out races (debug only)
+            try:
+                import os
+                if os.environ.get("DEBUG_CG_SYNC", "0").lower() in ("1", "true", "yes"):
+                    torch.cuda.current_stream().synchronize()
+            except Exception:
+                pass
 
             # Store fields used by replay()
             self.raw_bs = raw_bs
+            # Debug: dump bs/raw_bs and head of req_pool_indices/seq_lens for mapping verification
+            try:
+                import os
+                dbg = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "1").lower() not in ("0", "false", "no")
+                if dbg:
+                    try:
+                        rpi = self.req_pool_indices[:bs].clone().to("cpu", non_blocking=True).tolist()
+                        sl = self.seq_lens[:bs].clone().to("cpu", non_blocking=True).tolist()
+                        mode_name = self.capture_forward_mode.name if hasattr(self, "capture_forward_mode") else "NA"
+                        has_spec = forward_batch.spec_info is not None
+                        uid = int(getattr(self, "_replay_uid", -1))
+                        extra = ""
+                        if bs != raw_bs and raw_bs > 0:
+                            extra = f" rpi_pad_tail={rpi[max(raw_bs-2,0):bs]}"
+                        logger.info(f"[CG-REPLAY-PREP] uid={uid} bs={bs} raw_bs={raw_bs} mode={mode_name} spec={has_spec} req_pool_indices_head={rpi[:4]} seq_lens_head={sl[:4]}{extra}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             # Use the actual copied token count to be consistent in replay
             self.raw_num_token = n_id if n_id > 0 else raw_num_token
             self.bs = bs
@@ -787,30 +931,47 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # CRITICAL: Semi-PD流同步修复 - 在任何操作前就设置正确的流
+        # Optional stream switching (default OFF to align with origin)
         original_stream = None
-        if self.model_runner.server_args.enable_semi_pd:
+        try:
+            import os
+            do_switch = (
+                self.model_runner.server_args.enable_semi_pd
+                and os.environ.get("CG_SWITCH_STREAM", "0").lower() in ("1", "true", "yes")
+            )
+        except Exception:
+            do_switch = False
+        if do_switch:
             original_stream = torch.cuda.current_stream()
             if original_stream != self.stream:
                 if DEBUG_LOGS_ENABLED:
                     logger.info(f"[CG-STREAM-EARLY-FIX] switching from {original_stream.cuda_stream:x} to {self.stream.cuda_stream:x}")
                 torch.cuda.set_stream(self.stream)
-        
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             n = min(self.raw_num_token, forward_batch.input_ids.shape[0])
             if n > 0:
-                self.input_ids[: n].copy_(forward_batch.input_ids[-n:])
-                self.positions[: n].copy_(forward_batch.positions[-n:])
+                # Align with origin: copy from the head
+                self.input_ids[: n].copy_(forward_batch.input_ids[: n])
+                self.positions[: n].copy_(forward_batch.positions[: n])
 
         # Replay
         self._log_streams("replay:entry")
-        
-        # CRITICAL: Semi-PD流同步修复 - 在任何操作前就设置正确的流
+
+        # Optional stream switching (default OFF to align with origin)
         original_stream = None
-        if self.model_runner.server_args.enable_semi_pd:
+        try:
+            import os
+            do_switch = (
+                self.model_runner.server_args.enable_semi_pd
+                and os.environ.get("CG_SWITCH_STREAM", "0").lower() in ("1", "true", "yes")
+            )
+        except Exception:
+            do_switch = False
+        if do_switch:
             original_stream = torch.cuda.current_stream()
             if original_stream != self.stream:
                 if DEBUG_LOGS_ENABLED:
@@ -819,46 +980,51 @@ class CudaGraphRunner:
 
         # 添加 NVTX 标记和精确计时
         torch.cuda.nvtx.range_push("CudaGraph_Replay_Total")
-        
+
         # 测量 replay 前的准备时间
         _t_prepare_start = time.perf_counter()
         torch.cuda.nvtx.range_push("CudaGraph_Pre_Replay")
-        
+
         # 检查当前流状态
         current_stream_before = torch.cuda.current_stream()
         if DEBUG_LOGS_ENABLED:
             logger.info(f"[CG-STREAM-FIX] about_to_replay current={current_stream_before.cuda_stream:x}, graph={self.stream.cuda_stream:x}")
-        
-        # 确保在正确的流上
-        if current_stream_before != self.stream:
+
+        # 可选：确保在捕获流上回放（默认与原生一致：不强制切流）
+        try:
+            import os
+            do_switch = os.environ.get("CG_SWITCH_STREAM", "0").lower() in ("1", "true", "yes")
+        except Exception:
+            do_switch = False
+        if do_switch and current_stream_before != self.stream:
             torch.cuda.set_stream(self.stream)
             if DEBUG_LOGS_ENABLED:
                 logger.info(f"[CG-CRITICAL-STREAM-SWITCH] forced stream switch at replay time")
-        
+
         torch.cuda.nvtx.range_pop()  # Pre_Replay
         _t_prepare_end = time.perf_counter()
-        
+
         # 精确测量 CUDA Graph replay 时间
         torch.cuda.nvtx.range_push("CudaGraph_Core_Replay")
         _t0 = time.perf_counter()
-        
+
         # 核心 replay 调用 - Semi-PD 优化
         if self.model_runner.server_args.enable_semi_pd:
             # Semi-PD 特殊处理：检查Graph状态并优化执行
             graph = self.graphs[self.bs]
-            
+
             # 检查Graph是否有效（避免重新捕获导致的开销）
             if hasattr(graph, '_is_captured') and not graph._is_captured:
                 logger.info(f"[CG-WARNING] Graph not properly captured for bs={self.bs}")
-            
+
             # 使用GPU事件计时而非CPU计时来减少host-device同步
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
-            
+
             start_event.record()
             graph.replay()
             end_event.record()
-            
+
             # 非阻塞检查（仅用于调试）
             if end_event.query():
                 gpu_time = start_event.elapsed_time(end_event)
@@ -866,32 +1032,32 @@ class CudaGraphRunner:
         else:
             # 标准执行
             self.graphs[self.bs].replay()
-        
+
         _t1 = time.perf_counter()
         torch.cuda.nvtx.range_pop()  # Core_Replay
-        
+
         # 测量 replay 后的清理时间
         torch.cuda.nvtx.range_push("CudaGraph_Post_Replay")
         _t_post_start = time.perf_counter()
-        
+
         # 恢复原始流（如果需要）
         if original_stream and original_stream != self.stream:
             torch.cuda.set_stream(original_stream)
             if DEBUG_LOGS_ENABLED:
                 logger.info(f"[CG-STREAM-EARLY-FIX] restored to {original_stream.cuda_stream:x}")
-        
+
         torch.cuda.nvtx.range_pop()  # Post_Replay
         torch.cuda.nvtx.range_pop()  # Total
         _t_post_end = time.perf_counter()
 
         self._log_streams("replay:exit")
-        
+
         # 详细的性能日志
         prepare_time = (_t_prepare_end - _t_prepare_start) * 1000
         core_replay_time = (_t1 - _t0) * 1000
         post_time = (_t_post_end - _t_post_start) * 1000
         total_time = (_t_post_end - _t_prepare_start) * 1000
-        
+
         if DEBUG_LOGS_ENABLED:
             logger.info(
                 f"[CG-LAUNCH] cudaGraphLaunch host_cost={core_replay_time:.3f} ms, bs={self.bs}, mode={self.capture_forward_mode.name}"
@@ -912,7 +1078,11 @@ class CudaGraphRunner:
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice by actual tokens (raw_num_token), not padded bs, to avoid
+            # forwarding fabricated rows to the next PP stage.
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

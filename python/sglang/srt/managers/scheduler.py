@@ -954,7 +954,34 @@ class Scheduler(
                 if self.cur_batch:
 
                     server_is_idle = False
-                    result = self.run_batch(self.cur_batch)
+                    # Optional per-step H2D audit: counts and bytes
+                    if os.environ.get("SGLANG_H2D_STEP_AUDIT", "0").lower() in ("1", "true", "yes"):
+                        try:
+                            from .copy_audit import CopyAudit
+                            CopyAudit.reset()
+                            scope = f"PP{getattr(self, 'pp_rank', -1)}_MB{mb_id}"
+                            with CopyAudit(scope=scope, log_fn=logger.info):
+                                result = self.run_batch(self.cur_batch)
+                            try:
+                                totals = CopyAudit.totals()
+                                logger.info(
+                                    f"[H2D_STEP_AUDIT] role={getattr(self,'instance_role','NA')} pp={getattr(self,'pp_rank','?')} tp={self.tp_rank} mb={mb_id} "
+                                    f"h2d_bytes={totals.get('h2d_bytes',0)} h2d_calls={totals.get('h2d_calls',0)} "
+                                    f"d2h_bytes={totals.get('d2h_bytes',0)} d2h_calls={totals.get('d2h_calls',0)} "
+                                    f"total_bytes={totals.get('bytes',0)} total_calls={totals.get('calls',0)}"
+                                )
+                                # Top-K callsites by bytes (optional)
+                                try:
+                                    topk = int(os.environ.get("SGLANG_H2D_STEP_AUDIT_TOPK", "10"))
+                                except Exception:
+                                    topk = 10
+                                CopyAudit.dump_summary(top_k=topk, log_fn=logger.info)
+                            except Exception:
+                                pass
+                        except Exception:
+                            result = self.run_batch(self.cur_batch)
+                    else:
+                        result = self.run_batch(self.cur_batch)
                     # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
                     if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
                         try:
@@ -1565,6 +1592,31 @@ class Scheduler(
         )
 
         logger.info(msg)
+        # Extra debug: print decode row order (rid list) for batch mapping
+        try:
+            import os
+            if os.environ.get("DEBUG_ATTENTION", "0").lower() in ("1", "true", "yes"):
+                try:
+                    order = [str(getattr(r, "rid", None))[:8] for r in batch.reqs]
+                    rpidx = [int(getattr(r, "req_pool_idx", -1)) for r in batch.reqs]
+                    try:
+                        sl_head = batch.seq_lens[: len(batch.reqs)].clone().to("cpu", non_blocking=True).tolist()
+                    except Exception:
+                        sl_head = []
+                    msg_order = f"[DBG_ATTN] decode_row_order rid={order} req_pool_idx={rpidx} seq_lens={sl_head}"
+                    try:
+                        logger.info(msg_order)
+                    except Exception:
+                        pass
+                    try:
+                        print(msg_order)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used

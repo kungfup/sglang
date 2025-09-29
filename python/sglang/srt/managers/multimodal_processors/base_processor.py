@@ -138,24 +138,27 @@ class BaseMultimodalProcessor(ABC):
             )
         except Exception:
             is_fast = False
-        # Choose processor output device.
-        # Default to CPU to avoid GPU->CPU->GPU round trips under PP/Semi-PD; allow override via env.
-        preferred_dev = os.environ.get("SGLANG_MM_PREPROC_DEVICE", "cpu").lower()
-        if preferred_dev not in ("cpu", "cuda"):
-            preferred_dev = "cpu"
-        if preferred_dev == "cuda" and not torch.cuda.is_available():
-            preferred_dev = "cpu"
-        if preferred_dev == "cuda" and is_fast:
+        # Choose processor output device + placement policy
+        # Default (origin-compatible): if fast processor is available and CUDA present, run on CUDA,
+        # then force pixel_values back to CPU (optionally pinned). Scheduler will H2D to stage device.
+        # Optional alternative (lazy H2D): with SGLANG_MM_LAZY_H2D=1, keep everything on CPU and let
+        # the model/Vision tower do async H2D on demand; avoid scheduler-side H2D.
+        lazy_h2d = os.environ.get("SGLANG_MM_LAZY_H2D", "0").lower() in ("1", "true", "yes")
+
+        if not lazy_h2d and is_fast and torch.cuda.is_available():
+            # Origin behavior: preprocess on CUDA for fast path
             kwargs["device"] = "cuda"
         else:
-            # Ensure processor returns CPU tensors
+            # Lazy H2D (or no fast CUDA): preprocess on CPU
             kwargs["device"] = "cpu"
+
         logger.info(
-            "[MM_PREPROC] pid=%s fast_image_processor=%s set_device=%s arch=%s",
+            "[MM_PREPROC] pid=%s fast_image_processor=%s set_device=%s arch=%s lazy_h2d=%s",
             os.getpid(),
             is_fast,
             kwargs.get("device", None),
             self.arch,
+            lazy_h2d,
         )
         result = processor.__call__(
             text=[input_text],
@@ -166,27 +169,33 @@ class BaseMultimodalProcessor(ABC):
         if "pixel_values" in result and isinstance(result["pixel_values"], torch.Tensor):
             try:
                 logger.info(
-                    "[MM_PREPROC] pixel_values before_move device=%s dtype=%s shape=%s",
+                    "[MM_PREPROC] pixel_values before_stage device=%s dtype=%s shape=%s",
                     getattr(result["pixel_values"], "device", "n/a"),
                     getattr(result["pixel_values"], "dtype", "n/a"),
                     tuple(result["pixel_values"].shape),
                 )
             except Exception:
                 pass
-            # Do NOT force CPU staging here. Honor the processor's output device to
-            # avoid redundant D2H/H2D round-trips.
-            # If the tensor is on CPU and pinning is enabled, pin to accelerate H2D later.
+
             try:
-                if (
-                    getattr(result["pixel_values"], "device", torch.device("cpu")).type == "cpu"
-                    and os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes")
-                ):
-                    result["pixel_values"] = result["pixel_values"].pin_memory()
+                if lazy_h2d:
+                    # Keep on CPU, pin if enabled
+                    if result["pixel_values"].device.type != "cpu":
+                        result["pixel_values"] = result["pixel_values"].to("cpu", non_blocking=False)
+                    if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                        result["pixel_values"] = result["pixel_values"].pin_memory()
+                else:
+                    # Origin behavior: always stage to CPU after preprocessing (may come from CUDA)
+                    if result["pixel_values"].device.type != "cpu":
+                        result["pixel_values"] = result["pixel_values"].to("cpu", non_blocking=False)
+                    if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                        result["pixel_values"] = result["pixel_values"].pin_memory()
             except Exception:
                 pass
+
             try:
                 logger.info(
-                    "[MM_PREPROC] pixel_values after_move device=%s",
+                    "[MM_PREPROC] pixel_values after_stage device=%s",
                     getattr(result["pixel_values"], "device", "n/a"),
                 )
             except Exception:

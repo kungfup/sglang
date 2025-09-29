@@ -23,6 +23,8 @@ class Stat:
     cpu_to_cuda: int = 0
     cuda_to_cpu: int = 0
     dtype_changes: int = 0
+    h2d_bytes: int = 0
+    d2h_bytes: int = 0
 
 
 class CopyAudit:
@@ -81,8 +83,10 @@ class CopyAudit:
                     dst_dev = t.device.type
                 if src_dev == "cpu" and dst_dev == "cuda":
                     stat.cpu_to_cuda += 1
+                    stat.h2d_bytes += b
                 elif src_dev == "cuda" and dst_dev == "cpu":
                     stat.cuda_to_cpu += 1
+                    stat.d2h_bytes += b
             except Exception:
                 pass
             # dtype change
@@ -110,6 +114,25 @@ class CopyAudit:
     @staticmethod
     def reset():
         CopyAudit._stats.clear()
+
+    @staticmethod
+    def totals():
+        t_calls = t_bytes = h2d_calls = d2h_calls = h2d_bytes = d2h_bytes = 0
+        for v in CopyAudit._stats.values():
+            t_calls += v.calls
+            t_bytes += v.bytes
+            h2d_calls += v.cpu_to_cuda
+            d2h_calls += v.cuda_to_cpu
+            h2d_bytes += v.h2d_bytes
+            d2h_bytes += v.d2h_bytes
+        return {
+            "calls": t_calls,
+            "bytes": t_bytes,
+            "h2d_calls": h2d_calls,
+            "h2d_bytes": h2d_bytes,
+            "d2h_calls": d2h_calls,
+            "d2h_bytes": d2h_bytes,
+        }
 
 
 def _find_site() -> str:

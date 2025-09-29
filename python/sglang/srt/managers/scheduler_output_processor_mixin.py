@@ -4,6 +4,8 @@ import gc
 import logging
 import os
 import threading
+import torch
+
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -78,7 +80,7 @@ class SchedulerOutputProcessorMixin:
                 # 常规处理
                 if next_token_ids is not None and not isinstance(next_token_ids, list):
                     next_token_ids = next_token_ids.tolist()
-                
+
                 # 处理logprobs
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
@@ -136,17 +138,28 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .cpu()
-                            .clone()
-                            .tolist()
-                        )
+                        # Avoid heavy CPU tolist() in the hot path.
+                        # Optionally use pinned D2H and defer Python list conversion.
+                        _hs_slice = logits_output.hidden_states[
+                            hidden_state_offset : (
+                                hidden_state_offset := hidden_state_offset + len(req.origin_input_ids)
+                            )
+                        ].detach()
+                        try:
+                            defer = os.environ.get("SGLANG_DEFER_HS_TOLIST", "1").lower() in ("1","true","yes")
+                            pin_d2h = os.environ.get("SGLANG_PIN_D2H", "1").lower() in ("1","true","yes")
+                        except Exception:
+                            defer = True; pin_d2h = True
+                        if pin_d2h and _hs_slice.is_cuda:
+                            _cpu_buf = torch.empty_like(_hs_slice, device="cpu", pin_memory=True)
+                            _cpu_buf.copy_(_hs_slice, non_blocking=True)
+                        else:
+                            _cpu_buf = _hs_slice.to("cpu", non_blocking=True)
+                        if defer:
+                            # Store CPU tensor; convert to list at stream_output time if needed
+                            req.hidden_states.append(_cpu_buf)
+                        else:
+                            req.hidden_states.append(_cpu_buf.tolist())
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -295,9 +308,22 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                # Avoid blocking .tolist() here; copy to pinned CPU and optionally defer conversion.
+                _hs = logits_output.hidden_states[i].detach()
+                try:
+                    defer = os.environ.get("SGLANG_DEFER_HS_TOLIST", "1").lower() in ("1","true","yes")
+                    pin_d2h = os.environ.get("SGLANG_PIN_D2H", "1").lower() in ("1","true","yes")
+                except Exception:
+                    defer = True; pin_d2h = True
+                if pin_d2h and _hs.is_cuda:
+                    _cpu_buf = torch.empty_like(_hs, device="cpu", pin_memory=True)
+                    _cpu_buf.copy_(_hs, non_blocking=True)
+                else:
+                    _cpu_buf = _hs.to("cpu", non_blocking=True)
+                if defer:
+                    req.hidden_states.append(_cpu_buf)
+                else:
+                    req.hidden_states.append(_cpu_buf.tolist())
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 req.grammar.accept_token(next_token_id)
@@ -727,7 +753,27 @@ class SchedulerOutputProcessorMixin:
                 if req.return_hidden_states:
                     if output_hidden_states is None:
                         output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
+                    try:
+                        hs_mode = os.environ.get("SGLANG_STREAM_HS_MODE", "final").lower()
+                    except Exception:
+                        hs_mode = "final"
+                    if hs_mode in ("stream", "1", "true"):
+                        hs_obj = req.hidden_states
+                    else:
+                        if req.finished():
+                            _hs_list = []
+                            for _h in (req.hidden_states or []):
+                                if hasattr(_h, "tolist"):
+                                    try:
+                                        _hs_list.append(_h.tolist())
+                                    except Exception:
+                                        _hs_list.append(None)
+                                else:
+                                    _hs_list.append(_h)
+                            hs_obj = _hs_list
+                        else:
+                            hs_obj = None
+                    output_hidden_states.append(hs_obj)
 
             if (
                 req.finished()

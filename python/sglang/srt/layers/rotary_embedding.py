@@ -2,10 +2,22 @@
 
 """Rotary Positional Embeddings."""
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+import logging
+logger = logging.getLogger(__name__)
+# Debug flag to trace RoPE cache usage and positions during forward.
+DEBUG_ROPE = os.environ.get("DEBUG_ROPE_ISOLATION", "0").lower() in ("1", "true", "yes")
+
+if DEBUG_ROPE:
+    try:
+        logger.info("[DBG_ROPE] module_loaded path=%s", __file__)
+    except Exception:
+        pass
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
@@ -97,6 +109,7 @@ class RotaryEmbedding(CustomOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
@@ -129,6 +142,14 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] forward_native_enter dev={str(query.device)} dtype={str(query.dtype)} pos_shape={tuple(positions.shape)}"
+                )
+            except Exception:
+                pass
+
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
             positions = positions + offsets
@@ -159,6 +180,14 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] forward_cpu_enter dev={str(query.device)} dtype={str(query.dtype)} pos_shape={tuple(positions.shape)}"
+                )
+            except Exception:
+                pass
+
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
@@ -179,23 +208,48 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] forward_cuda_enter dev={str(query.device)} dtype={str(query.dtype)} pos_shape={tuple(positions.shape)}"
+                )
+            except Exception:
+                pass
+
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+            # Ensure we don't mutate or move the module buffer during forward; use a local copy.
+            # The fused CUDA kernel requires cos_sin_cache to be float32.
+            cos_sin_cache_local = self.cos_sin_cache.to(query.device, dtype=torch.float32)
+            if DEBUG_ROPE:
+                try:
+                    logger.info(
+                        f"[DBG_ROPE] kernel dev={query.device} qk_dtype={query.dtype} cache_dtype={cos_sin_cache_local.dtype} pos_shape={tuple(positions.shape)} cache_id={id(self.cos_sin_cache)} local_id={id(cos_sin_cache_local)}"
+                    )
+                except Exception:
+                    pass
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
                 key=key,
                 head_size=self.head_size,
-                cos_sin_cache=self.cos_sin_cache,
+                cos_sin_cache=cos_sin_cache_local,
                 is_neox=self.is_neox_style,
             )
         else:
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            cos_sin_cache_local = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            if DEBUG_ROPE:
+                try:
+                    logger.info(
+                        f"[DBG_ROPE] vllm_rotary dev={query.device} dtype={query.dtype} pos_shape={tuple(positions.shape)} cache_id={id(self.cos_sin_cache)} local_id={id(cos_sin_cache_local)}"
+                    )
+                except Exception:
+                    pass
             self.vllm_rotary_embedding(
                 positions,
                 query,
                 key,
                 self.head_size,
-                self.cos_sin_cache,
+                cos_sin_cache_local,
                 self.is_neox_style,
             )
         return query, key
@@ -554,6 +608,14 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] mrope_forward_enter dev={str(query.device)} dtype={str(query.dtype)} pos_shape={tuple(positions.shape)}"
+                )
+            except Exception:
+                pass
+
         query = query.view(*query.shape[:-1], -1, self.head_size)
         key = key.view(*key.shape[:-1], -1, self.head_size)
 
@@ -566,11 +628,16 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
             if long_prompt_offset is not None
             else positions
         )
-        self.long_short_cos_sin_cache: torch.Tensor = self.long_short_cos_sin_cache.to(
-            idx.device
-        )
+        long_short_cos_sin_cache_local = self.long_short_cos_sin_cache.to(idx.device)
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] mrope dev={idx.device} pos_shape={tuple(idx.shape)} cache_id={id(self.long_short_cos_sin_cache)} local_id={id(long_short_cos_sin_cache_local)}"
+                )
+            except Exception:
+                pass
         idx = torch.add(idx, offsets) if offsets is not None else idx
-        cos_sin = torch.index_select(self.long_short_cos_sin_cache, 0, idx)
+        cos_sin = torch.index_select(long_short_cos_sin_cache_local, 0, idx)
 
         cos, sin = cos_sin.chunk(2, dim=-1)
         cos = cos.repeat(1, 2).unsqueeze(-2)
@@ -691,8 +758,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
+        cos_sin_cache_local = self.cos_sin_cache.to(positions.device)
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] native dev={positions.device} pos_shape={tuple(positions.shape)} cache_id={id(self.cos_sin_cache)} local_id={id(cos_sin_cache_local)}"
+                )
+            except Exception:
+                pass
+        cos_sin = cos_sin_cache_local[
             torch.add(positions, offsets) if offsets is not None else positions
         ]
         cos, sin = cos_sin.chunk(2, dim=-1)
@@ -830,14 +904,28 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(query.device)
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] complex_forward_enter dev={str(query.device)} dtype={str(query.dtype)} q_shape={tuple(query.shape)} k_shape={tuple(key.shape)}"
+                )
+            except Exception:
+                pass
+        cos_sin_cache_local = self.cos_sin_cache.to(query.device)
+        if DEBUG_ROPE:
+            try:
+                logger.info(
+                    f"[DBG_ROPE] complex dev={query.device} q_shape={tuple(query.shape)} cache_id={id(self.cos_sin_cache)} local_id={id(cos_sin_cache_local)}"
+                )
+            except Exception:
+                pass
         query_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
         key_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
         broadcast_shape = [
             d if i == 1 or i == (query_.ndim - 1) else 1
             for i, d in enumerate(query_.shape)
         ]
-        freqs_ci = self.cos_sin_cache.view(*broadcast_shape)
+        freqs_ci = cos_sin_cache_local.view(*broadcast_shape)
         query_out = torch.view_as_real(query_ * freqs_ci).flatten(3)
         key_out = torch.view_as_real(key_ * freqs_ci).flatten(3)
         return query_out.type_as(query), key_out.type_as(key)

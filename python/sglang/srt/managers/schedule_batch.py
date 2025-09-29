@@ -1324,9 +1324,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        # Do not alter pixel_values device here. Let the model handle placement/copies.
-        # This avoids D2H/H2D round-trips and enables earlier/async prefetch if implemented.
+        # Place multimodal pixel_values according to policy
+        lazy_h2d = os.environ.get("SGLANG_MM_LAZY_H2D", "0").lower() in ("1", "true", "yes")
         self.multimodal_inputs = multimodal_inputs
+        # Only the first PP stage needs pixel_values on device; later stages only consume hidden_states.
+        is_pp_first = True
+        try:
+            from sglang.srt.distributed import get_pp_group
+            is_pp_first = get_pp_group().is_first_rank
+        except Exception:
+            pass
+        if is_pp_first and (not lazy_h2d) and (self.multimodal_inputs is not None):
+            try:
+                # Origin-compatible: stage pixel_values to current stage device now
+                for item in getattr(self.multimodal_inputs, "mm_items", []) or []:
+                    pv = getattr(item, "pixel_values", None)
+                    if isinstance(pv, torch.Tensor) and pv.numel() > 0:
+                        if pv.device.type == "cpu":
+                            # Pin to speed up H2D if configured
+                            if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                                try:
+                                    pv = pv.pin_memory()
+                                except Exception:
+                                    pass
+                        if pv.device != self.device:
+                            pv = pv.to(self.device, non_blocking=True)
+                        item.pixel_values = pv
+            except Exception as e:
+                logger.warning(f"[MM_PREPROC] Failed to stage pixel_values to device: {e}")
+        elif (not is_pp_first) and (not lazy_h2d):
+            # Non-first PP stage: explicitly skip staging images to avoid delaying PP recv
+            try:
+                logger.info("[MM_PREPROC] Skip staging pixel_values on non-first PP stage to minimize prefill stall")
+            except Exception:
+                pass
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
@@ -1362,6 +1393,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     out_cache_loc[pt : pt + extend_lens[i]],
                 )
                 pt += extend_lens[i]
+
+        # Record a CUDA event after req_to_token has been written so CUDA Graph replay can wait on it
+        try:
+            dev = getattr(self, 'device', None)
+            evt = torch.cuda.Event(blocking=False)
+            torch.cuda.current_stream(device=dev).record_event(evt)
+            setattr(self.req_to_token_pool, 'last_write_event', evt)
+        except Exception:
+            pass
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -1616,6 +1656,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_to_token_pool.write(
             self.req_pool_indices, locs, self.out_cache_loc.to(torch.int32)
         )
+        # Record a CUDA event after per-step decode write to req_to_token so replay can wait precisely
+        try:
+            dev = getattr(self, 'device', None)
+            evt = torch.cuda.Event(blocking=False)
+            torch.cuda.current_stream(device=dev).record_event(evt)
+            setattr(self.req_to_token_pool, 'last_write_event', evt)
+        except Exception:
+            pass
+
 
     def filter_batch(
         self,

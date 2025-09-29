@@ -3,6 +3,8 @@ from typing import Callable, List, Optional, Tuple
 import einops
 import torch
 import logging
+import os
+
 
 from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -611,14 +613,40 @@ def apply_fp8_linear(
                 assert (
                     weight_scale.numel() == weight.shape[1]
                 ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                output = fp8_scaled_mm(
-                    qinput,
-                    weight,
-                    x_scale,
-                    weight_scale,
-                    out_dtype=input.dtype,
-                    bias=bias,
-                )
+                # Guard: slice along M when it exceeds kernel-supported launch configs (e.g., 8k may fail).
+                # Keep FP8 fast path by splitting qinput/x_scale on dim=0.
+                M_total = int(qinput.shape[0])
+                max_m = int(os.environ.get("SGLANG_FP8_MAX_M_PER_GEMM", "4096"))
+                if max_m <= 0:
+                    max_m = M_total
+                if M_total <= max_m:
+                    output = fp8_scaled_mm(
+                        qinput,
+                        weight,
+                        x_scale,
+                        weight_scale,
+                        out_dtype=input.dtype,
+                        bias=bias,
+                    )
+                else:
+                    chunks = []
+                    start = 0
+                    while start < M_total:
+                        end = min(start + max_m, M_total)
+                        xs = x_scale[start:end] if x_scale.dim() == 1 else x_scale[start:end, ...]
+                        part = fp8_scaled_mm(
+                            qinput[start:end, :],
+                            weight,
+                            xs,
+                            weight_scale,
+                            out_dtype=input.dtype,
+                            bias=None,
+                        )
+                        chunks.append(part)
+                        start = end
+                    output = torch.cat(chunks, dim=0)
+                    if bias is not None:
+                        output = output + bias
             return output.view(*output_shape)
 
         # torch.scaled_mm supports per tensor weights + activations only
@@ -777,14 +805,39 @@ def apply_fp8_linear(
                             )
                         except Exception:
                             pass
-                    output = fp8_scaled_mm(
-                        qinput,
-                        weight,
-                        x_scale,
-                        weight_scale,
-                        out_dtype=input.dtype,
-                        bias=bias,
-                    )
+                    # Guard: slice along M when it exceeds kernel-supported launch configs
+                    M_total = int(qinput.shape[0])
+                    max_m = int(os.environ.get("SGLANG_FP8_MAX_M_PER_GEMM", "4096"))
+                    if max_m <= 0:
+                        max_m = M_total
+                    if M_total <= max_m:
+                        output = fp8_scaled_mm(
+                            qinput,
+                            weight,
+                            x_scale,
+                            weight_scale,
+                            out_dtype=input.dtype,
+                            bias=bias,
+                        )
+                    else:
+                        chunks = []
+                        start = 0
+                        while start < M_total:
+                            end = min(start + max_m, M_total)
+                            xs = x_scale[start:end] if x_scale.dim() == 1 else x_scale[start:end, ...]
+                            part = fp8_scaled_mm(
+                                qinput[start:end, :],
+                                weight,
+                                xs,
+                                weight_scale,
+                                out_dtype=input.dtype,
+                                bias=None,
+                            )
+                            chunks.append(part)
+                            start = end
+                        output = torch.cat(chunks, dim=0)
+                        if bias is not None:
+                            output = output + bias
                 return output.view(*output_shape)
             except (ImportError, NameError, AttributeError, RuntimeError) as e:
                 try:

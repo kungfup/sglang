@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -45,6 +46,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.utils import dump_to_file
 
 logger = logging.getLogger(__name__)
+DEBUG_LOGITS = os.environ.get("DEBUG_LOGITS", "0").lower() in ("1", "true", "yes")
+if DEBUG_LOGITS:
+    logger.info("[DBG_LOGITS] module_loaded path=%s", __file__)
 
 
 @dataclasses.dataclass
@@ -235,6 +239,13 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        if DEBUG_LOGITS:
+            try:
+                logger.info(
+                    f"[DBG_LOGITS] enter hidden_states_shape={tuple(hidden_states.shape)} dev={str(hidden_states.device)} dtype={str(hidden_states.dtype)}"
+                )
+            except Exception:
+                pass
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         # Get the last hidden states and last logits for the next token prediction
@@ -322,6 +333,13 @@ class LogitsProcessor(nn.Module):
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
+        if DEBUG_LOGITS:
+            try:
+                logger.info(
+                    f"[DBG_LOGITS] sampled_logits shape={tuple(sampled_logits.shape)} dev={str(sampled_logits.device)} dtype={str(sampled_logits.dtype)}"
+                )
+            except Exception:
+                pass
 
         if self.debug_tensor_dump_output_folder:
             assert (

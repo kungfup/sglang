@@ -5,6 +5,21 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+DEBUG_ATTN = os.environ.get("DEBUG_ATTENTION", "0").lower() in ("1", "true", "yes")
+if DEBUG_ATTN:
+    # Use both logger and print to ensure visibility even if logging isn't configured yet
+    try:
+        logger.info("[DBG_ATTN] module_loaded path=%s", __file__)
+    except Exception:
+        pass
+    try:
+        print(f"[DBG_ATTN] module_loaded path={__file__}")
+    except Exception:
+        pass
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -624,6 +639,20 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if DEBUG_ATTN:
+            msg = (
+                f"[DBG_ATTN] forward_extend_enter bs={forward_batch.batch_size} mode={forward_batch.forward_mode.name} "
+                f"q={tuple(q.shape)} k={(tuple(k.shape) if k is not None else None)} v={(tuple(v.shape) if v is not None else None)} "
+                f"dev={str(q.device)} dtype={str(q.dtype)} use_mla={getattr(self,'use_mla',None)} use_irope={getattr(layer,'use_irope',None)}"
+            )
+            try:
+                logger.info(msg)
+            except Exception:
+                pass
+            try:
+                print(msg)
+            except Exception:
+                pass
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -692,6 +721,27 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
             max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
+        if DEBUG_ATTN:
+            # Safe to read shapes/devices of metadata tensors (no GPU sync)
+            try:
+                msg_meta = (
+                    "[DBG_ATTN] meta_extend "
+                    f"pt_shape={(tuple(page_table.shape) if isinstance(page_table, torch.Tensor) else None)} pt_dev={(str(page_table.device) if isinstance(page_table, torch.Tensor) else None)} "
+                    f"q_cu_shape={(tuple(cu_seqlens_q.shape) if isinstance(cu_seqlens_q, torch.Tensor) else None)} q_cu_dev={(str(cu_seqlens_q.device) if isinstance(cu_seqlens_q, torch.Tensor) else None)} "
+                    f"k_cu_shape={(tuple(cu_seqlens_k.shape) if 'cu_seqlens_k' in locals() and isinstance(cu_seqlens_k, torch.Tensor) else None)} "
+                    f"cache_seqlens_shape={(tuple(cache_seqlens.shape) if isinstance(cache_seqlens, torch.Tensor) else None)} "
+                    f"max_q={max_seqlen_q} max_k={max_seqlen_k}"
+                )
+                try:
+                    logger.info(msg_meta)
+                except Exception:
+                    pass
+                try:
+                    print(msg_meta)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -887,6 +937,20 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if DEBUG_ATTN:
+            msg = (
+                f"[DBG_ATTN] forward_decode_enter bs={forward_batch.batch_size} mode={forward_batch.forward_mode.name} "
+                f"q={tuple(q.shape)} k={(tuple(k.shape) if k is not None else None)} v={(tuple(v.shape) if v is not None else None)} "
+                f"dev={str(q.device)} dtype={str(q.dtype)} use_mla={getattr(self,'use_mla',None)} use_irope={getattr(layer,'use_irope',None)} spec={forward_batch.spec_info is not None}"
+            )
+            try:
+                logger.info(msg)
+            except Exception:
+                pass
+            try:
+                print(msg)
+            except Exception:
+                pass
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -915,6 +979,24 @@ class FlashAttentionBackend(AttentionBackend):
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
+        if DEBUG_ATTN:
+            try:
+                msg_loc = (
+                    "[DBG_ATTN] meta_decode "
+                    f"local={(use_local_attn)} "
+                    f"page_table_shape={(tuple(local_attn_metadata.local_block_table.shape) if (use_local_attn and hasattr(local_attn_metadata,'local_block_table') and isinstance(local_attn_metadata.local_block_table, torch.Tensor)) else None)} "
+                    f"q_cu_shape={(tuple(local_attn_metadata.local_query_start_loc.shape) if (use_local_attn and hasattr(local_attn_metadata,'local_query_start_loc') and isinstance(local_attn_metadata.local_query_start_loc, torch.Tensor)) else None)} "
+                )
+                try:
+                    logger.info(msg_loc)
+                except Exception:
+                    pass
+                try:
+                    print(msg_loc)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
@@ -1443,7 +1525,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 # Precompute maximum sequence length
                 metadata.max_seq_len_k = seq_lens.max().item()
-                # Precompute page table
+                # Precompute page table (bind rows to req_pool_indices during capture to match origin)
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     req_pool_indices, :
                 ]
@@ -1482,9 +1564,8 @@ class FlashAttentionBackend(AttentionBackend):
                     : (bs + 1)
                 ]
 
-                metadata.page_table = self.target_verify_metadata["page_table"][
-                    req_pool_indices, :
-                ]
+                # Bind page_table rows to req order during capture to match origin behavior
+                metadata.page_table = self.target_verify_metadata["page_table"][req_pool_indices, :]
 
                 self.target_verify_metadata[bs] = metadata
             else:
@@ -1546,9 +1627,8 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            metadata.page_table = self.draft_extend_metadata["page_table"][
-                req_pool_indices, :
-            ]
+            # Bind page_table rows to req order during capture to match origin behavior
+            metadata.page_table = self.draft_extend_metadata["page_table"][req_pool_indices, :]
 
             self.draft_extend_metadata[bs] = metadata
 
@@ -1561,9 +1641,8 @@ class FlashAttentionBackend(AttentionBackend):
                 "encoder_cu_seqlens_k"
             ][: (encoder_bs + 1)]
 
-            metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
-                req_pool_indices, :
-            ]
+            # Bind encoder_page_table rows to req order during capture to match origin behavior
+            metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][req_pool_indices, :]
 
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
@@ -1585,8 +1664,36 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
         device = seq_lens.device
+        # Ensure we see the latest writes (e.g., req_to_token/KV updates) from the default stream
+        try:
+            torch.cuda.current_stream(device=device).wait_stream(torch.cuda.default_stream(device=device))
+        except Exception:
+            pass
+        # Optional full device sync for diagnosing race conditions during replay
+        import os
+        if os.environ.get("DEBUG_ATTENTION_SYNC", "0").lower() in ("1", "true", "yes"):
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
         metadata = None
         metadata_expand = None
+
+        if DEBUG_ATTN:
+            try:
+                _rpi = req_pool_indices.clone().to("cpu", non_blocking=True).tolist()
+                _sl = seq_lens.clone().to("cpu", non_blocking=True).tolist()
+                _max_src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens
+                _max_len = int(_max_src.max().item())
+                _path = (
+                    "draft" if (spec_info is not None and forward_mode.is_decode_or_idle()) else (
+                    "verify" if forward_mode.is_target_verify() else (
+                    "normal" if forward_mode.is_decode_or_idle() else "other"))
+                )
+                _uid = getattr(self, "debug_replay_uid", None)
+                print(f"[DBG_ATTN] replay_decode_init uid={_uid} path={_path} bs={bs} max_len={_max_len} rpi_head={_rpi[:4]} sl_head={_sl[:4]}")
+            except Exception:
+                pass
 
         if forward_mode.is_decode_or_idle():
 
@@ -1613,6 +1720,35 @@ class FlashAttentionBackend(AttentionBackend):
                         self.speculative_step_id + 1,
                         self.page_size,
                     )
+                    # Optional: Force overwrite page_table from a fresh snapshot on the same stream (draft<=1)
+                    try:
+                        import os
+                        if os.environ.get("DEBUG_ATTENTION_FORCE_OVERWRITE", "0").lower() in ("1", "true", "yes"):
+                            _si = self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages]
+                            _pi = self.req_to_token[req_pool_indices[:, None], _si[None, :]] // self.page_size
+                            metadata.page_table[:, :max_seq_pages].copy_(_pi)
+                            # Optional: Zero out the right tail beyond valid pages to avoid any stale indices during replay
+                            if os.environ.get("DEBUG_ATTENTION_ZERO_TAIL", "0").lower() in ("1", "true", "yes") and metadata.page_table.shape[1] > max_seq_pages:
+                                metadata.page_table[:, int(max_seq_pages):].fill_(0)
+
+                            if DEBUG_ATTN:
+                                _uid = getattr(self, "debug_replay_uid", None)
+                                print(f"[DBG_ATTN] pgtbl_overwrite uid={_uid} bs={bs} max_seq_pages={int(max_seq_pages)} (draft<=1)")
+                    except Exception:
+                        pass
+                    # Lightweight verification of page_table vs req_to_token mapping (draft decode, topk<=1)
+                    try:
+                        if os.environ.get("DEBUG_ATTENTION_PGTBL", "0").lower() in ("1", "true", "yes"):
+                            rows = int(min(2, metadata.page_table.shape[0]))
+                            cols = int(min(8, max_seq_pages))
+                            if rows > 0 and cols > 0:
+                                pt = metadata.page_table[:rows, :cols].to("cpu", non_blocking=True)
+                                si = self.decode_cuda_graph_metadata["strided_indices"][:cols]
+                                ri = req_pool_indices[:rows]
+                                rt = (self.req_to_token[ri[:, None], si[None, :]] // self.page_size).to("cpu", non_blocking=True)
+                                print(f"[DBG_ATTN] pgtbl_head(draft<=1) rows={rows} cols={cols} pt={pt.tolist()} rt={rt.tolist()}")
+                    except Exception:
+                        pass
 
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -1662,6 +1798,43 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                 )
+                # Optional: Force overwrite page_table from a fresh snapshot on the same stream (normal)
+                try:
+                    import os
+                    if os.environ.get("DEBUG_ATTENTION_FORCE_OVERWRITE", "0").lower() in ("1", "true", "yes"):
+                        _si = self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages]
+                        _pi = self.req_to_token[req_pool_indices[:, None], _si[None, :]] // self.page_size
+                        metadata.page_table[:, :max_seq_pages].copy_(_pi)
+                        # Optional: Zero out the right tail beyond valid pages to avoid any stale indices during replay
+                        if os.environ.get("DEBUG_ATTENTION_ZERO_TAIL", "0").lower() in ("1", "true", "yes") and metadata.page_table.shape[1] > max_seq_pages:
+                            metadata.page_table[:, int(max_seq_pages):].fill_(0)
+
+                        if DEBUG_ATTN:
+                            _uid = getattr(self, "debug_replay_uid", None)
+                            print(f"[DBG_ATTN] pgtbl_overwrite uid={_uid} bs={bs} max_seq_pages={int(max_seq_pages)}")
+                except Exception:
+                    pass
+                # Lightweight verification of page_table vs req_to_token mapping (normal decode)
+                try:
+                    if os.environ.get("DEBUG_ATTENTION_PGTBL", "0").lower() in ("1", "true", "yes"):
+                        rows = int(min(2, metadata.page_table.shape[0]))
+                        cols = int(min(8, max_seq_pages))
+                        if rows > 0 and cols > 0:
+                            pt = metadata.page_table[:rows, :cols].to("cpu", non_blocking=True)
+                            si = self.decode_cuda_graph_metadata["strided_indices"][:cols]
+                            ri = req_pool_indices[:rows]
+                            rt = (self.req_to_token[ri[:, None], si[None, :]] // self.page_size).to("cpu", non_blocking=True)
+                            print(f"[DBG_ATTN] pgtbl_head(normal) rows={rows} cols={cols} pt={pt.tolist()} rt={rt.tolist()}")
+                except Exception:
+                    pass
+
+                if DEBUG_ATTN:
+                    try:
+                        _rpi = req_pool_indices.clone().to("cpu", non_blocking=True).tolist()
+                        _max_pages = int(max_seq_pages)
+                        print(f"[DBG_ATTN] normal_decode_set_metadata done bs={bs} rpi_head={_rpi[:4]} max_pages={_max_pages}")
+                    except Exception:
+                        pass
 
                 self._update_local_attn_metadata_for_replay(metadata, bs)
         elif forward_mode.is_target_verify():
@@ -1686,6 +1859,27 @@ class FlashAttentionBackend(AttentionBackend):
                 ]
                 page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                # Optional: zero out tail
+                try:
+                    import os
+                    if os.environ.get("DEBUG_ATTENTION_ZERO_TAIL", "0").lower() in ("1", "true", "yes") and metadata.page_table.shape[1] > max_seq_pages:
+                        metadata.page_table[:, int(max_seq_pages):].fill_(0)
+                except Exception:
+                    pass
+
+                # Lightweight verification of page_table vs req_to_token mapping (target verify, topk<=1)
+                try:
+                    if os.environ.get("DEBUG_ATTENTION_PGTBL", "0").lower() in ("1", "true", "yes"):
+                        rows = int(min(2, metadata.page_table.shape[0]))
+                        cols = int(min(8, max_seq_pages))
+                        if rows > 0 and cols > 0:
+                            pt = metadata.page_table[:rows, :cols].to("cpu", non_blocking=True)
+                            si = self.decode_cuda_graph_metadata["strided_indices"][:cols]
+                            ri = req_pool_indices[:rows]
+                            rt = (self.req_to_token[ri[:, None], si[None, :]] // self.page_size).to("cpu", non_blocking=True)
+                            print(f"[DBG_ATTN] pgtbl_head(verify<=1) rows={rows} cols={cols} pt={pt.tolist()} rt={rt.tolist()}")
+                except Exception:
+                    pass
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -1944,7 +2138,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+        # Use number of pages instead of raw tokens to slice page_table correctly
+        max_seq_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        sliced_page_table = metadata.page_table[:bs, :max_seq_pages]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
@@ -1960,6 +2156,11 @@ class FlashAttentionBackend(AttentionBackend):
             sliced_page_table,
             self.page_size,
         )
+        if DEBUG_ATTN:
+            try:
+                print(f"[DBG_ATTN] local_attn_replay_setup bs={bs} max_seq_len={max_seq_len} max_seq_pages={max_seq_pages}")
+            except Exception:
+                pass
 
         # Convert back to tensors
         device = local_q_buf.device
