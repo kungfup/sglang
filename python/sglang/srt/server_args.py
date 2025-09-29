@@ -432,9 +432,15 @@ class ServerArgs:
 
         if self.pp_size > 1:
             self.disable_overlap_schedule = True
-            logger.warning(
-                "Pipeline parallelism is incompatible with overlap schedule."
-            )
+            # Downgrade to info by default to avoid alarming users; can restore via env
+            if os.environ.get("SGLANG_SUPPRESS_PP_OVERLAP_WARN", "1").lower() in ("1", "true", "yes"):
+                logger.info(
+                    "Pipeline parallelism detected; overlap scheduler is disabled automatically."
+                )
+            else:
+                logger.warning(
+                    "Pipeline parallelism is incompatible with overlap schedule."
+                )
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -1835,19 +1841,28 @@ class SemiPDPortArgs:
             # Use only server port and pp_rank to generate a stable, shared prefix
             ipc_prefix = f"/tmp/semipd_{server_args.port}_pp{pp_rank}"
 
+            # Build a global detokenizer endpoint (independent of pp_rank) with optional TCP fallback
+            det_transport = os.environ.get("SGLANG_SEMIPD_DETOKENIZER_TRANSPORT", "ipc").lower()
+            global_prefix = f"/tmp/semipd_{server_args.port}"
+            detok_addr = (
+                f"tcp://127.0.0.1:{server_args.port + 1}" if det_transport == "tcp" else f"ipc://{global_prefix}_detokenizer"
+            )
+
+            # Use distinct NCCL ports per role (P vs D) to isolate data planes while
+            # keeping the same base across PP ranks. This avoids P/D cross-talk.
             return SemiPDPortArgs(
                 tokenizer_ipc_name=f"ipc://{ipc_prefix}_tokenizer",
                 s_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_s_scheduler",
                 p_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_p_scheduler",
                 d_scheduler_input_ipc_name=f"ipc://{ipc_prefix}_d_scheduler",
-                detokenizer_ipc_name=f"ipc://{ipc_prefix}_detokenizer",
+                detokenizer_ipc_name=detok_addr,
                 bridge_ipc_name=f"ipc://{ipc_prefix}_bridge",
                 rpc_ipc_name=f"ipc://{ipc_prefix}_rpc",
-                s_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
-                p_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
-                d_nccl_port=nccl_port,  # 🔧 使用共享的NCCL端口
+                s_nccl_port=nccl_port,
+                p_nccl_port=nccl_port + 11,
+                d_nccl_port=nccl_port + 22,
                 pp_rank=pp_rank,
-                gpu_id=pp_rank,  # 每个PP stage使用不同的GPU
+                gpu_id=pp_rank,
             )
         else:
             if server_args.nnodes > 1:

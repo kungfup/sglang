@@ -84,6 +84,11 @@ class DetokenizerManager:
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
+        try:
+            logger.info(f"📡 [DETOKENIZER] Endpoints: recv_from_scheduler={port_args.detokenizer_ipc_name}, send_to_tokenizer={port_args.tokenizer_ipc_name}")
+        except Exception:
+            pass
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:

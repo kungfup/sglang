@@ -199,6 +199,9 @@ class TokenizerManager:
             # Glue-only: avoid double-ingestion. Route generate to DECODE only;
             # DECODE forwards to PREFILL locally to populate its waiting queue.
             self.send_to_scheduler = self.send_to_d_scheduler
+            logger.info(
+                f"[TOKENIZER] Semi-PD route: Generate→DECODE only, dst={port_args.d_scheduler_input_ipc_name}"
+            )
         else:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True

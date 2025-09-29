@@ -1247,10 +1247,15 @@ def _launch_semi_pd_subprocesses(
     )
     detoken_proc.start()
     logger.info(f"✅ [SEMI-PD] Detokenizer process started with PID: {detoken_proc.pid}")
+    try:
+        logger.info(f"📡 [SEMI-PD] Detokenizer endpoint: {port_args.detokenizer_ipc_name}")
+    except Exception:
+        pass
 
     # Wait for detokenizer to be ready
     logger.info("⏳ [SEMI-PD] Waiting for Detokenizer to be ready...")
     try:
+        ready_strict = os.environ.get("SGLANG_DETOKENIZER_READY_STRICT", "1").lower() not in ("0", "false", "no")
         if detoken_reader.poll(60):  # 60 seconds timeout for L20
             detoken_data = detoken_reader.recv()
             logger.info(f"📨 [SEMI-PD] Received data from detokenizer: {detoken_data}")
@@ -1258,13 +1263,19 @@ def _launch_semi_pd_subprocesses(
                 logger.info("✅ [SEMI-PD] Detokenizer is ready")
             else:
                 logger.error(f"❌ [SEMI-PD] Detokenizer failed to start: {detoken_data}")
-                raise RuntimeError("Detokenizer initialization failed")
+                if ready_strict:
+                    raise RuntimeError("Detokenizer initialization failed")
         else:
-            logger.error("❌ [SEMI-PD] Timeout waiting for Detokenizer ready signal after 60 seconds")
-            raise RuntimeError("Detokenizer ready timeout")
+            msg = "❌ [SEMI-PD] Timeout waiting for Detokenizer ready signal after 60 seconds"
+            if ready_strict:
+                logger.error(msg)
+                raise RuntimeError("Detokenizer ready timeout")
+            else:
+                logger.warning(msg + ", continue without blocking (STRICT=0)")
     except Exception as e:
         logger.error(f"❌ [SEMI-PD] Error waiting for Detokenizer: {e}")
-        raise
+        if ready_strict:
+            raise
 
     # Launch tokenizer process (if not created early)
     if not early_tokenizer_initialized:

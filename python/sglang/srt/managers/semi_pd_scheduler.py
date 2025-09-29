@@ -179,6 +179,18 @@ class SemiPDScheduler(Scheduler):
             self.waiting_queue.insert(0, req)
         else:
             self.waiting_queue.append(req)
+        # TRACE: confirm PREFILL enqueues request
+        try:
+            import os as _os
+            if (
+                getattr(self, "instance_role", None) == InstanceRole.PREFILL
+                and _os.getenv("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes")
+            ):
+                logger.info(
+                    f"[PREFILL-PP{getattr(self,'pp_rank','?')}] waiting_queue+=rid={getattr(req,'rid','?')} size={len(self.waiting_queue)}"
+                )
+        except Exception:
+            pass
 
     def handle_generate_request(
         self,

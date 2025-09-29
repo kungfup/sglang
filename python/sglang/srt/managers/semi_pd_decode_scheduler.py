@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     GetNextPrefillBatchInput,
     GetNextPrefillBatchOutput,
     TokenizedGenerateReqInput,
+    StepTag,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -83,6 +84,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # 🔧 从环境变量获取pp_size
         self.pp_size = int(os.environ.get("SGLANG_PP_SIZE", 1))  # 🔧 保存pp_size
 
+        # Prefer server_args.pp_size when available; fallback to env if missing
+        try:
+            self.pp_size = getattr(server_args, "pp_size", self.pp_size)
+        except Exception:
+            pass
+
         # 🔧 PP模式下的DECODE进程间通信初始化
         # 注意：不要覆盖父类设置的self.pp_group (GroupCoordinator对象)
         # self.pp_group 已经在父类中通过 get_pp_group() 正确设置
@@ -120,6 +127,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         self._spd_authorize_outbox = deque()
         self._spd_max_auth_rids = int(os.environ.get("SGLANG_SEMIPD_AUTH_MAX_RIDS", "64"))
 
+        # Rate limit for empty authorization nudges (seconds)
+        self._last_empty_auth_ts = 0.0
+
         # 🔧 PP stage间通信：DECODE进程需要与下一个stage的DECODE进程通信
         if self.attn_tp_rank == 0:
             context = zmq.Context(2)
@@ -133,20 +143,20 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             logger.info(
                 f"[DECODE-PP{pp_rank}] IPC endpoints: bridge(connect)={self.port_args.bridge_ipc_name}, p_scheduler={self.port_args.p_scheduler_input_ipc_name}, d_scheduler(bind)={self.port_args.d_scheduler_input_ipc_name}"
             )
+            # Connect to P instance (same-PP). Each DECODE-PPk must send to PREFILL-PPk.
+            _p_sched_addr = self.port_args.p_scheduler_input_ipc_name
             self.send_to_p_instance = get_zmq_socket(
-                context, zmq.PUSH, self.port_args.p_scheduler_input_ipc_name, False
+                context, zmq.PUSH, _p_sched_addr, False
             )
             # 所有PP段的DECODE都需要接收本stage的PREFILL消息（GetNextPrefillBatchInput / BatchProcessPrefillResultReq）
             # For non-PP0 DECODE stages, base Scheduler does not bind
             # d_scheduler_input_ipc_name. Create a dedicated PULL to receive
             # PREFILL→DECODE messages on this stage.
             try:
-                if getattr(self, 'pp_rank', 0) != 0 or getattr(self, 'recv_from_tokenizer', None) is None:
-                    self.recv_from_p_instance = get_zmq_socket(
-                        context, zmq.PULL, self.port_args.d_scheduler_input_ipc_name, True
-                    )
-                else:
-                    self.recv_from_p_instance = None
+                # Always bind a PULL socket to receive PREFILL→DECODE work/control on this stage
+                self.recv_from_p_instance = get_zmq_socket(
+                    context, zmq.PULL, self.port_args.d_scheduler_input_ipc_name, True
+                )
             except Exception:
                 self.recv_from_p_instance = None
 
@@ -181,6 +191,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self._handshake_done = True
+
+            # Semi-PD unified clock: local micro-batch sequence counter (best-effort)
+            try:
+                self._mb_seq = 0
+            except Exception:
+                self._mb_seq = 0
+
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """
@@ -293,9 +310,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
           - disable mixed-style chunked prefill
           - skip requests that not in rids
         """
-        # Safety: if called without explicit candidates (e.g., by parent), do nothing
-        if rids is None:
-            return None
+        # When rids is None, build from the full waiting_queue (used by PP>0 async authorization)
+        # If rids is a list, restrict to that subset (used by PP0 sync authorization)
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -304,6 +320,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            # removed noisy TRACE gnbp.early_exit log
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -343,6 +360,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             logger.info(
                 f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}"
             )
+        if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+            try:
+                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.begin waiting={len(self.waiting_queue)} rids={'ALL' if rids is None else len(rids)}")
+            except Exception:
+                pass
         for req in self.waiting_queue:
             # Semi-PD
             if rids is not None and req.rid not in rids:
@@ -391,6 +413,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+                try:
+                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.no_can_run waiting={len(self.waiting_queue)} running={len(self.running_batch.reqs)} new_token_ratio={self.new_token_ratio:.3f}")
+                except Exception:
+                    pass
             return None
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -456,13 +483,44 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
           authorization to let PREFILL clear its awaiting flag and retry later.
         """
         # Optional trace: who requested authorization and with which candidate rids
+        # keep a concise trace; drop heavy stack to reduce log noise
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
             try:
-                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE get_next_prefill_batch rids={recv_req.rids}\n" + "".join(traceback.format_stack(limit=12)))
+                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE get_next_prefill_batch rids={recv_req.rids}")
             except Exception:
                 pass
 
         # quiet
+
+
+        # Semi-PD unified clock: on PP>0, do not use sync authorization path; let async path
+        # (_maybe_authorize_prefill) deliver non-empty grants via p_scheduler_input
+        if getattr(self, "pp_rank", 0) > 0 and getattr(self.server_args, "enable_semi_pd", False):
+            try:
+                # Send an empty authorization to clear PREFILL awaiting flag if it asked via sync by mistake
+                self.bridge_socket.send_pyobj(GetNextPrefillBatchOutput(
+                    rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
+                ))
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.p2d.gnp.sync.blocked",
+                    msg=f"[DECODE-PP{self.pp_rank}] (PP>0) block sync auth; empty reply sent, prefer async via p_scheduler_input",
+                )
+            except Exception:
+                pass
+            return None
+
+        # Decide phase for this authorization (P-only EXTEND on PP0; PRIME on last stage)
+        try:
+            phase = "EXTEND" if getattr(self, 'pp_rank', 0) == 0 else "PRIME_DECODE"
+            # Best-effort StepTag to help P align logs; not used for control gating
+            try:
+                self.bridge_socket.send_pyobj(StepTag(mb_id=None, phase=phase, pp_rank=getattr(self, 'pp_rank', None), req_ids=list(recv_req.rids or [])))
+                logger.info(f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN")
+            except Exception:
+                pass
+        except Exception:
+            phase = "EXTEND"
 
         # Release unfinished chunk if any, mirroring semipd_nopp behavior
         if self.chunked_req:
@@ -495,7 +553,6 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 req_pool_indices = [r.req_pool_idx for r in batch.reqs]
                 prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
                 extend_input_lens = [r.extend_input_len for r in batch.reqs]
-
                 msg = GetNextPrefillBatchOutput(
                     rids=approved_rids,
                     chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
@@ -516,12 +573,177 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             # Fall back silently; PREFILL will retry via resend logic.
             pass
 
+        # Bump local tick for observability
+        try:
+            ps = int(getattr(self, 'pp_size', 1)) or 1
+            self._mb_seq = (getattr(self, '_mb_seq', 0) + 1) % ps
+        except Exception:
+            pass
+
         # Synchronous path fully handles the authorization; no dispatcher output
         return None
 
     def _maybe_authorize_prefill(self):
+        # Semi-PD unified clock:
+        # - PP0: disable async authorization (only sync reply path is used)
+        # - PP>0: allow async authorization, but send non-empty authorizations via p_scheduler_input
+        try:
+            if getattr(self.server_args, 'enable_semi_pd', False):
+                # PP0 strict sync: by default, do NOT push non-empty async authorizations to PP0.
+                # Only nudge with empty auths to clear awaiting flags.
+                if getattr(self, 'pp_rank', 0) == 0:
+                    try:
+                        strict = os.environ.get("SGLANG_SEMIPD_PP0_STRICT_SYNC", "0").lower() in ("1","true","yes")
+                        # If proactive PP0 auth is explicitly enabled, override strict to False
+                        if os.environ.get("SGLANG_SEMIPD_PP0_PROACTIVE_AUTH", "0").lower() in ("1","true","yes"):
+                            strict = False
+                    except Exception:
+                        strict = True
+                    try:
+                        if strict:
+                            # Strict PP0: do NOT send empty nudges; rely solely on sync get_next_prefill_batch via bridge.
+                            return
+                        # Non-strict mode: keep previous PP0 async fallback
+                        if self.chunked_req:
+                            self.tree_cache.cache_unfinished_req(self.chunked_req)
+                            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                        batch = self.get_new_batch_prefill(None)
+                        if batch is None:
+                            # Empty nudge
+                            import time as _t
+                            _min_int = float(os.environ.get("SGLANG_SEMIPD_EMPTY_AUTH_MIN_S", "0.2"))
+                            _now = _t.time()
+                            if _now - getattr(self, "_last_empty_auth_ts", 0.0) >= _min_int:
+                                empty = GetNextPrefillBatchOutput(
+                                    rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
+                                )
+                                try:
+                                    self.bridge_socket.send_pyobj(empty)
+                                except Exception:
+                                    pass
+                                self._last_empty_auth_ts = _now
+                            return
+                        approved_rids = [r.rid for r in batch.reqs]
+                        req_pool_indices = [r.req_pool_idx for r in batch.reqs]
+                        prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
+                        extend_input_lens = [r.extend_input_len for r in batch.reqs]
+                        msg = GetNextPrefillBatchOutput(
+                            rids=approved_rids,
+                            chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                            req_pool_indices=req_pool_indices,
+                            prefix_lens=prefix_lens,
+                            extend_input_lens=extend_input_lens,
+                        )
+                        # StepTag for observability (EXTEND on PP0)
+                        try:
+                            self.bridge_socket.send_pyobj(
+                                StepTag(mb_id=None, phase="EXTEND", pp_rank=getattr(self, 'pp_rank', None), req_ids=list(approved_rids))
+                            )
+                            logger.info(
+                                f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase=EXTEND] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')}"
+                            )
+                        except Exception:
+                            pass
+                        # Actually deliver the authorization to PREFILL via the same work-plane channel as PP>0 (p_scheduler_input)
+                        try:
+                            self.send_to_p_instance.send_pyobj(msg)
+                            semi_pd_log_info_throttle(
+                                logger,
+                                key=f"pp{self.pp_rank}.p2d.gnp.send",
+                                msg=f"[DECODE-PP{self.pp_rank}] (PP0) →P GetNextPrefillBatchOutput via p_scheduler_input: #rids={len(approved_rids)}",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    except Exception:
+                        return
+                # For PP>0, build from D waiting queue (ignore candidates) and send to P
+                try:
+                    if self.chunked_req:
+                        self.tree_cache.cache_unfinished_req(self.chunked_req)
+                        self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                    batch = self.get_new_batch_prefill(None)
+                    if batch is None:
+                        # Fallback: try candidate-driven auth on PP>0 using prealloc queue from forwarded reqs
+                        try:
+                            slice_rids = []
+                            while getattr(self, "_spd_prealloc_queue", None) and len(slice_rids) < getattr(self, "_spd_max_auth_rids", 32):
+                                slice_rids.append(self._spd_prealloc_queue.popleft())
+                            if slice_rids:
+                                batch = self.get_new_batch_prefill(slice_rids)
+                                # push back if not used
+                                if batch is None:
+                                    for rid in reversed(slice_rids):
+                                        self._spd_prealloc_queue.appendleft(rid)
+                        except Exception:
+                            pass
+                    if batch is None:
+                        # nudge P to clear awaiting flag and keep recv posted (rate-limited)
+                        if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+                            try:
+                                semi_pd_log_info_throttle(
+                                    logger,
+                                    key=f"pp{self.pp_rank}.auth.empty",
+                                    msg=f"[DECODE-PP{self.pp_rank}] TRACE auth.empty waiting={len(self.waiting_queue)} running={len(self.running_batch.reqs)} cand={len(getattr(self,'_spd_prealloc_queue',[]))}"
+                                )
+                            except Exception:
+                                pass
+                        import time as _t
+                        _min_int = float(os.environ.get("SGLANG_SEMIPD_EMPTY_AUTH_MIN_S","0.2"))
+                        _now = _t.time()
+                        if _now - getattr(self, "_last_empty_auth_ts", 0.0) >= _min_int:
+                            try:
+                                # Send empty auth via bridge (control plane) to clear awaiting flag quickly
+                                self.bridge_socket.send_pyobj(GetNextPrefillBatchOutput(
+                                    rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
+                                ))
+                            except Exception:
+                                pass
+                            self._last_empty_auth_ts = _now
+                        return
+                    approved_rids = [r.rid for r in batch.reqs]
+                    req_pool_indices = [r.req_pool_idx for r in batch.reqs]
+                    prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
+                    extend_input_lens = [r.extend_input_len for r in batch.reqs]
+                    msg = GetNextPrefillBatchOutput(
+                        rids=approved_rids,
+                        chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                        req_pool_indices=req_pool_indices,
+                        prefix_lens=prefix_lens,
+                        extend_input_lens=extend_input_lens,
+                    )
+                    try:
+                        if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+                            try:
+                                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE auth.nonempty approved_rids={approved_rids[:3]} sz={len(approved_rids)}")
+                            except Exception:
+                                pass
+                        # send a StepTag for observability on PP>0 async path
+                        try:
+                            phase = "PRIME_DECODE" if (hasattr(self, 'pp_group') and self.pp_group is not None and self.pp_group.is_last_rank) else "EXTEND"
+                            self.bridge_socket.send_pyobj(StepTag(mb_id=None, phase=phase, pp_rank=getattr(self, 'pp_rank', None), req_ids=list(approved_rids)))
+                            logger.info(
+                                f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')}"
+                            )
+                        except Exception:
+                            pass
+                        self.send_to_p_instance.send_pyobj(msg)
+                        semi_pd_log_info_throttle(
+                            logger,
+                            key=f"pp{self.pp_rank}.p2d.gnp.send",
+                            msg=(
+                                f"[DECODE-PP{self.pp_rank}] (PP>0) →P GetNextPrefillBatchOutput: #rids={len(approved_rids)} via p_scheduler_input={getattr(self.port_args,'p_scheduler_input_ipc_name','?')}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    return
+        except Exception:
+            pass
         # First try to send any queued authorizations
-        if getattr(self, "_handshake_done", True) and self._spd_authorize_outbox:
+        if self._spd_authorize_outbox:
             try:
                 msg = self._spd_authorize_outbox[0]
                 self.bridge_socket.send_pyobj(msg)
@@ -541,6 +763,59 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             except Exception:
                 pass
         # Then build new authorization
+
+        # Proactive authorization for PP0: authorize PREFILL from local waiting queue
+        # This avoids relying on PP0-P to "pull" authorization and keeps P0/P1 in the same tick.
+        try:
+            if getattr(self, 'pp_rank', 0) == 0:
+                # Release unfinished chunk if any
+                if self.chunked_req:
+                    self.tree_cache.cache_unfinished_req(self.chunked_req)
+                    self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                batch = self.get_new_batch_prefill(None)
+                if batch is None:
+                    # Nudge P to clear awaiting flag; throttle via outbox
+                    self._spd_authorize_outbox.append(
+                        GetNextPrefillBatchOutput(
+                            rids=[], chunked_rid=None,
+                            req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
+                        )
+                    )
+                    return
+                approved_rids = [r.rid for r in batch.reqs]
+                req_pool_indices = [r.req_pool_idx for r in batch.reqs]
+                prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
+                extend_input_lens = [r.extend_input_len for r in batch.reqs]
+                # Enqueue to outbox; it will be sent at the top on next call
+                self._spd_authorize_outbox.append(
+                    GetNextPrefillBatchOutput(
+                        rids=approved_rids,
+                        chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
+                        req_pool_indices=req_pool_indices,
+                        prefix_lens=prefix_lens,
+                        extend_input_lens=extend_input_lens,
+                    )
+                )
+                # Best-effort observability only
+                try:
+                    phase = "EXTEND"
+                    self.bridge_socket.send_pyobj(
+                        StepTag(
+                            mb_id=None, phase=phase,
+                            pp_rank=getattr(self, 'pp_rank', None),
+                            req_ids=list(approved_rids),
+                        )
+                    )
+                    logger.info(
+                        f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] QUEUE AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')}"
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception:
+            # Fall through to other paths on any error
+            pass
+
         if os.environ.get("SGLANG_SEMIPD_D_IGNORE_CANDIDATES", "0").lower() in ("1","true","yes"):
             # Ignore candidates; authorize from D waiting queue directly
             if self.chunked_req:
@@ -636,9 +911,36 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         import torch
 
         num_tokens = len(recv_req.next_token_ids) if recv_req.next_token_ids else 0
+        try:
+            # Throttled receive log with rids for visibility
+            semi_pd_log_info_throttle(
+                logger,
+                key=f"pp{getattr(self,'pp_rank','?')}.d.recv.presult",
+                msg=f"[DECODE-PP{getattr(self,'pp_rank','?')}] ←P prefill_result: tokens={num_tokens} rids={list(getattr(recv_req,'rids',[]) or [])}",
+                interval_ms=1000,
+            )
+        except Exception:
+            pass
         logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] ←P tokens: {num_tokens}")
 
-        batch = self.scheduled_prefill_batches.pop(0)
+        # Correlate the correct authorized batch: prefer matching by rids when provided
+        batch = None
+        try:
+            if getattr(recv_req, 'rids', None):
+                want = tuple(getattr(recv_req, 'rids'))
+                for i, b in enumerate(self.scheduled_prefill_batches):
+                    try:
+                        have = tuple([r.rid for r in b.reqs])
+                    except Exception:
+                        have = None
+                    if have == want:
+                        batch = self.scheduled_prefill_batches.pop(i)
+                        break
+        except Exception:
+            batch = None
+        if batch is None:
+            # Fallback to FIFO for backward compatibility
+            batch = self.scheduled_prefill_batches.pop(0)
 
         logits_processor_output = None
         if recv_req.next_token_logits is not None:
@@ -760,32 +1062,44 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             if not self.running_batch.is_empty():
                 ret = self.running_batch
 
-        # If still nothing to run, return an IDLE batch to keep PP synchronization
+        # If still nothing to run, DO NOT fabricate an IDLE batch in Semi-PD+PP.
+        # Returning None lets the event_loop_pp guard skip NCCL recv/send, avoiding single-sided waits.
         if ret is None and self.pp_size > 1:
-            idle = ScheduleBatch.init_new(
-                [],
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                self.tree_cache,
-                self.model_config,
-                self.enable_overlap,
-                self.spec_algorithm,
-                self.server_args.enable_custom_logit_processor,
-            )
-            idle.prepare_for_idle()
-            ret = idle
+            try:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.d.idle.skip",
+                    msg=f"[DECODE-PP{self.pp_rank}] return None (no NCCL on idle)",
+                    interval_ms=1000,
+                )
+            except Exception:
+                pass
+            ret = None
 
         # Handle DP attention if enabled
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention and ret is not None:
             ret, _ = self.prepare_dp_attn_batch(ret)
         return ret
 
     def recv_requests(self):
         """Extend parent's recv to also poll local PULL from PREFILL on non-PP0 stages."""
+        fwd_ct = 0  # ensure defined even if forwarding block is skipped due to exceptions
+
         recv_reqs = super().recv_requests()
-        # Forward newly arrived generate requests to same-stage PREFILL to ensure its waiting_queue is populated
+        # Drop any misrouted generates on non-PP0 defensively
         try:
-            if self.attn_tp_rank == 0 and hasattr(self, 'send_to_p_instance') and self.send_to_p_instance is not None:
+            if self.pp_rank > 0 and recv_reqs:
+                from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+                recv_reqs = [o for o in recv_reqs if not isinstance(o, TokenizedGenerateReqInput)]
+        except Exception:
+            pass
+        # Forward newly arrived generate requests to same-stage PREFILL to ensure its waiting_queue is populated (PP0 only)
+        try:
+            if (
+                self.attn_tp_rank == 0
+                and getattr(self, 'send_to_p_instance', None) is not None
+                and self.pp_rank == 0
+            ):
                 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
                 fwd_ct = 0
                 for _obj in list(recv_reqs or []):
@@ -795,8 +1109,25 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                             fwd_ct += 1
                         except Exception:
                             pass
-                if fwd_ct:
-                    pass
+                if fwd_ct and os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                    try:
+                        logger.info(
+                            f"[DECODE-PP{self.pp_rank}] fwd_to_P: {fwd_ct} TokenizedGenerateReqInput via {getattr(self.port_args,'p_scheduler_input_ipc_name','?')}"
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if fwd_ct:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.d.fwd.gen",
+                    msg=(
+                        f"[DECODE-PP{self.pp_rank}] fwd_to_P via p_scheduler={getattr(self.port_args,'p_scheduler_input_ipc_name','?')} count={fwd_ct}"
+                    ),
+                    interval_ms=1000,
+                )
         except Exception:
             pass
         if getattr(self, 'recv_from_p_instance', None) is not None and self.attn_tp_rank == 0:
@@ -805,10 +1136,27 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     obj = self.recv_from_p_instance.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                if isinstance(obj, dict):
+                    # Handle control plane messages inline (e.g., HELLO/ACK)
+                    if obj.get("type") == "HELLO_ACK":
+                        self._handshake_done = True
+                    # drop other control dicts silently
+                    continue
                 if recv_reqs is None:
                     recv_reqs = []
                 # Accept only work messages
                 if isinstance(obj, (GetNextPrefillBatchInput, BatchProcessPrefillResultReq)):
+                    # Throttled low-level ZMQ receive log
+                    try:
+                        if isinstance(obj, BatchProcessPrefillResultReq):
+                            semi_pd_log_info_throttle(
+                                logger,
+                                key=f"pp{self.pp_rank}.d.zmq.recv.presult",
+                                msg=f"[DECODE-PP{self.pp_rank}] ZMQ recv BatchProcessPrefillResultReq rids={list(getattr(obj,'rids',[]) or [])}",
+                                interval_ms=1000,
+                            )
+                    except Exception:
+                        pass
                     recv_reqs.append(obj)
         return recv_reqs
 

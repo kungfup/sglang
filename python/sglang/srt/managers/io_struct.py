@@ -1001,6 +1001,16 @@ class RpcReqOutput:
     message: str
 
 
+
+# Semi-PD unified clock control message (optional, control-plane only)
+@dataclass
+class StepTag:
+    mb_id: Optional[int]
+    phase: str  # "EXTEND" | "PRIME_DECODE" | "DECODE_NEXT" | "PREFILL_IDLE"
+    pp_rank: Optional[int] = None
+    req_ids: Optional[List[str]] = None
+    token_pos: Optional[Dict[str, int]] = None
+
 @dataclass
 class GetNextPrefillBatchInput:
     rids: List[str]
@@ -1022,8 +1032,10 @@ class BatchRetractReqInput:
 
 @dataclass
 class BatchProcessPrefillResultReq:
-    next_token_ids: List[int]
-    next_token_logits: npt.NDArray[np.float32]
+    # Optional correlation to match back the authorized batch on DECODE
+    rids: Optional[List[str]] = None
+    next_token_ids: List[int] = None
+    next_token_logits: Optional[npt.NDArray[np.float32]] = None
 
 
 # (No extra control-plane messages needed; reuse native PP event loop.)

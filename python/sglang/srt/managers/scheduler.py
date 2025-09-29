@@ -453,6 +453,17 @@ class Scheduler(
         logger.info(f"[SCHEDULER] 分布式组信息: tp_group.world_size={self.tp_group.world_size}, pp_group.world_size={self.pp_group.world_size if self.pp_group is not None else 'None'}")
         logger.info(f"[SCHEDULER] 分布式组信息: world_group.world_size={self.world_group.world_size}")
 
+        # Semi-PD: startup last-rank truth check (pp_rank/pp_size vs pp_group)
+        try:
+            _pg_last = (self.pp_group.is_last_rank if self.pp_group is not None else None)
+            _truth_last = (self.pp_rank == self.pp_size - 1)
+            if _pg_last is not None and _pg_last != _truth_last:
+                logger.error(f"[SCHEDULER] last-rank mismatch: truth(pp_rank/pp_size)={_truth_last}, pp_group.is_last_rank={_pg_last}; trusting pp_rank/pp_size")
+            else:
+                logger.info(f"[SCHEDULER] last-rank check: truth={_truth_last}, pp_group.is_last_rank={_pg_last}")
+        except Exception:
+            pass
+
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
@@ -929,6 +940,20 @@ class Scheduler(
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism with Semi-PD support."""
 
+        # Throttled entry log to confirm loop is running per role/pp
+        try:
+            from sglang.srt.utils import semi_pd_log_info_throttle as _th
+            role = getattr(self, 'instance_role', None)
+            pp = getattr(self, 'pp_rank', None)
+            _th(
+                logger,
+                key=f"pp{pp}.sched.loop.enter",
+                msg=f"[SCHED-PP{pp}] ENTER event_loop_pp role={role}",
+                interval_ms=1000,
+            )
+        except Exception:
+            pass
+
         # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
 
         mbs = [None] * self.pp_size
@@ -939,9 +964,19 @@ class Scheduler(
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
+        # PREFILL PP send/recv trace counters (throttled)
+        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+            if not hasattr(self, '_pp_trace_send_hits'):
+                self._pp_trace_send_hits = 0
+            if not hasattr(self, '_pp_trace_recv_hits'):
+                self._pp_trace_recv_hits = 0
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_size):
+                # Track whether PREFILL sent proxy tensors early in this microbatch (to prevent duplicate PP sends)
+                prefill_proxy_sent_early = False
+
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
@@ -954,9 +989,9 @@ class Scheduler(
                 if self.cur_batch:
 
                     server_is_idle = False
+                    # Semi-PD PREFILL gating: rely only on role to ensure same-stage handoff always triggers
                     is_semi_pd_prefill = (
-                        getattr(self.server_args, 'enable_semi_pd', False)
-                        and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                        getattr(self, 'instance_role', None) == InstanceRole.PREFILL
                     )
                     is_idle_batch = getattr(self.cur_batch, 'forward_mode', None) and self.cur_batch.forward_mode.is_idle()
 
@@ -967,6 +1002,17 @@ class Scheduler(
                         # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
                         if is_semi_pd_prefill:
                             try:
+                                # throttled scheduler-side call trace
+                                try:
+                                    from sglang.srt.utils import semi_pd_log_info_throttle as _th
+                                    _th(
+                                        logger,
+                                        key=f"pp{getattr(self,'pp_rank','?')}.sched.p_result.call",
+                                        msg=f"[SCHED-PP{getattr(self,'pp_rank','?')}] call process_batch_result for PREFILL (mode={getattr(getattr(self,'cur_batch',''), 'forward_mode', None)})",
+                                        interval_ms=1000,
+                                    )
+                                except Exception:
+                                    pass
                                 self.process_batch_result(self.cur_batch, result)
                             except Exception:
                                 logger.exception("[SEMI_PD_PP] PREFILL handoff failed; continue loop")
@@ -1008,39 +1054,88 @@ class Scheduler(
                             )
                         else:
                             send_tok = {"next_token_ids": next_token_ids}
+                        # TRACE: PP_SEND TOKENS (last DECODE only)
+                        try:
+                            from sglang.srt.utils import semi_pd_log_info_throttle as _th
+                            n_tok = 0
+                            try:
+                                n_tok = len(next_token_ids) if next_token_ids is not None else 0
+                            except Exception:
+                                n_tok = 0
+                            _th(
+                                logger,
+                                key=f"pp{getattr(self,'pp_rank','?')}.decode.pp_send_tok",
+                                msg=f"[PP][DECODE-PP{getattr(self,'pp_rank','?')}] PP_SEND TOKENS n={n_tok}",
+                                interval_ms=1000,
+                            )
+                        except Exception:
+                            pass
                         self.pp_group.send_tensor_dict(
                             send_tok,
                             all_gather_group=self.attn_tp_group,
                         )
 
 
-                # For Semi-PD PREFILL: send proxy tensors early before any recv to avoid both sides waiting on recv
-                if (
-                    getattr(self.server_args, 'enable_semi_pd', False)
-                    and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
-                    and self.pp_group is not None and not self.pp_group.is_last_rank
-                ):
-                    if self.cur_batch and (result is not None) and (getattr(result, 'pp_hidden_states_proxy_tensors', None) is not None):
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
+                # (removed) Early-send for PREFILL: rely on the standard PP send below to keep send/recv pairing simple
 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
+
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
+                    # TRACE: mark PP_RECV POST (PREFILL only)
+                    try:
+                        import os as _os
+                        if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
+                            role = getattr(self, 'instance_role', None)
+                            if role is not None and getattr(role, 'name', '') == 'PREFILL':
+                                logger.info(f"[PP][PREFILL-PP{self.pp_rank}] PP_RECV POST")
+                    except Exception:
+                        pass
+
                     next_pp_outputs = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
 
+                    # Increment recv trace and throttle a summary only for PREFILL
+                    try:
+                        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+                            self._pp_trace_recv_hits += 1
+                            from sglang.srt.utils import semi_pd_log_info_throttle as _th
+                            _th(
+                                logger,
+                                key=f"pp{getattr(self,'pp_rank','?')}.prefill.pp_recv",
+                                msg=(
+                                    f"[PREFILL-PP{getattr(self,'pp_rank','?')}] TRACE PP_RECV hits={getattr(self,'_pp_trace_recv_hits',0)}"
+                                ),
+                                interval_ms=1000,
+                            )
+                    except Exception:
+                        pass
+
 
                     # In PP, only the stage following the last rank receives tokens.
                     # Other stages will receive hidden-state proxies without 'next_token_ids'.
                     if next_pp_outputs is not None and "next_token_ids" in next_pp_outputs.tensors:
                         mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+
+                    if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes") and next_pp_outputs is not None:
+                        try:
+                            ks = list(next_pp_outputs.tensors.keys())
+                            if "next_token_ids" in ks:
+                                try:
+                                    n_tok = len(next_pp_outputs["next_token_ids"])  # list or tensor-like
+                                except Exception:
+                                    n_tok = 0
+                                if n_tok > 0:
+                                    logger.info(f"[PP][PP{(self.pp_rank+1)%self.pp_size}] PP_RECV TOKENS n={n_tok} keys={ks[:3]}")
+                            else:
+                                logger.info(f"[PP][PP{(self.pp_rank+1)%self.pp_size}] PP_RECV HS keys={ks[:3]}")
+                        except Exception:
+                            pass
+
                         logits_output_args = {
                             k[len("logits_output.") :]: v
                             for k, v in next_pp_outputs.tensors.items()
@@ -1082,8 +1177,42 @@ class Scheduler(
                     # send out reqs to the next stage
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
+                        # Semi-PD: forward only work-plane messages across PP stages (strict whitelist)
+                        try:
+                            from sglang.srt.managers.io_struct import (
+                                TokenizedGenerateReqInput,
+                                GenerateReqInput,
+                                EmbeddingReqInput,
+                                TokenizedEmbeddingReqInput,
+                                BatchMultimodalDecodeReq,
+                            )
+                        except Exception:
+                            TokenizedGenerateReqInput = type("_A", (), {})
+                            GenerateReqInput = type("_B", (), {})
+                            EmbeddingReqInput = type("_C", (), {})
+                            TokenizedEmbeddingReqInput = type("_D", (), {})
+                            BatchMultimodalDecodeReq = type("_E", (), {})
+                        allowed_types = (
+                            TokenizedGenerateReqInput,
+                            GenerateReqInput,
+                            EmbeddingReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchMultimodalDecodeReq,
+                        )
+                        fwd_reqs = recv_reqs
+                        if (getattr(self.server_args, 'enable_semi_pd', False) or os.environ.get('SGLANG_ENABLE_SEMI_PD','0').lower() in ('1','true','yes')):
+                            fwd_reqs = [x for x in (recv_reqs or []) if isinstance(x, allowed_types)]
+                            # Optional: drop-log under TRACE for visibility
+                            import os as _os
+                            if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
+                                try:
+                                    dropped = len(list(recv_reqs or [])) - len(fwd_reqs)
+                                    if dropped:
+                                        logger.info(f"[PP{self.pp_rank}] dropped {dropped} control-plane msgs on cross-PP forward")
+                                except Exception:
+                                    pass
                         point_to_point_pyobj(
-                            recv_reqs,
+                            fwd_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
                             self.world_group.cpu_group,
                             self.pp_rank * self.tp_size + dp_offset,
@@ -1091,16 +1220,24 @@ class Scheduler(
                         )
 
                     # send out proxy tensors to the next stage
-                    # For Semi-PD PREFILL, this is already sent earlier to avoid deadlock.
+                    # Send out proxy tensors to the next stage (EXTEND path on PREFILL)
                     if (
                         self.cur_batch
                         and (result is not None)
                         and (getattr(result, 'pp_hidden_states_proxy_tensors', None) is not None)
-                        and not (
-                            getattr(self.server_args, 'enable_semi_pd', False)
-                            and getattr(self, 'instance_role', None) == InstanceRole.PREFILL
-                        )
                     ):
+                        # TRACE: PP_SEND HS (all non-last ranks)
+                        try:
+                            from sglang.srt.utils import semi_pd_log_info_throttle as _th
+                            keys = list(getattr(result, 'pp_hidden_states_proxy_tensors', {}).keys())
+                            _th(
+                                logger,
+                                key=f"pp{getattr(self,'pp_rank','?')}.prefill.pp_send_hs",
+                                msg=f"[PP][{getattr(self,'instance_role',None)}-PP{getattr(self,'pp_rank','?')}] PP_SEND HS keys={keys[:3]}",
+                                interval_ms=1000,
+                            )
+                        except Exception:
+                            pass
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
@@ -1116,6 +1253,8 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+            return []
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
@@ -1151,28 +1290,45 @@ class Scheduler(
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
+                # Separate Semi-PD control-plane messages so we do NOT broadcast them across TP ranks
+                try:
+                    from sglang.srt.managers.io_struct import (
+                        GetNextPrefillBatchInput,
+                        GetNextPrefillBatchOutput,
+                        BatchProcessPrefillResultReq,
+                    )
+                except Exception:
+                    GetNextPrefillBatchInput = type("_X", (), {})
+                    GetNextPrefillBatchOutput = type("_Z", (), {})
+                    BatchProcessPrefillResultReq = type("_Y", (), {})
+                semi_pd_ctrl = []
+                if (getattr(self.server_args, 'enable_semi_pd', False) or os.environ.get('SGLANG_ENABLE_SEMI_PD','0').lower() in ('1','true','yes')):
+                    semi_pd_ctrl = [
+                        req
+                        for req in (recv_reqs or [])
+                        if isinstance(req, (GetNextPrefillBatchInput, GetNextPrefillBatchOutput, BatchProcessPrefillResultReq))
+                    ]
                 work_reqs = [
                     req
-                    for req in recv_reqs
+                    for req in (recv_reqs or [])
                     if isinstance(
                         req,
                         (
                             TokenizedGenerateReqInput,
                             TokenizedEmbeddingReqInput,
-                            GetNextPrefillBatchInput,
-                            BatchProcessPrefillResultReq,
                         ),
                     )
                 ]
                 control_reqs = [
                     req
-                    for req in recv_reqs
+                    for req in (recv_reqs or [])
                     if not isinstance(
                         req,
                         (
                             TokenizedGenerateReqInput,
                             TokenizedEmbeddingReqInput,
                             GetNextPrefillBatchInput,
+                            GetNextPrefillBatchOutput,
                             BatchProcessPrefillResultReq,
                         ),
                     )
@@ -1180,6 +1336,7 @@ class Scheduler(
             else:
                 work_reqs = None
                 control_reqs = None
+                semi_pd_ctrl = None
 
             if self.attn_tp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1196,6 +1353,9 @@ class Scheduler(
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
+            # Re-attach local-only Semi-PD control messages on attn_tp_rank==0
+            if ((getattr(self.server_args, 'enable_semi_pd', False) or os.environ.get('SGLANG_ENABLE_SEMI_PD','0').lower() in ('1','true','yes')) and self.attn_tp_rank == 0 and semi_pd_ctrl):
+                recv_reqs.extend(semi_pd_ctrl)
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
@@ -1206,6 +1366,10 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        # Semi-PD: PREFILL does not consume CPU-plane requests from tokenizer/RPC.
+        # All PREFILL control/work messages are handled via its own IPC sockets.
+        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+            return
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (

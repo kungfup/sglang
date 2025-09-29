@@ -18,6 +18,8 @@ import os
 import time
 import requests
 from types import SimpleNamespace
+import threading
+
 from typing import List, Optional, Union
 from collections import deque
 import traceback
@@ -33,8 +35,10 @@ from sglang.srt.managers.io_struct import (
     GetNextPrefillBatchOutput,
     TokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
+    StepTag,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, ForwardMode
+
 from sglang.srt.managers.scheduler import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.managers.semi_pd_scheduler import SemiPDScheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -71,6 +75,12 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             bypass_load_weight,
             InstanceRole.PREFILL,
         )
+        # BOOT visibility: mark PREFILL-PP init enter for early crash diagnosis
+        try:
+            logger.info(f"[PREFILL-PP{pp_rank}] BOOT init enter (tp={tp_rank})")
+        except Exception:
+            pass
+
 
         # Do not force-disable overlap; follow server args
         self.chunked_rid = None
@@ -98,16 +108,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.bridge_socket = get_zmq_socket(
                 context, zmq.PULL, port_args.bridge_ipc_name, True
             )
-            # PP>0: bind its own p_scheduler_input to receive DECODE-forwarded requests
+            # Bind p_scheduler_input to receive DECODE-forwarded requests (all PP ranks)
             self.recv_from_decode_forwarded = None
             try:
-                if getattr(self, 'pp_rank', 0) != 0:
-                    self.recv_from_decode_forwarded = get_zmq_socket(
-                        context, zmq.PULL, port_args.p_scheduler_input_ipc_name, True
-                    )
-                    logger.info(
-                        f"[PREFILL-PP{pp_rank}] bind p_scheduler_input: {port_args.p_scheduler_input_ipc_name}"
-                    )
+                self.recv_from_decode_forwarded = get_zmq_socket(
+                    context, zmq.PULL, port_args.p_scheduler_input_ipc_name, True
+                )
+                logger.info(
+                    f"[PREFILL-PP{pp_rank}] bind p_scheduler_input: {port_args.p_scheduler_input_ipc_name}"
+                )
             except Exception as _e:
                 logger.warning(f"[PREFILL-PP{pp_rank}] bind p_scheduler_input failed: {_e}")
             try:
@@ -115,13 +124,17 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     logger.info(
                         f"[PREFILL-PP{pp_rank}] PP group: is_last_rank={self.pp_group.is_last_rank}"
                     )
+
             except Exception:
                 pass
+            # Disable multi-inbox: each PREFILL only binds its own p_scheduler_input.
+            self.recv_from_decode_forwarded_all = []
             logger.info(
                 f"[PREFILL-PP{pp_rank}] IPC endpoints: d_scheduler={port_args.d_scheduler_input_ipc_name}, bridge(bind)={port_args.bridge_ipc_name}"
             )
             try:
                 # Add a receive timeout so PREFILL won't hang forever if DECODE doesn't reply
+                # Align default with design doc (README): default 200ms
                 timeout_ms = int(os.environ.get("SEMI_PD_P2D_REQ_TIMEOUT_MS", "200"))
                 self.bridge_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
                 logger.info(
@@ -153,7 +166,13 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 # 纯TP模式：只有主TP rank需要IPC连接
                 self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
                 self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
-                logger.info(f"🔧 [PREFILL-PP{pp_rank}] 纯TP模式：非主TP rank，跳过IPC连接")
+        # Front-side short polling (no background drain thread)
+        self._auth_inbox_lock = threading.Lock()
+        self._drain_thread_enabled = False
+        try:
+            logger.info(f"[PREFILL-PP{pp_rank}] Using front-side NOBLOCK polling for control/work (no drain thread)")
+        except Exception:
+            pass
 
         # Bootstrap registration (health + endpoint alignment)
         self._handshake_done = os.environ.get("SGLANG_SEMIPD_DISABLE_HANDSHAKE", "0").lower() in ("1","true","yes")
@@ -194,6 +213,168 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     break
                 time.sleep(0.05)
 
+        # BOOT visibility: mark PREFILL-PP init done
+        try:
+            logger.info(f"[PREFILL-PP{pp_rank}] BOOT init done (tp={tp_rank})")
+        except Exception:
+            pass
+
+    def _drain_with_poller_pp0(self, max_iters: int = 32, timeout_ms: int = 5):
+        """Drain p_scheduler_input and bridge with a ZMQ Poller for PP0.
+
+        This reduces the chance of missing initial control/work messages
+        and helps align the first EXTEND tick.
+        """
+        try:
+            use_poller = os.environ.get("SGLANG_SEMIPD_PP0_POLLER", "1").lower() in ("1","true","yes")
+            if not use_poller:
+                return (0, 0)
+            if getattr(self, 'pp_rank', 0) != 0 or self.attn_tp_rank != 0:
+                return (0, 0)
+            poller = zmq.Poller()
+            sock_map = {}
+            if getattr(self, 'recv_from_decode_forwarded', None) is not None:
+                poller.register(self.recv_from_decode_forwarded, zmq.POLLIN)
+                sock_map[self.recv_from_decode_forwarded] = 'p_scheduler_input'
+            if getattr(self, 'bridge_socket', None) is not None:
+                poller.register(self.bridge_socket, zmq.POLLIN)
+                sock_map[self.bridge_socket] = 'bridge'
+            ps_gen = 0
+            ps_auth = 0
+            it = 0
+            while it < max_iters:
+                it += 1
+                evts = dict(poller.poll(timeout_ms))
+                if not evts:
+                    break
+                # Prioritize p_scheduler_input over bridge to avoid starving Generate
+                ps_list = []
+                br_list = []
+                for s, _ in evts.items():
+                    (_ps_list := ps_list if sock_map.get(s) == 'p_scheduler_input' else br_list).append(s)
+                for s in ps_list + br_list:
+                    src = sock_map.get(s, 'unknown')
+                    try:
+                        obj = s.recv_pyobj(zmq.NOBLOCK)
+                    except Exception:
+                        continue
+                    # Control dicts: HELLO
+                    if isinstance(obj, dict):
+                        try:
+                            if obj.get("type") == "HELLO":
+                                self._handshake_done = True
+                                try:
+                                    self.send_to_d_instance.send_pyobj({"type": "HELLO_ACK", "pp": self.pp_rank})
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        continue
+                    # StepTag control
+                    if isinstance(obj, StepTag):
+                        try:
+                            self._last_step_tag = obj
+                            if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1","true","yes"):
+                                logger.info(
+                                    f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}] RECV STEP on {src} phase={getattr(obj,'phase','?')}"
+                                )
+                        except Exception:
+                            pass
+                        continue
+                    # Work-plane messages
+                    from sglang.srt.managers.io_struct import (
+                        TokenizedGenerateReqInput,
+                        GetNextPrefillBatchOutput,
+                    )
+                    if isinstance(obj, TokenizedGenerateReqInput):
+                        try:
+                            # Pre-log receive (always throttled)
+                            try:
+                                semi_pd_log_info_throttle(
+                                    logger,
+                                    key=f"pp{self.pp_rank}.recv.gen",
+                                    msg=f"[PREFILL-PP{self.pp_rank}] RECV {src} TokenizedGenerateReqInput rid={getattr(obj,'rid','?')}"
+                                )
+                            except Exception:
+                                pass
+                            self.handle_generate_request(obj)
+                            ps_gen += 1
+                            if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1","true","yes"):
+                                logger.info(
+                                    f"[PREFILL-PP{self.pp_rank}] TRACE handled {src} TokenizedGenerateReqInput rid={getattr(obj,'rid','?')}"
+                                )
+                        except Exception as _e:
+                            try:
+                                semi_pd_log_info_throttle(
+                                    logger,
+                                    key=f"pp{self.pp_rank}.recv.gen.error",
+                                    msg=f"[PREFILL-PP{self.pp_rank}] handle_generate_request error: {_e}"
+                                )
+                            except Exception:
+                                pass
+                        continue
+                    if isinstance(obj, GetNextPrefillBatchOutput):
+                        try:
+                            # Drop empty authorizations on PP0 to avoid inbox flooding
+                            if not (getattr(self, 'pp_rank', 0) == 0 and len(getattr(obj, 'rids', []) or []) == 0):
+                                if hasattr(self, '_auth_inbox_lock'):
+                                    with self._auth_inbox_lock:
+                                        self._auth_inbox.append(obj)
+                                else:
+                                    self._auth_inbox.append(obj)
+                                ps_auth += 1
+                                if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1","true","yes") and len(getattr(obj, 'rids', []) or []) > 0:
+                                    logger.info(
+                                        f"[PREFILL-PP{self.pp_rank}] inbox+=auth(#rids={len(obj.rids)}) from {src}"
+                                    )
+                        except Exception:
+                            pass
+                        continue
+            # Throttled poller summary
+            try:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.poller.summary",
+                    msg=(
+                        f"[PREFILL-PP{self.pp_rank}] TRACE poller ps.gen={ps_gen} ps.auth={ps_auth} wq={len(self.waiting_queue)} inbox={len(self._auth_inbox)}"
+                    ),
+                    interval_ms=1000,
+                )
+            except Exception:
+                pass
+            return (ps_gen, ps_auth)
+        except Exception:
+            return (0, 0)
+
+    def maybe_sleep_on_idle(self):
+        """
+        PREFILL override: be responsive to Semi-PD control/work sockets when idle.
+        Lightly poll p_scheduler_input and bridge to wake up on incoming events,
+        without draining here (actual draining happens in get_next_batch_to_run).
+        """
+        try:
+            poller = zmq.Poller()
+            any_reg = False
+            if getattr(self, 'recv_from_decode_forwarded', None) is not None:
+                poller.register(self.recv_from_decode_forwarded, zmq.POLLIN)
+                any_reg = True
+            if getattr(self, 'bridge_socket', None) is not None:
+                poller.register(self.bridge_socket, zmq.POLLIN)
+                any_reg = True
+            if any_reg:
+                import os as _os
+                to_ms = int(_os.environ.get("SEMI_PD_IDLE_POLL_TIMEOUT_MS", "200"))
+                # Wait only; do not recv here to centralize consumption in GNBTR
+                poller.poll(to_ms)
+            else:
+                super().maybe_sleep_on_idle()
+        except Exception:
+            try:
+                super().maybe_sleep_on_idle()
+            except Exception:
+                pass
+
+
     def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
         """
         原版Semi-PD的核心设计：P-Scheduler使用D-Scheduler预分配的资源
@@ -201,7 +382,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         # Optional trace: show who triggered EXTEND and the authorized rids
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
             try:
-                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE to_extend_batch rids={resp.rids}\n" + "".join(traceback.format_stack(limit=12)))
+                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE to_extend_batch rids={resp.rids}")
             except Exception:
                 pass
 
@@ -213,6 +394,47 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         can_run_list = [r for r in self.waiting_queue if r.rid in resp.rids]
         # Sort by the order of resp.rids
         can_run_list.sort(key=lambda r: resp.rids.index(r.rid))
+
+        # For PP>0 stages: fabricate lightweight placeholder reqs for authorized rids
+        # that are not yet in waiting_queue, so downstream PREFILL can build EXTEND
+        # batches without having seen local Generate requests. This follows the
+        # unified-clock design where only PP0 ingests Generate.
+
+        # Optional: allow PP0 to synthesize placeholders too when env enabled to
+        # quickly align the first EXTEND tick if generate arrival races with auth.
+        try:
+            _pp0_synth = os.environ.get("SGLANG_SEMIPD_PP0_SYNTH_PLACEHOLDER", "1").lower() in ("1", "true", "yes")
+            if getattr(self, 'pp_rank', 0) > 0 or _pp0_synth:
+                from sglang.srt.managers.schedule_batch import Req
+                from sglang.srt.sampling.sampling_params import SamplingParams
+                existing = {r.rid for r in can_run_list}
+                for i, rid in enumerate(resp.rids):
+                    if rid in existing:
+                        continue
+                    pre_len = int(resp.prefix_lens[i]) if i < len(resp.prefix_lens) else 0
+                    ext_len = int(resp.extend_input_lens[i]) if i < len(resp.extend_input_lens) else 0
+                    # Minimal synthetic req: sizes only; data come from PP hidden states
+                    synth = Req(
+                        rid=rid,
+                        origin_input_text="",
+                        origin_input_ids=[0] * pre_len,
+                        sampling_params=SamplingParams(max_new_tokens=max(1, ext_len)),
+                    )
+                    synth.prefix_indices = [0] * pre_len
+                    synth.extend_input_len = ext_len
+                    synth.fill_ids = [0] * (pre_len + ext_len)
+                    self.waiting_queue.append(synth)
+                    can_run_list.append(synth)
+                    try:
+                        import os as _os
+                        if _os.getenv("SGLANG_SEMIPD_TRACE", "0").lower() in ("1","true","yes"):
+                            logger.info(
+                                f"[PREFILL-PP{self.pp_rank}] synth.placeholder rid={rid} pre={pre_len} ext={ext_len} (pp0={getattr(self,'pp_rank',0)==0})"
+                            )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # 🔧 MIGRATION: 原版Semi-PD的等待队列管理逻辑
         if self.chunked_rid != resp.chunked_rid:
@@ -251,7 +473,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             else:
                 # 尚未分配：只需占位长度，真实映射由prepare_for_extend分配后再建立
                 r.prefix_indices = [0] * pre_len
-            r.fill_ids = r.origin_input_ids[: pre_len + r.extend_input_len]
+            # If origin_input_ids does not contain extend tokens (synthetic PP>0 case), fabricate zeros for extend.
+            if len(r.origin_input_ids) >= pre_len + r.extend_input_len:
+                r.fill_ids = r.origin_input_ids[: pre_len + r.extend_input_len]
+            else:
+                r.fill_ids = (r.origin_input_ids[:pre_len]) + [0] * int(r.extend_input_len)
 
         # 🔧 MIGRATION: 原版Semi-PD的ScheduleBatch创建
         # P-Scheduler有资源引用，但通过pre_allocated_req_pool_indices控制分配行为
@@ -270,6 +496,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             batch.prepare_for_extend(pre_allocated_req_pool_indices=resp.req_pool_indices)
         else:
             batch.prepare_for_extend()
+
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
@@ -278,60 +505,131 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         SGLang PP event loop handle cross-stage send/recv.
         This method should not fabricate dummy batches for downstream PP stages.
         """
-        # Poll forwarded generate requests from same-stage DECODE (PP>0)
-        if getattr(self, 'recv_from_decode_forwarded', None) is not None:
-            while True:
-                try:
-                    obj = self.recv_from_decode_forwarded.recv_pyobj(zmq.NOBLOCK)
-                except Exception:
-                    break
-                # Append to waiting queue directly
-                try:
-                    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-                    if isinstance(obj, TokenizedGenerateReqInput):
-                        self.handle_generate_request(obj)
-                except Exception:
-                    pass
-        # Pre-drain bridge: move pending auth/control into inbox so we never miss DECODE's reply
+        # Entry log (throttled) to confirm loop is running on PP0
         try:
-            while True:
-                obj = self.bridge_socket.recv_pyobj(zmq.NOBLOCK)
-                # Control dicts: HELLO/others
-                if isinstance(obj, dict):
-                    try:
-                        if obj.get("type") == "HELLO":
-                            self._handshake_done = True
-                            try:
-                                self.send_to_d_instance.send_pyobj({"type": "HELLO_ACK", "pp": self.pp_rank})
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    continue
-                # Work message: authorization
-                if isinstance(obj, GetNextPrefillBatchOutput):
-                    self._auth_inbox.append(obj)
-                    if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-                        try:
-                            logger.info(f"[PREFILL-PP{self.pp_rank}] inbox+=auth(#rids={len(obj.rids)})")
-                        except Exception:
-                            pass
-                    continue
-                # ignore other types silently
+            if getattr(self, 'pp_rank', 0) == 0 and getattr(self, 'attn_tp_rank', 0) == 0:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.gnbtr.enter",
+                    msg=f"[PREFILL-PP{self.pp_rank}] ENTER get_next_batch_to_run",
+                    interval_ms=1000,
+                )
         except Exception:
             pass
 
 
-        # For non-PP0 stages: delegate to native PP path so that cross-stage
-        # send/recv and execution are driven by SGLang's event loop correctly.
-        if getattr(self, 'pp_rank', 0) != 0:
-            return super().get_next_batch_to_run()
-
-        if not self.waiting_queue:
-            logger.debug(
-                f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None"
+        # Poll forwarded generate requests and async authorizations from all PP ranks (PP>0)
+        # For PP0, prefer poller-based unified drain to avoid missing initial messages.
+        try:
+            self._drain_with_poller_pp0(max_iters=256, timeout_ms=10)
+        except Exception:
+            pass
+        # Throttled socket status log to confirm which endpoints are active (no env gating)
+        try:
+            semi_pd_log_info_throttle(
+                logger,
+                key=f"pp{self.pp_rank}.sockets",
+                msg=(
+                    f"[PREFILL-PP{self.pp_rank}] sockets: p_scheduler={'on' if getattr(self, 'recv_from_decode_forwarded', None) is not None else 'off'} "
+                    f"addr={getattr(self.port_args, 'p_scheduler_input_ipc_name', '?')} bridge={getattr(self.port_args, 'bridge_ipc_name', '?')}"
+                ),
+                interval_ms=1000,
             )
-            return None
+        except Exception:
+            pass
+
+
+        sockets = []
+        if getattr(self, 'recv_from_decode_forwarded', None) is not None and not (
+            getattr(self, 'pp_rank', 0) == 0 and getattr(self, 'attn_tp_rank', 0) == 0
+        ):
+            sockets = [self.recv_from_decode_forwarded]
+        # diag counters for p_scheduler_input poll
+        diag_gen = 0
+        diag_auth_ps = 0
+        if not getattr(self, '_drain_thread_enabled', False):
+            for s in sockets:
+                while True:
+                    try:
+                        obj = s.recv_pyobj(zmq.NOBLOCK)
+                    except Exception:
+                        break
+                    try:
+                        if isinstance(obj, TokenizedGenerateReqInput):
+                            # Pre-log the receive (always throttled), then enqueue request
+                            try:
+                                semi_pd_log_info_throttle(
+                                    logger,
+                                    key=f"pp{self.pp_rank}.recv.gen",
+                                    msg=(f"[PREFILL-PP{self.pp_rank}] RECV p_scheduler_input TokenizedGenerateReqInput rid={getattr(obj,'rid','?')}")
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                diag_gen += 1
+                                self.handle_generate_request(obj)
+                            except Exception as _e:
+                                try:
+                                    semi_pd_log_info_throttle(
+                                        logger,
+                                        key=f"pp{self.pp_rank}.recv.gen.error",
+                                        msg=f"[PREFILL-PP{self.pp_rank}] handle_generate_request error: {_e}"
+                                    )
+                                except Exception:
+                                    pass
+                            continue
+                        if isinstance(obj, GetNextPrefillBatchOutput):
+                            # Drop empty authorizations on PP0 to avoid inbox flooding
+                            if not (getattr(self, 'pp_rank', 0) == 0 and len(getattr(obj, 'rids', []) or []) == 0):
+                                if hasattr(self, '_auth_inbox_lock'):
+                                    with self._auth_inbox_lock:
+                                        self._auth_inbox.append(obj)
+                                else:
+                                    self._auth_inbox.append(obj)
+                                diag_auth_ps += 1
+                                if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes") and len(getattr(obj, 'rids', []) or []) > 0:
+                                    try:
+                                        logger.info(f"[PREFILL-PP{self.pp_rank}] inbox+=auth(#rids={len(obj.rids)}) from p_scheduler_input")
+                                    except Exception:
+                                        pass
+                            continue
+                    except Exception:
+                        pass
+        # Always-throttled PP0 poll summary (even if TRACE not enabled)
+        try:
+            if getattr(self, 'pp_rank', 0) == 0:
+                inbox_len = len(self._auth_inbox) if hasattr(self, '_auth_inbox') else -1
+                wq_len = len(self.waiting_queue) if hasattr(self, 'waiting_queue') else -1
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{self.pp_rank}.poll.summary",
+                    msg=(f"[PREFILL-PP{self.pp_rank}] poll-summary wq={wq_len} inbox={inbox_len}"),
+                    interval_ms=1000,
+                )
+        except Exception:
+            pass
+
+        # TRACE: summarize poll stats for PP0
+        try:
+            if getattr(self, 'pp_rank', 0) == 0 and os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                inbox_len = len(self._auth_inbox) if hasattr(self, '_auth_inbox') else -1
+                wq_len = len(self.waiting_queue) if hasattr(self, 'waiting_queue') else -1
+                logger.info(
+                    f"[PREFILL-PP{self.pp_rank}] TRACE poll ps.gen={diag_gen} ps.auth={diag_auth_ps} wq={wq_len} inbox={inbox_len}"
+                )
+        except Exception:
+            pass
+
+
+        # Unified clock: PREFILL on all PP ranks only builds batches from explicit authorization
+        # issued by same-stage DECODE. Do NOT self-schedule via parent's get_next_batch_to_run.
+
+        # Do not early-return on empty queue; let idle fallback keep PP send/recv aligned
+        # if not self.waiting_queue:
+        #     logger.debug(
+        #         f"[PREFILL-PP{self.pp_rank}] No waiting requests, returning None"
+        #     )
+        #     return None
 
         # 仅 PP0 主动向 DECODE 请求授权；其他 PP 段不从 DECODE 拉批次
         resp = None
@@ -342,7 +640,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             # 发送候选（节流/重发），由D授权
             now = time.time()
             import os
-            resend_interval = float(os.environ.get("SGLANG_SEMIPD_AUTH_RESEND_S", "0.2"))
+            resend_interval = float(os.environ.get("SGLANG_SEMIPD_AUTH_RESEND_S", "0.05"))
             candidates = self._last_candidates if (self._awaiting_auth and (now - self._last_candidates_ts) < resend_interval) else None
             if candidates is None:
                 n_prefill_tokens = 0
@@ -352,6 +650,14 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                         break
                     n_prefill_tokens += len(r.origin_input_ids)
                     candidates.append(r.rid)
+            # TRACE: show PP0-P waiting_queue and planned candidates
+            try:
+                if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                    logger.info(
+                        f"[PREFILL-PP{self.pp_rank}] TRACE cand.prepare waiting={len(self.waiting_queue)} awaiting={self._awaiting_auth} cand={len(candidates)}"
+                    )
+            except Exception:
+                pass
             if candidates:
                 self.send_to_d_instance.send_pyobj(GetNextPrefillBatchInput(rids=candidates))
                 try:
@@ -360,6 +666,14 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                         key=f"pp{self.pp_rank}.p2d.gnp.req",
                         msg=f"[PREFILL-PP{self.pp_rank}] →D GetNextPrefillBatchInput: #rids={len(candidates)}",
                     )
+                except Exception:
+                    pass
+                # TRACE: explicitly record the rids we sent as candidates
+                try:
+                    if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                        logger.info(
+                            f"[PREFILL-PP{self.pp_rank}] TRACE cand.send rids={list(candidates)}"
+                        )
                 except Exception:
                     pass
                 self._awaiting_auth = True
@@ -393,6 +707,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     except Exception:
                         pass
                     continue
+                # Optional StepTag control
+                if isinstance(obj, StepTag):
+                    try:
+                        self._last_step_tag = obj
+                        logger.info(f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id={getattr(obj,'mb_id','-')}][phase={getattr(obj,'phase','?')}] RECV STEP")
+                    except Exception:
+                        pass
+                    drained_ctrl += 1
+                    continue
                 if isinstance(obj, GetNextPrefillBatchOutput):
                     resp = obj
                     break
@@ -408,7 +731,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 except Exception:
                     pass
             else:
-                # No authorization; skip this round
+                # No authorization this round. Do not return early; fall through to idle micro-batch to keep PP aligned.
                 try:
                     semi_pd_log_info_throttle(
                         logger,
@@ -417,7 +740,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     )
                 except Exception:
                     pass
-                return None
+                # continue; ret remains None and idle fallback (if pp_size>1) will be used
 
             # 多TP广播
             if self.attn_tp_size > 1:
@@ -435,14 +758,32 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         ret = None
         # Enqueue received authorization (if any) into inbox for strict gating
         if isinstance(resp, GetNextPrefillBatchOutput):
-            self._auth_inbox.append(resp)
+            # Only enqueue non-empty authorizations to build EXTEND; still clear awaiting flag via resp above
+            if len(getattr(resp, 'rids', []) or []) > 0:
+                self._auth_inbox.append(resp)
             resp = None
 
         auth = None
         if self._auth_inbox:
             auth = self._auth_inbox.popleft()
         if auth and len(auth.rids) > 0:
+            # Build EXTEND; if failed to form a batch this round, do NOT drop the auth — requeue it.
             ret = self.to_extend_batch(auth)
+            if (ret is None) or (not getattr(ret, 'reqs', None)):
+                try:
+                    self._auth_inbox.appendleft(auth)
+                except Exception:
+                    pass
+                ret = None
+            else:
+                # TRACE: built EXTEND from authorization
+                try:
+                    import os as _os
+                    if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
+                        logger.info(f"[PREFILL-PP{self.pp_rank}] EXTEND from auth rids={list(auth.rids)} size={len(ret.reqs) if ret else 0}")
+                except Exception:
+                    pass
+
 
         # 不再为下游PP stage创建虚拟batch，交由 event_loop_pp 统一驱动
 
@@ -450,12 +791,21 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         if self.server_args.enable_dp_attention:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
-        # If no authorized work yet, return an idle micro-batch to keep PP send/recv aligned
+        # If no authorized work yet on PREFILL under PP, do NOT fabricate an idle batch.
+        # Unified clock rule: when idle, both sides must avoid NCCL; return None to skip PP recv/send.
         if ret is None and getattr(self, 'pp_size', 1) > 1:
             try:
-                ret = self.get_idle_batch()
+                import os as _os
+                if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
+                    semi_pd_log_info_throttle(
+                        logger,
+                        key=f"pp{self.pp_rank}.idle",
+                        msg=f"[PREFILL-PP{self.pp_rank}] return IDLE(no NCCL)",
+                        interval_ms=int(os.environ.get("SEMI_PD_IDLE_LOG_INTERVAL_MS", "1000")),
+                    )
             except Exception:
-                ret = None
+                pass
+            # keep ret=None
         logger.debug(
             f"[PREFILL-PP{self.pp_rank}] Returning batch with {len(ret.reqs) if ret else 0} requests"
         )
@@ -475,6 +825,20 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         2. PP1 PREFILL: 产生next_token_ids，发送给PP1 DECODE
         """
         import os
+        # diag: enter hook (always-throttled, no env gating)
+        try:
+            mode = getattr(batch, 'forward_mode', None)
+            is_ext = bool(mode and mode.is_extend())
+            from sglang.srt.utils import semi_pd_log_info_throttle as _th
+            _th(
+                logger,
+                key=f"pp{getattr(self,'pp_rank','?')}.p_result.enter",
+                msg=f"[PREFILL-PP{getattr(self,'pp_rank','?')}] ENTER process_batch_result_prefill is_extend={is_ext}",
+                interval_ms=1000,
+            )
+        except Exception:
+            pass
+
 
         # 获取PP配置：优先使用对象属性，其次使用pp_group，最后才退回环境变量
         try:
@@ -502,27 +866,54 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         # 在最后PP段，无论是否产生token，都通知同段DECODE继续（空列表表示仅完成EXTEND）
         if is_last_pp_stage:
+            # Be robust if result is None
             next_token_ids_list = []
-            if result.next_token_ids is not None:
+            next_token_logits = None
+            if result is not None and getattr(result, 'next_token_ids', None) is not None:
                 try:
                     next_token_ids_list = result.next_token_ids.tolist()
                 except Exception:
                     next_token_ids_list = list(result.next_token_ids)
-            next_token_logits = None
             try:
-                if getattr(batch, 'return_logprob', False) and result.logits_output is not None:
+                if (
+                    result is not None
+                    and getattr(batch, 'return_logprob', False)
+                    and getattr(result, 'logits_output', None) is not None
+                ):
                     next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
             except Exception:
                 pass
+            rids = [r.rid for r in batch.reqs]
+            # diag: will send (always-throttled)
+            try:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{pp_rank}.p2d.send.will",
+                    msg=f"[PREFILL-PP{pp_rank}] →D will send prefill_result: tokens={len(next_token_ids_list)} rids={rids}",
+                    interval_ms=1000,
+                )
+            except Exception:
+                pass
             req = BatchProcessPrefillResultReq(
+                rids=rids,
                 next_token_ids=next_token_ids_list,
                 next_token_logits=next_token_logits,
             )
-            logger.info(f"[PREFILL-PP{pp_rank}] →D tokens: {len(next_token_ids_list)}")
             self.send_to_d_instance.send_pyobj(req)
+            # diag: sent (always-throttled)
+            try:
+                semi_pd_log_info_throttle(
+                    logger,
+                    key=f"pp{pp_rank}.p2d.send.done",
+                    msg=f"[PREFILL-PP{pp_rank}] →D sent prefill_result",
+                    interval_ms=1000,
+                )
+            except Exception:
+                pass
             return
-        # 非最后段（无token）：不做本地处理，交由原生PP事件循环在下一段接收并处理
-        # 在非最后PP段，prefill不产生token，直接返回避免父类对None进行迭代。
+        # 非最后段：不处理tokens，也不调用父类；让 event_loop_pp 根据
+        # result.pp_hidden_states_proxy_tensors 自动触发原生PP跨段发送。
+        # 这里直接返回，避免父类按 next_token_ids 逻辑进行 zip(...) 而报错。
         return
 
 
@@ -534,7 +925,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         # Optional trace: who actually triggers model execution on PREFILL
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
             try:
-                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE run_batch(reqlen={len(batch.reqs) if batch else 0})\n" + "".join(traceback.format_stack(limit=12)))
+                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE run_batch(reqlen={len(batch.reqs) if batch else 0})")
             except Exception:
                 pass
         return super().run_batch(batch)
