@@ -473,10 +473,29 @@ class ForwardBatch:
                         * 3
                     )
                 else:
+                    # Slice mrope_positions for this chunk
                     mrope_positions = mm_input.mrope_positions[
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+
+                    # If slicing resulted in fewer positions than expected (e.g., due to out-of-bounds),
+                    # pad with default text positions
+                    actual_len = mrope_positions.shape[1]
+                    if actual_len < extend_seq_len:
+                        # Generate default positions for the missing tokens (text tokens)
+                        missing_len = extend_seq_len - actual_len
+                        start_pos = extend_prefix_len + actual_len
+                        default_positions = torch.tensor(
+                            [[pos for pos in range(start_pos, start_pos + missing_len)]] * 3,
+                            dtype=mrope_positions.dtype,
+                            device=mrope_positions.device if mrope_positions.numel() > 0 else "cpu"
+                        )
+                        if mrope_positions.numel() > 0:
+                            mrope_positions = torch.cat([mrope_positions, default_positions], dim=1)
+                        else:
+                            mrope_positions = default_positions
+
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(

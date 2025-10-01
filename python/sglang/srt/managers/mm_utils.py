@@ -346,12 +346,13 @@ def _adjust_embedding_length(
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
                 )
-            # extract from the end: this is a compromise
+            # Extract from the beginning to align with mrope_positions slicing
+            # In chunked prefill, both embedding and mrope_positions are sliced from the start
             if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+                embedding = embedding[:num_mm_tokens_in_input_ids, :]
             else:
                 num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
+                embedding = embedding[:num_multimodal, :]
         else:
             raise RuntimeError(
                 f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
