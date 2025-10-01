@@ -952,7 +952,8 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        if server_args.disaggregation_mode == "null":
+        # 🔧 Semi-PD also needs warmup request like disaggregation mode
+        if server_args.disaggregation_mode == "null" and not server_args.enable_semi_pd:
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -962,21 +963,32 @@ def _wait_and_warmup(
             assert res.status_code == 200, f"{res}"
         else:
             logger.info(f"Start of prefill warmup ...")
-            json_data = {
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
-            }
+            # 🔧 Semi-PD uses simple warmup format (single request)
+            if server_args.enable_semi_pd:
+                json_data = {
+                    "sampling_params": {
+                        "temperature": 0.0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                    "input_ids": [0, 1, 2, 3],
+                }
+            else:
+                json_data = {
+                    "sampling_params": {
+                        "temperature": 0.0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                    "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                    # This is a hack to ensure fake transfer is enabled during prefill warmup
+                    # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                    "bootstrap_room": [
+                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                        for i in range(server_args.dp_size)
+                    ],
+                    "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                }
             res = requests.post(
                 url + request_name,
                 json=json_data,
