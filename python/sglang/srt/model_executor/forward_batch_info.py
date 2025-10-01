@@ -483,6 +483,14 @@ class ForwardBatch:
                     # pad with default text positions
                     actual_len = mrope_positions.shape[1]
                     if actual_len < extend_seq_len:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(
+                            f"[mRoPE Padding] Batch {batch_idx}: mrope_positions sliced to {actual_len} tokens, "
+                            f"but extend_seq_len={extend_seq_len}. Padding {extend_seq_len - actual_len} text positions. "
+                            f"Original shape: {mm_input.mrope_positions.shape}, "
+                            f"extend_prefix_len={extend_prefix_len}"
+                        )
                         # Generate default positions for the missing tokens (text tokens)
                         missing_len = extend_seq_len - actual_len
                         start_pos = extend_prefix_len + actual_len

@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import os
 from functools import lru_cache, partial
 from inspect import signature
 from typing import Iterable, List, Optional, Tuple, Type
@@ -476,6 +477,16 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
 
+        # ViT async computation optimization
+        # Create a separate CUDA stream for ViT computation to overlap with LLM prefill
+        self.vit_async_enabled = os.environ.get("SGLANG_VIT_ASYNC_DISABLED", "0") != "1"
+        self.vit_stream = None
+        if self.pp_group.is_first_rank and self.vit_async_enabled:
+            self.vit_stream = torch.cuda.Stream()
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("[ViT Async] Enabled ViT asynchronous computation with dedicated CUDA stream")
+
         if self.pp_group.is_first_rank:
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
@@ -550,6 +561,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         """
         Process image data and generate image embeddings.
 
+        With ViT async optimization enabled, this function will execute ViT computation
+        in a separate CUDA stream to overlap with LLM prefill computation.
+
         Args:
             items: List of multimodal items containing image data.
 
@@ -562,7 +576,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 item.pixel_values = item.pixel_values.to(device=self.device)
             if item.image_grid_thw is not None and item.image_grid_thw.device != self.device:
                 item.image_grid_thw = item.image_grid_thw.to(device=self.device)
-                
+
         # In qwen-vl, the last dimension is the same
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype
@@ -570,8 +584,30 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds.contiguous()
+
+        # Execute ViT computation asynchronously if enabled
+        if self.vit_async_enabled and self.vit_stream is not None:
+            # Record the current stream's state
+            current_stream = torch.cuda.current_stream()
+
+            # Switch to ViT stream for async computation
+            with torch.cuda.stream(self.vit_stream):
+                # Wait for data to be ready (transferred to device)
+                self.vit_stream.wait_stream(current_stream)
+
+                # Execute ViT computation in the separate stream
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds = image_embeds.contiguous()
+
+            # Make the current stream wait for ViT computation to complete
+            # This ensures the embeddings are ready before being used
+            current_stream.wait_stream(self.vit_stream)
+
+            return image_embeds
+        else:
+            # Synchronous execution (original behavior)
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+            return image_embeds.contiguous()
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         """
