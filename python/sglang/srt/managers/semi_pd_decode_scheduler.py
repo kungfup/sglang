@@ -1129,7 +1129,39 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # - never call super().get_next_batch_to_run() to avoid PREFILL execution on DECODE
         self._maybe_authorize_prefill()
 
-        # If we have a ready decode batch queued from PREFILL result, adopt it
+        # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 needs to process requests from DECODE-PP0
+        # These requests are received via recv_requests() and stored in waiting_queue
+        # We need to process them to create decode batches
+        if self.pp_size > 1 and self.pp_rank > 0:
+            # DECODE-PP>0: Process requests from PP0 (received via point_to_point_pyobj)
+            # These are decode requests that need to be processed in this PP stage
+            if self.waiting_queue and self.running_batch.is_empty():
+                # Get requests from waiting_queue and create a decode batch
+                # This is similar to what the base scheduler does
+                from sglang.srt.managers.schedule_batch import ScheduleBatch
+                # Take all requests from waiting_queue
+                reqs = []
+                while self.waiting_queue:
+                    reqs.append(self.waiting_queue.pop(0))  # 🔧 Fix: use pop(0) instead of popleft() for list
+                if reqs:
+                    # Create a decode batch with these requests
+                    self.running_batch = ScheduleBatch.init_new(
+                        reqs=reqs,
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=getattr(self, 'enable_overlap', False),
+                        spec_algorithm=getattr(self, 'spec_algorithm', None),
+                        enable_custom_logit_processor=getattr(self, 'enable_custom_logit_processor', False),
+                    )
+                    logger.info(f"[DECODE-PP{self.pp_rank}] Created decode batch from PP0 requests: #reqs={len(reqs)}")
+
+            # 🔧 ADDITIONAL FIX: If PP0 is not sending new requests (autoregressive loop),
+            # PP1 should keep processing the existing running_batch
+            # This is the normal behavior - just continue with the existing batch
+
+        # If we have a ready decode batch queued from PREFILL result, adopt it (PP0 only)
         if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
             if len(self._ready_decode_batches) > 0:
                 self.running_batch = self._ready_decode_batches.popleft()
@@ -1247,31 +1279,44 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 if recv_reqs is None:
                     recv_reqs = []
                 # Accept only work messages
-                if isinstance(obj, (GetNextPrefillBatchInput, BatchProcessPrefillResultReq)):
-                    # Detailed trace for authorization chain diagnostics
+                # 🔧 Semi-PD + PP: Only DECODE-PP0 receives BatchProcessPrefillResultReq (tokens from PREFILL-PP0)
+                # DECODE-PP1 does not receive tokens via IPC anymore (uses standard PP pipeline instead)
+                if isinstance(obj, GetNextPrefillBatchInput):
+                    # All DECODE PP stages receive GetNextPrefillBatchInput (authorization requests)
                     try:
-                        from sglang.srt.managers.io_struct import GetNextPrefillBatchInput as _G
-                        if isinstance(obj, _G):
-                            semi_pd_log_info_throttle(
-                                logger,
-                                key=f"pp{self.pp_rank}.d.recv.gnpi",
-                                msg=f"[DECODE-PP{self.pp_rank}] <-P GetNextPrefillBatchInput: #rids={len(getattr(obj,'rids',[]) or [])} sample={list(getattr(obj,'rids',[]) or [])[:1]}",
-                                interval_ms=1000,
-                            )
-                    except Exception:
-                        pass
-                    # Throttled low-level ZMQ receive log
-                    try:
-                        if isinstance(obj, BatchProcessPrefillResultReq):
-                            semi_pd_log_info_throttle(
-                                logger,
-                                key=f"pp{self.pp_rank}.d.zmq.recv.presult",
-                                msg=f"[DECODE-PP{self.pp_rank}] ZMQ recv BatchProcessPrefillResultReq rids={list(getattr(obj,'rids',[]) or [])}",
-                                interval_ms=1000,
-                            )
+                        semi_pd_log_info_throttle(
+                            logger,
+                            key=f"pp{self.pp_rank}.d.recv.gnpi",
+                            msg=f"[DECODE-PP{self.pp_rank}] <-P GetNextPrefillBatchInput: #rids={len(getattr(obj,'rids',[]) or [])} sample={list(getattr(obj,'rids',[]) or [])[:1]}",
+                            interval_ms=1000,
+                        )
                     except Exception:
                         pass
                     recv_reqs.append(obj)
+                elif isinstance(obj, BatchProcessPrefillResultReq):
+                    # Only DECODE-PP0 receives BatchProcessPrefillResultReq (tokens from PREFILL-PP0)
+                    if self.pp_rank == 0:
+                        try:
+                            semi_pd_log_info_throttle(
+                                logger,
+                                key=f"pp{self.pp_rank}.d.zmq.recv.presult",
+                                msg=f"[DECODE-PP0] ZMQ recv BatchProcessPrefillResultReq rids={list(getattr(obj,'rids',[]) or [])}",
+                                interval_ms=1000,
+                            )
+                        except Exception:
+                            pass
+                        recv_reqs.append(obj)
+                    else:
+                        # DECODE-PP1 ignores BatchProcessPrefillResultReq (uses standard PP pipeline)
+                        try:
+                            semi_pd_log_info_throttle(
+                                logger,
+                                key=f"pp{self.pp_rank}.d.zmq.ignore.presult",
+                                msg=f"[DECODE-PP{self.pp_rank}] Ignoring BatchProcessPrefillResultReq (not PP0)",
+                                interval_ms=5000,
+                            )
+                        except Exception:
+                            pass
         return recv_reqs
 
     def process_input_requests(self, recv_reqs):
@@ -1280,11 +1325,19 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             filtered = []
             for obj in (recv_reqs or []):
                 if isinstance(obj, dict):
+                    # 🔧 CRITICAL FIX: Only filter Semi-PD control messages, not all dicts!
+                    # Regular requests (TokenizedGenerateReqInput, etc.) should be processed
                     if obj.get("type") == "HELLO_ACK":
                         self._handshake_done = True
                         continue
-                    # drop other control dicts silently
-                    continue
+                    # 🔧 FIX: Don't drop all dicts! Only drop Semi-PD control messages
+                    # Check if this is a Semi-PD control message (has "type" field)
+                    if "type" in obj:
+                        # This is a control message, drop it
+                        logger.debug(f"[DECODE-PP{self.pp_rank}] Dropping Semi-PD control message: type={obj.get('type')}")
+                        continue
+                    # Otherwise, this is a regular request dict, keep it
+                    logger.info(f"[DECODE-PP{self.pp_rank}] Received request dict: keys={list(obj.keys())}")
                 filtered.append(obj)
             return super().process_input_requests(filtered)
         except Exception:

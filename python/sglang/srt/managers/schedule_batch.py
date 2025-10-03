@@ -1466,9 +1466,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                assert (
-                    self.token_to_kv_pool_allocator.available_size() > 0
-                ), "No space left for only one request"
+                # 🔧 CRITICAL FIX: Don't assert, gracefully handle OOM
+                # If no space left, finish the request instead of crashing
+                if self.token_to_kv_pool_allocator.available_size() <= 0:
+                    logger.warning(
+                        f"[RETRACT] No space left for only one request {self.reqs[sorted_indices[0]].rid}, "
+                        f"finishing request gracefully"
+                    )
+                    # Mark the request as finished due to length limit
+                    req = self.reqs[sorted_indices[0]]
+                    req.finished_reason = FINISH_LENGTH()
                 break
 
             first_iter = False

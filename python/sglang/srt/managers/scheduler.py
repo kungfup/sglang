@@ -940,94 +940,82 @@ class Scheduler(
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism with Semi-PD support."""
 
-        # Throttled entry log to confirm loop is running per role/pp
         try:
-            from sglang.srt.utils import semi_pd_log_info_throttle as _th
-            role = getattr(self, 'instance_role', None)
-            pp = getattr(self, 'pp_rank', None)
-            _th(
-                logger,
-                key=f"pp{pp}.sched.loop.enter",
-                msg=f"[SCHED-PP{pp}] ENTER event_loop_pp role={role}",
-                interval_ms=1000,
-            )
-        except Exception:
-            pass
+            # 🔧 CRITICAL: DECODE waits for PREFILL socket to be ready before starting event loop
+            # This ensures the first request forwarding doesn't lose messages
+            from sglang.semi_pd.utils import InstanceRole
+            if getattr(self, 'instance_role', None) == InstanceRole.DECODE:
+                if self.attn_tp_rank == 0 and hasattr(self, '_wait_for_prefill_socket_ready'):
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] event_loop_pp starting, waiting for PREFILL socket ready")
+                    self._wait_for_prefill_socket_ready()
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] PREFILL socket ready, proceeding with event loop")
+                    # 🔧 DEBUG: Force flush to ensure log is written
+                    import sys
+                    sys.stdout.flush()
+                    sys.stderr.flush()
 
-        # 🔧 CRITICAL: DECODE waits for PREFILL socket to be ready before starting event loop
-        # This ensures the first request forwarding doesn't lose messages
-        from sglang.semi_pd.utils import InstanceRole
-        if getattr(self, 'instance_role', None) == InstanceRole.DECODE:
-            if self.attn_tp_rank == 0 and hasattr(self, '_wait_for_prefill_socket_ready'):
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] event_loop_pp starting, waiting for PREFILL socket ready")
-                self._wait_for_prefill_socket_ready()
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] PREFILL socket ready, proceeding with event loop")
+            # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
 
-        # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
+            # 🔧 DEBUG: Log before initializing running_mbs
+            logger.info(f"[PP{getattr(self,'pp_rank','?')}] Initializing event_loop_pp variables...")
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception as e:
+            logger.error(f"[PP{getattr(self,'pp_rank','?')}] CRITICAL ERROR in event_loop_pp initialization: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
         mbs = [None] * self.pp_size
         last_mbs = [None] * self.pp_size
+
+        # 🔧 DEBUG: Log before creating ScheduleBatch
+        logger.info(f"[PP{getattr(self,'pp_rank','?')}] Creating running_mbs with pp_size={self.pp_size}...")
+
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
+
+        # 🔧 DEBUG: Log after creating ScheduleBatch
+        logger.info(f"[PP{getattr(self,'pp_rank','?')}] running_mbs created successfully")
+
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
-        # PREFILL PP send/recv trace counters (throttled)
-        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-            if not hasattr(self, '_pp_trace_send_hits'):
-                self._pp_trace_send_hits = 0
-            if not hasattr(self, '_pp_trace_recv_hits'):
-                self._pp_trace_recv_hits = 0
-
-        # DEBUG: Log before entering while loop
-        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-            logger.info(f"[PREFILL-PP{getattr(self,'pp_rank','?')}] About to enter while True loop")
-
-        _loop_iter = 0
-
-        # DEBUG: Log after _loop_iter initialization
-        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-            logger.info(f"[PREFILL-PP{getattr(self,'pp_rank','?')}] _loop_iter initialized, entering while True")
+        # 🔧 DEBUG: Log before entering main loop
+        logger.info(f"[PP{getattr(self,'pp_rank','?')}] Entering main event loop...")
 
         while True:
-            # DEBUG: Log first entry into while True
-            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-                if not hasattr(self, '_while_true_entered'):
-                    logger.info(f"[PREFILL-PP{getattr(self,'pp_rank','?')}] ENTERED while True loop")
-                    self._while_true_entered = True
-            # DEBUG: Log loop iteration for PREFILL-PP0 only (throttled)
-            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                _loop_iter += 1
-                if _loop_iter <= 5 or _loop_iter % 10000 == 0:
-                    logger.info(f"[PREFILL-PP0] Loop iteration {_loop_iter}")
 
             server_is_idle = True
             for mb_id in range(self.pp_size):
-                # DEBUG: Log mb_id for PREFILL-PP0
-                if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                    if _loop_iter <= 5:
-                        logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} START")
-
-                # Track whether PREFILL sent proxy tensors early in this microbatch (to prevent duplicate PP sends)
-                prefill_proxy_sent_early = False
-
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
-                mbs[mb_id] = self.get_next_batch_to_run()
-                self.running_mbs[mb_id] = self.running_batch
+
+                # 🔧 方案 A：PREFILL batch 管理
+                # - PREFILL-PP0: 保持 batch 直到接收到 token
+                # - PREFILL-PP1: 正常获取新 batch
+
+                # 检查是否需要保持 batch（PREFILL-PP0）
+                is_prefill_pp0_waiting = (
+                    getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                    and self.pp_rank == 0
+                    and mbs[mb_id] is not None
+                    and getattr(mbs[mb_id], '_waiting_for_pp1_token', False)
+                )
+
+                if not is_prefill_pp0_waiting:
+                    # 正常情况：获取下一个 batch
+                    mbs[mb_id] = self.get_next_batch_to_run()
+                    self.running_mbs[mb_id] = self.running_batch
+                # else: PREFILL-PP0 等待 token：保持当前 batch
 
                 self.cur_batch = mbs[mb_id]
-
-                # DEBUG: Log after get_next_batch_to_run for PREFILL-PP0
-                if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                    if _loop_iter <= 5:
-                        logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} cur_batch={'None' if self.cur_batch is None else 'Batch'}")
                 if self.cur_batch:
-
                     server_is_idle = False
                     # Semi-PD PREFILL gating: rely only on role to ensure same-stage handoff always triggers
                     is_semi_pd_prefill = (
@@ -1035,6 +1023,11 @@ class Scheduler(
                     )
                     is_idle_batch = getattr(self.cur_batch, 'forward_mode', None) and self.cur_batch.forward_mode.is_idle()
 
+                    # 🔧 CRITICAL FIX: PREFILL should skip run_batch() for IDLE batches
+                    # This prevents deadlock in PP mode:
+                    # - PREFILL-PP0 skips run_batch() → doesn't send hidden states
+                    # - PREFILL-PP1 must also skip run_batch() → doesn't try to recv hidden states
+                    # Otherwise PREFILL-PP1 will block in tp_worker.recv_tensor_dict()
                     if is_semi_pd_prefill and is_idle_batch:
                         result = None  # Skip any model forward for idle placeholder batches
                     else:
@@ -1042,32 +1035,18 @@ class Scheduler(
                         # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
                         if is_semi_pd_prefill:
                             try:
-                                # throttled scheduler-side call trace
-                                try:
-                                    from sglang.srt.utils import semi_pd_log_info_throttle as _th
-                                    _th(
-                                        logger,
-                                        key=f"pp{getattr(self,'pp_rank','?')}.sched.p_result.call",
-                                        msg=f"[SCHED-PP{getattr(self,'pp_rank','?')}] call process_batch_result for PREFILL (mode={getattr(getattr(self,'cur_batch',''), 'forward_mode', None)})",
-                                        interval_ms=1000,
-                                    )
-                                except Exception:
-                                    pass
                                 self.process_batch_result(self.cur_batch, result)
                             except Exception:
                                 logger.exception("[SEMI_PD_PP] PREFILL handoff failed; continue loop")
 
                 # (last rank) send the outputs to the next step
-                # Semi-PD: Only DECODE instance is responsible for cross-stage token send.
-                # PREFILL instance does not send tokens across stages; it hands off
-                # tokens to same-stage DECODE via IPC, and DECODE performs the PP send.
+                # 🔧 Semi-PD + PP: Both PREFILL and DECODE use standard PP token transmission
+                # PREFILL-PP1 sends tokens to PREFILL-PP0 (standard PP pipeline)
+                # DECODE-PP1 sends tokens to DECODE-PP0 (standard PP pipeline)
+                # PREFILL-PP0 then forwards tokens to DECODE-PP0 via IPC
                 if (
                     self.pp_group is not None
                     and self.pp_group.is_last_rank
-                    and (
-                        not getattr(self.server_args, "enable_semi_pd", False)
-                        or getattr(self, "instance_role", None) == InstanceRole.DECODE
-                    )
                 ):
                     if self.cur_batch and result is not None:
                         next_token_ids, bids[mb_id] = (
@@ -1094,82 +1073,89 @@ class Scheduler(
                             )
                         else:
                             send_tok = {"next_token_ids": next_token_ids}
-                        # TRACE: PP_SEND TOKENS (last DECODE only)
-                        try:
-                            from sglang.srt.utils import semi_pd_log_info_throttle as _th
-                            n_tok = 0
-                            try:
-                                n_tok = len(next_token_ids) if next_token_ids is not None else 0
-                            except Exception:
-                                n_tok = 0
-                            _th(
-                                logger,
-                                key=f"pp{getattr(self,'pp_rank','?')}.decode.pp_send_tok",
-                                msg=f"[PP][DECODE-PP{getattr(self,'pp_rank','?')}] PP_SEND TOKENS n={n_tok}",
-                                interval_ms=1000,
-                            )
-                        except Exception:
-                            pass
                         self.pp_group.send_tensor_dict(
                             send_tok,
                             all_gather_group=self.attn_tp_group,
                         )
 
-
-                # (removed) Early-send for PREFILL: rely on the standard PP send below to keep send/recv pairing simple
-
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
 
-                # DEBUG: Log next_mb_id check for PREFILL-PP0
-                if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                    if _loop_iter <= 5:
-                        logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} next_mb_id={next_mb_id} mbs[next_mb_id]={'None' if mbs[next_mb_id] is None else 'Batch'}")
-
                 next_pp_outputs = None
-                if mbs[next_mb_id] is not None:
-                    # DEBUG: Log before recv_tensor_dict for PREFILL-PP0
-                    if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                        if _loop_iter <= 5:
-                            logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} CALLING recv_tensor_dict()")
-                    # TRACE: mark PP_RECV POST (PREFILL only)
-                    try:
-                        import os as _os
-                        if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
-                            role = getattr(self, 'instance_role', None)
-                            if role is not None and getattr(role, 'name', '') == 'PREFILL':
-                                logger.info(f"[PP][PREFILL-PP{self.pp_rank}] PP_RECV POST")
-                    except Exception:
-                        pass
+                # 🔧 Semi-PD + PP: Both PREFILL and DECODE use standard PP pipeline
+                # No special microbatch handling needed - standard next_mb_id works for both
+                # 🔧 CRITICAL FIX: PREFILL should NOT recv when next batch is IDLE
+                # because PREFILL-PP1 doesn't send anything for IDLE batches (result=None)
+                should_recv = mbs[next_mb_id] is not None
+                if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+                    # PREFILL: Only recv if next batch is NOT idle
+                    is_next_idle = (
+                        mbs[next_mb_id] is not None
+                        and getattr(mbs[next_mb_id], 'forward_mode', None)
+                        and mbs[next_mb_id].forward_mode.is_idle()
+                    )
+                    should_recv = mbs[next_mb_id] is not None and not is_next_idle
 
+                if should_recv:
                     next_pp_outputs = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
 
-                    # Increment recv trace and throttle a summary only for PREFILL
-                    try:
-                        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-                            self._pp_trace_recv_hits += 1
-                            from sglang.srt.utils import semi_pd_log_info_throttle as _th
-                            _th(
-                                logger,
-                                key=f"pp{getattr(self,'pp_rank','?')}.prefill.pp_recv",
-                                msg=(
-                                    f"[PREFILL-PP{getattr(self,'pp_rank','?')}] TRACE PP_RECV hits={getattr(self,'_pp_trace_recv_hits',0)}"
-                                ),
-                                interval_ms=1000,
-                            )
-                    except Exception:
-                        pass
+                    # 🔧 CRITICAL FIX: Semi-PD DECODE-PP>0 needs to sync batch with PP0
+                    # When DECODE-PP1 receives hidden states from PP0, it needs to create a batch
+                    # This is similar to how PREFILL-PP1 works
+                    # We infer batch size from hidden states shape
+                    if (getattr(self.server_args, 'enable_semi_pd', False)
+                        and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+                        and self.pp_rank > 0
+                        and next_pp_outputs is not None
+                        and "hidden_states" in next_pp_outputs.tensors):
+                        # Check if we need to create a batch
+                        if self.running_batch.is_empty():
+                            # Infer batch size from hidden states
+                            hidden_states = next_pp_outputs["hidden_states"]
+                            batch_size = hidden_states.shape[0]
+                            if batch_size > 0:
+                                # Create dummy requests for the batch
+                                # These are placeholder requests that will be updated by PP0's data
+                                # Note: Req and ScheduleBatch are already imported at the top of the file
+                                from sglang.srt.sampling.sampling_params import SamplingParams
+                                dummy_reqs = []
+                                for i in range(batch_size):
+                                    # Create a minimal dummy request with required attributes
+                                    dummy_req = Req(
+                                        rid=f"pp{self.pp_rank}_dummy_{i}",
+                                        input_text="",
+                                        input_ids=[0],  # At least one token
+                                        sampling_params=SamplingParams(),  # Default sampling params
+                                    )
+                                    # Set required attributes for decode
+                                    dummy_req.output_ids = []
+                                    dummy_req.finished_reason = None
+                                    dummy_reqs.append(dummy_req)
 
+                                # Create a decode batch with dummy requests
+                                # ScheduleBatch is already imported at the top of the file
+                                self.running_batch = ScheduleBatch.init_new(
+                                    reqs=dummy_reqs,
+                                    req_to_token_pool=self.req_to_token_pool,
+                                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                                    tree_cache=self.tree_cache,
+                                    model_config=self.model_config,
+                                    enable_overlap=getattr(self, 'enable_overlap', False),
+                                    spec_algorithm=getattr(self, 'spec_algorithm', None),
+                                    enable_custom_logit_processor=getattr(self, 'enable_custom_logit_processor', False),
+                                )
+                                logger.info(f"[DECODE-PP{self.pp_rank}] Created batch from hidden states: batch_size={batch_size}")
 
                     # In PP, only the stage following the last rank receives tokens.
                     # Other stages will receive hidden-state proxies without 'next_token_ids'.
                     if next_pp_outputs is not None and "next_token_ids" in next_pp_outputs.tensors:
                         mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
 
+                    # DEBUG: Log received tensors (optional trace)
                     if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes") and next_pp_outputs is not None:
                         try:
                             ks = list(next_pp_outputs.tensors.keys())
@@ -1185,6 +1171,10 @@ class Scheduler(
                         except Exception:
                             pass
 
+                    # Process received tensors (always, not just in TRACE mode!)
+                    # 🔧 CRITICAL FIX: Only process as tokens if 'next_token_ids' is present
+                    # PP0 receives tokens from PP1, other stages receive hidden states
+                    if next_pp_outputs is not None and "next_token_ids" in next_pp_outputs.tensors:
                         logits_output_args = {
                             k[len("logits_output.") :]: v
                             for k, v in next_pp_outputs.tensors.items()
@@ -1194,6 +1184,11 @@ class Scheduler(
                             LogitsProcessorOutput(**logits_output_args)
                             if len(logits_output_args) > 0
                             else None
+                        )
+                        # 🔧 CRITICAL FIX: result might be None (e.g., for IDLE batches)
+                        # Use False as default for can_run_cuda_graph when result is None
+                        can_run_cuda_graph = (
+                            result.can_run_cuda_graph if result is not None else False
                         )
                         output_result = GenerationBatchResult(
                             logits_output=logits_output,
@@ -1206,10 +1201,30 @@ class Scheduler(
                                 "extend_logprob_start_len_per_req", None
                             ),
                             bid=bids[next_mb_id],
-                            can_run_cuda_graph=result.can_run_cuda_graph,
+                            can_run_cuda_graph=can_run_cuda_graph,
                         )
                         self.process_batch_result(mbs[next_mb_id], output_result)
                         last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                        # 🔧 方案 1：PREFILL-PP0 在转发 token 后清空 batch
+                        if (
+                            getattr(self, 'instance_role', None) == InstanceRole.PREFILL
+                            and self.pp_rank == 0
+                            and mbs[next_mb_id] is not None
+                            and not getattr(mbs[next_mb_id], '_waiting_for_pp1_token', False)
+                        ):
+                            # batch 已经转发了 token，可以清空了
+                            try:
+                                from sglang.srt.utils import semi_pd_log_info_throttle
+                                semi_pd_log_info_throttle(
+                                    logger,
+                                    key=f"pp0.prefill.clear_batch",
+                                    msg=f"[PREFILL-PP0] Clearing batch after forwarding token mb_id={next_mb_id}",
+                                    interval_ms=1000,
+                                )
+                            except Exception:
+                                pass
+                            mbs[next_mb_id] = None
 
                 # (not last rank)
                 if self.pp_group is not None and not self.pp_group.is_last_rank:
@@ -1226,11 +1241,6 @@ class Scheduler(
                     # send out reqs to the next stage
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
-                        # DEBUG: Log before point_to_point_pyobj for PREFILL-PP0
-                        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                            if _loop_iter <= 5:
-                                logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} BEFORE point_to_point_pyobj recv_reqs={len(recv_reqs) if recv_reqs else 0}")
-
                         # Semi-PD: forward only work-plane messages across PP stages (strict whitelist)
                         try:
                             from sglang.srt.managers.io_struct import (
@@ -1266,15 +1276,12 @@ class Scheduler(
                                 except Exception:
                                     pass
 
-                        # DEBUG: Log before actual call for PREFILL-PP0
-                        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                            if _loop_iter <= 5:
-                                logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} CALLING point_to_point_pyobj fwd_reqs={len(fwd_reqs) if fwd_reqs else 0}")
-
-                        # 🔧 CRITICAL: Semi-PD PREFILL doesn't forward requests via point_to_point_pyobj
-                        # - PREFILL-PP0: receives work via IPC from DECODE-PP0 (not via tokenizer)
-                        # - PREFILL-PP>0: receives hidden states via recv_tensor_dict() (not via point_to_point_pyobj)
-                        # Skip point_to_point_pyobj to avoid blocking
+                        # 🔧 CRITICAL FIX: Semi-PD PREFILL doesn't forward requests via point_to_point_pyobj
+                        # - PREFILL: receives work via IPC from DECODE, doesn't use point_to_point_pyobj
+                        # - DECODE: uses normal PP flow, forwards requests via point_to_point_pyobj
+                        #   * DECODE-PP0: receives TokenizedGenerateReqInput from tokenizer
+                        #   * DECODE-PP0: forwards TokenizedGenerateReqInput to DECODE-PP1 via point_to_point_pyobj
+                        #   * DECODE-PP1: receives TokenizedGenerateReqInput and forwards to PREFILL-PP1 via IPC
                         if not (getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL):
                             point_to_point_pyobj(
                                 fwd_reqs,
@@ -1283,11 +1290,6 @@ class Scheduler(
                                 self.pp_rank * self.tp_size + dp_offset,
                                 (self.pp_rank + 1) * self.tp_size + dp_offset,
                             )
-
-                        # DEBUG: Log after point_to_point_pyobj for PREFILL-PP0
-                        if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                            if _loop_iter <= 5:
-                                logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} AFTER point_to_point_pyobj (skipped for Semi-PD)")
 
                     # send out proxy tensors to the next stage
                     # Send out proxy tensors to the next stage (EXTEND path on PREFILL)
@@ -1315,35 +1317,28 @@ class Scheduler(
 
                 pp_outputs = next_pp_outputs
 
-                # DEBUG: Log end of mb_id for PREFILL-PP0
-                if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                    if _loop_iter <= 5:
-                        logger.info(f"[PREFILL-PP0] Loop {_loop_iter} mb_id={mb_id} END")
-
-            # DEBUG: Log end of for loop for PREFILL-PP0
-            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                if _loop_iter <= 5:
-                    logger.info(f"[PREFILL-PP0] Loop {_loop_iter} FOR LOOP DONE, server_is_idle={server_is_idle}")
-
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
-            # DEBUG: Log end of while iteration for PREFILL-PP0
-            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL and getattr(self, 'pp_rank', -1) == 0:
-                if _loop_iter <= 5:
-                    logger.info(f"[PREFILL-PP0] Loop {_loop_iter} WHILE ITERATION DONE")
-
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        # Semi-PD PREFILL: ALL PP stages don't recv requests from tokenizer or previous PP stage
+        # 🔧 CRITICAL FIX: Semi-PD PREFILL doesn't recv requests via point_to_point_pyobj
         # - PREFILL-PP0: receives work via IPC from DECODE-PP0 (not via tokenizer)
-        # - PREFILL-PP>0: receives hidden states via recv_tensor_dict() (not via point_to_point_pyobj)
-        # Both return empty list to avoid blocking on request reception
-        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
-            return []
+        # - PREFILL-PP>0: receives work via IPC from DECODE-PP>0 (forwarded by DECODE-PP0)
+        # - DECODE-PP0: receives work from tokenizer via ZMQ (normal flow)
+        # - DECODE-PP>0: receives work from DECODE-PP0 via point_to_point_pyobj (normal PP flow)
+        from sglang.semi_pd.utils import InstanceRole
+        if getattr(self.server_args, 'enable_semi_pd', False):
+            if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
+                # PREFILL: ALL PP stages skip point_to_point_pyobj, receive via IPC from DECODE
+                return []
+            # 🔧 FIX: DECODE-PP>0 should receive requests via point_to_point_pyobj from DECODE-PP0
+            # Then forward them to PREFILL-PP>0 via IPC
+            # Don't skip point_to_point_pyobj for DECODE!
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
@@ -1351,6 +1346,9 @@ class Scheduler(
                 while True:
                     try:
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        # 🔧 DEBUG: Log received requests
+                        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.DECODE:
+                            logger.info(f"[DECODE-PP{self.pp_rank}] recv_from_tokenizer: {type(recv_req).__name__}")
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1358,10 +1356,17 @@ class Scheduler(
                 while True:
                     try:
                         recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        # 🔧 DEBUG: Log received RPC
+                        if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.DECODE:
+                            logger.info(f"[DECODE-PP{self.pp_rank}] recv_from_rpc: {type(recv_rpc).__name__}")
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
                 # Semi-PD: 不再从CPU控制面接收token回送，完全复用原生PP事件循环
+
+                # 🔧 DEBUG: Log total received requests
+                if recv_reqs and getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.DECODE:
+                    logger.info(f"[DECODE-PP{self.pp_rank}] Total recv_reqs: {len(recv_reqs)}")
             else:
                 recv_reqs = None
         else:

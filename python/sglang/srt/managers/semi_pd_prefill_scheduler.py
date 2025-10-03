@@ -243,6 +243,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             ps_gen = 0
             ps_auth = 0
             it = 0
+            consecutive_again = 0  # 🔧 FIX: Track consecutive zmq.Again
+            max_consecutive_again = 5  # 🔧 FIX: Allow up to 5 consecutive zmq.Again before giving up
+
             # Debug: log socket state before recv loop
             try:
                 import os as _os
@@ -255,6 +258,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 it += 1
                 try:
                     obj = self.recv_from_decode_forwarded.recv_pyobj(zmq.NOBLOCK)
+                    consecutive_again = 0  # 🔧 FIX: Reset counter on successful recv
                     # Debug: log successful recv
                     try:
                         import os as _os
@@ -263,14 +267,18 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     except Exception:
                         pass
                 except zmq.Again:
-                    # Debug: log zmq.Again
-                    try:
-                        import os as _os
-                        if _os.getenv("SGLANG_SEMIPD_TRACE") == "1" and it == 1:
-                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain zmq.Again on first iteration")
-                    except Exception:
-                        pass
-                    break
+                    consecutive_again += 1  # 🔧 FIX: Increment counter
+                    # 🔧 DEBUG: Log zmq.Again (only first few times to avoid log flood)
+                    # Suppress verbose logging unless SGLANG_SEMIPD_TRACE is enabled
+                    if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                        if consecutive_again <= 3:
+                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain zmq.Again at it={it} consecutive={consecutive_again} ps_gen={ps_gen} ps_auth={ps_auth}")
+                    # 🔧 FIX: Only break after multiple consecutive zmq.Again
+                    if consecutive_again >= max_consecutive_again:
+                        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain giving up after {consecutive_again} consecutive zmq.Again")
+                        break
+                    continue  # 🔧 FIX: Continue trying instead of breaking immediately
                 except Exception as e:
                     try:
                         logger.error(f"[PREFILL-PP{self.pp_rank}] _drain recv exception: {e}")
@@ -361,6 +369,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 )
             except Exception:
                 pass
+
+            # 🔧 DEBUG: Log function exit (only if we received something)
+            if ps_gen > 0 or ps_auth > 0:
+                logger.info(f"[PREFILL-PP{self.pp_rank}] _drain_with_poller_pp0 EXIT: ps_gen={ps_gen} ps_auth={ps_auth} inbox={len(self._auth_inbox)}")
+
             return (ps_gen, ps_auth)
         except Exception:
             return (0, 0)
@@ -528,17 +541,24 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         This ensures PP event loop doesn't block while maintaining Semi-PD authorization flow.
         """
-        # DEBUG: Log entry for PREFILL-PP0 (throttled)
-        if getattr(self, 'pp_rank', -1) == 0:
-            if not hasattr(self, '_gnbtr_call_count'):
-                self._gnbtr_call_count = 0
-            self._gnbtr_call_count += 1
-            if self._gnbtr_call_count <= 5 or self._gnbtr_call_count % 10000 == 0:
-                logger.info(f"[PREFILL-PP0] get_next_batch_to_run() called #{self._gnbtr_call_count}")
+        # 🔧 DEBUG: Log function entry (throttled to avoid log flood)
+        # Suppress verbose logging unless SGLANG_SEMIPD_TRACE is enabled
+        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+            wq_len = len(self.waiting_queue)
+            inbox_len = len(getattr(self, '_auth_inbox', []))
+            if wq_len > 0 or inbox_len > 0:
+                logger.info(f"[PREFILL-PP{self.pp_rank}] get_next_batch_to_run ENTER: wq={wq_len} inbox={inbox_len}")
 
-        # 🔧 CRITICAL: Drain forwarded requests and authorizations (NON-BLOCKING)
+        # 🔧 CRITICAL: Drain forwarded requests and authorizations using the proper drain function
         # This must happen in every call to ensure we don't miss messages
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.pp_rank == 0:
+            # PP0: Use the dedicated drain function
+            try:
+                self._drain_with_poller_pp0(max_iters=100, timeout_ms=5)  # 🔧 增加到100次
+            except Exception as e:
+                logger.warning(f"[PREFILL-PP{self.pp_rank}] Drain exception: {e}")
+        elif self.attn_tp_rank == 0:
+            # PP>0: Use simple drain loop
             try:
                 while True:
                     try:
@@ -569,8 +589,20 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         # In Semi-PD PP mode, ALL PP stages should have requests in waiting_queue
         # - PP0: receives requests from DECODE-PP0 via IPC
         # - PP>0: receives requests from DECODE-PP>0 via IPC (forwarded from DECODE-PP0 via point_to_point_pyobj)
-        if not self.waiting_queue:
-            return None
+
+        # 🔧 If no requests in waiting_queue, check if we have authorization in inbox
+        # If we have authorization, it means DECODE sent it but we haven't received the request yet
+        # In this case, we should NOT return IDLE batch, but wait for the request
+        has_pending_auth = (
+            self.attn_tp_rank == 0
+            and hasattr(self, '_auth_inbox')
+            and self._auth_inbox
+        )
+
+        if not self.waiting_queue and not has_pending_auth:
+            # No requests and no pending authorization: return IDLE batch for PP warmup
+            # This prevents CPU spinning and allows PREFILL to complete warmup
+            return self.get_idle_batch()
 
         # 🔧 ALL PP stages: Propose candidates to same-stage DECODE (if not already waiting for authorization)
         if self.attn_tp_rank == 0:
@@ -692,59 +724,100 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         except Exception:
             pass
 
-        # 在最后PP段，无论是否产生token，都通知同段DECODE继续（空列表表示仅完成EXTEND）
-        if is_last_pp_stage:
-            # Be robust if result is None
-            next_token_ids_list = []
-            next_token_logits = None
-            if result is not None and getattr(result, 'next_token_ids', None) is not None:
+        # 🔧 方案 1：让 PREFILL-PP0 保持 batch 直到接收到 token
+
+        # 对于 PREFILL-PP0：
+        # - EXTEND 完成后，不立即清空 batch
+        # - 标记 batch 为 "等待 PP1 的 token"
+        # - batch 会在 event_loop_pp 的下一个 microbatch 中接收 token
+        # - 接收到 token 后，通过 IPC 转发给 DECODE-PP0，然后清空 batch
+
+        if self.pp_rank == 0:
+            # PREFILL-PP0: 标记 batch 为 "等待 token"
+            # 不调用父类的清空逻辑，让 batch 保持在 mbs 数组中
+            if batch is not None:
+                batch._waiting_for_pp1_token = True
+            # 不调用父类逻辑，直接返回
+            return
+
+        # 对于 PREFILL-PP1：
+        # - EXTEND 完成后，token 会通过标准 PP 逻辑发送给 PP0
+        # - 调用父类逻辑处理结果
+        # - 不需要清空 batch，因为 event_loop_pp 会在下一个循环中调用 get_next_batch_to_run()
+
+        # 调用父类逻辑处理结果
+        super().process_batch_result_prefill(batch, result, launch_done)
+
+    def process_batch_result(
+        self,
+        batch: ScheduleBatch,
+        result,
+        launch_done = None,
+    ):
+        """
+        🔧 方案 1：PREFILL-PP0 接收到来自 PREFILL-PP1 的 token 后，转发给 DECODE-PP0
+
+        流程：
+        1. PREFILL-PP0 在 mb_id=0 时处理 EXTEND，标记 batch 为 "等待 token"
+        2. PREFILL-PP1 在 mb_id=0 时生成 token，通过 NCCL 发送给 PREFILL-PP0
+        3. PREFILL-PP0 在 mb_id=1 时接收 token，调用此方法
+        4. 此方法将 token 通过 IPC 转发给 DECODE-PP0
+        5. 清空 batch，完成流水线
+        """
+        # 检查是否是 PREFILL-PP0 接收到 token
+        if (
+            self.pp_rank == 0
+            and batch is not None
+            and getattr(batch, '_waiting_for_pp1_token', False)
+            and result is not None
+            and hasattr(result, 'next_token_ids')
+            and result.next_token_ids is not None
+        ):
+            # PREFILL-PP0 接收到来自 PREFILL-PP1 的 token
+            # 通过 IPC 转发给 DECODE-PP0
+            try:
+                next_token_ids_list = []
                 try:
                     next_token_ids_list = result.next_token_ids.tolist()
                 except Exception:
                     next_token_ids_list = list(result.next_token_ids)
-            try:
-                if (
-                    result is not None
-                    and getattr(batch, 'return_logprob', False)
-                    and getattr(result, 'logits_output', None) is not None
-                ):
-                    next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
-            except Exception:
-                pass
-            rids = [r.rid for r in batch.reqs]
-            # diag: will send (always-throttled)
-            try:
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{pp_rank}.p2d.send.will",
-                    msg=f"[PREFILL-PP{pp_rank}] →D will send prefill_result: tokens={len(next_token_ids_list)} rids={rids}",
-                    interval_ms=1000,
-                )
-            except Exception:
-                pass
-            req = BatchProcessPrefillResultReq(
-                rids=rids,
-                next_token_ids=next_token_ids_list,
-                next_token_logits=next_token_logits,
-            )
-            self.send_to_d_instance.send_pyobj(req)
-            # diag: sent (always-throttled)
-            try:
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{pp_rank}.p2d.send.done",
-                    msg=f"[PREFILL-PP{pp_rank}] →D sent prefill_result",
-                    interval_ms=1000,
-                )
-            except Exception:
-                pass
-            return
-        # 非最后段：不处理tokens，也不调用父类；让 event_loop_pp 根据
-        # result.pp_hidden_states_proxy_tensors 自动触发原生PP跨段发送。
-        # 这里直接返回，避免父类按 next_token_ids 逻辑进行 zip(...) 而报错。
-        return
 
+                next_token_logits = None
+                try:
+                    if (
+                        getattr(batch, 'return_logprob', False)
+                        and hasattr(result, 'logits_output')
+                        and result.logits_output is not None
+                    ):
+                        next_token_logits = result.logits_output.next_token_logits.cpu().numpy()
+                except Exception:
+                    pass
 
+                rids = [r.rid for r in batch.reqs]
+
+                # IPC 发送给 DECODE-PP0
+                from sglang.srt.managers.io_struct import BatchProcessPrefillResultReq
+                req = BatchProcessPrefillResultReq(
+                    rids=rids,
+                    next_token_ids=next_token_ids_list,
+                    next_token_logits=next_token_logits,
+                )
+                self.send_to_d_instance.send_pyobj(req)
+
+                # 清除标记，batch 可以被清空了
+                batch._waiting_for_pp1_token = False
+
+                # 🔧 重要：手动清空 batch
+                # 因为 process_batch_result_prefill() 直接返回，不会清空 batch
+                # 所以我们需要在这里手动清空
+                # 注意：不调用父类逻辑，因为 batch 已经处理完成
+                return
+
+            except Exception as e:
+                logger.error(f"[PREFILL-PP0] Failed to forward tokens to DECODE-PP0: {e}")
+
+        # 调用父类逻辑处理其他情况
+        super().process_batch_result(batch, result, launch_done)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         logger.info("Ignore flush cache request")
