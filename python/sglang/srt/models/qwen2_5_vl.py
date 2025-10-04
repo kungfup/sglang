@@ -739,6 +739,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # NOTE: The sglang loader will only pass the relevant weights for
         # the modules that exist on this rank.
+
+        # Check if VIT Scheduler is enabled
+        enable_vit_scheduler = os.environ.get("SGLANG_VIT_SCHEDULER_ENABLED", "0") == "1"
+
         prefix_map = {
             "model.": "model.",
             "lm_head.": "lm_head.",
@@ -746,6 +750,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         }
         params_dict = dict(self.named_parameters())
         for name, tensor in weights:
+            # Skip ViT weights if VIT Scheduler is enabled
+            if enable_vit_scheduler and name.startswith("visual."):
+                logger.info(f"[VIT Scheduler] Skipping ViT weight: {name}")
+                continue
             # Special case for llava, which has a different prefix
             if name.startswith("visual.vision_tower.vision_model."):
                 sglang_name = name.replace(

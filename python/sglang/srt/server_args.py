@@ -92,6 +92,14 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
 
+    # VIT Scheduler options (for VLM models)
+    enable_vit_scheduler: bool = False
+    vit_scheduler_port: int = 5555
+    vit_scheduler_device: str = "cuda:0"
+    vit_scheduler_batch_size: int = 4
+    vit_scheduler_batch_timeout_ms: float = 10.0
+    vit_scheduler_cache_size_mb: int = 1024
+
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
@@ -853,6 +861,43 @@ class ServerArgs:
             type=int,
             default=ServerArgs.gpu_id_step,
             help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        )
+
+        # VIT Scheduler options (for VLM models)
+        parser.add_argument(
+            "--enable-vit-scheduler",
+            action="store_true",
+            help="Enable VIT Scheduler for VLM models. This will offload ViT computation to a separate process.",
+        )
+        parser.add_argument(
+            "--vit-scheduler-port",
+            type=int,
+            default=ServerArgs.vit_scheduler_port,
+            help="The ZMQ port for VIT Scheduler communication.",
+        )
+        parser.add_argument(
+            "--vit-scheduler-device",
+            type=str,
+            default=ServerArgs.vit_scheduler_device,
+            help="The device for VIT Scheduler (e.g., cuda:0, cuda:1).",
+        )
+        parser.add_argument(
+            "--vit-scheduler-batch-size",
+            type=int,
+            default=ServerArgs.vit_scheduler_batch_size,
+            help="The maximum batch size for VIT Scheduler.",
+        )
+        parser.add_argument(
+            "--vit-scheduler-batch-timeout-ms",
+            type=float,
+            default=ServerArgs.vit_scheduler_batch_timeout_ms,
+            help="The batch timeout in milliseconds for VIT Scheduler.",
+        )
+        parser.add_argument(
+            "--vit-scheduler-cache-size-mb",
+            type=int,
+            default=ServerArgs.vit_scheduler_cache_size_mb,
+            help="The embedding cache size in MB for VIT Scheduler.",
         )
 
         # Logging

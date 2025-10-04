@@ -257,15 +257,23 @@ def _get_precomputed_embedding(
 ) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_features, return their concatenation.
-    If some but not all have precomputed_features, raise NotImplementedError.
+    If some but not all have precomputed_features, clear all and return None (fallback to sync compute).
     If none have precomputed_features, return None.
     """
     precomputed_features = [item.precomputed_features for item in items]
     if any(feature is not None for feature in precomputed_features):
         if not all(feature is not None for feature in precomputed_features):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
+            # Mixed state detected: some items precomputed, some not
+            # This can happen when VIT Scheduler timeout causes partial failures in a batch
+            # Clear all precomputed features and fallback to synchronous computation
+            logger.warning(
+                f"[MM Utils] Mixed precomputed state detected in batch: "
+                f"{sum(1 for f in precomputed_features if f is not None)}/{len(precomputed_features)} items precomputed. "
+                f"Clearing all and falling back to synchronous ViT computation."
             )
+            for item in items:
+                item.precomputed_features = None
+            return None
         result = torch.concat(precomputed_features)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])

@@ -505,6 +505,11 @@ class Req:
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
+        # 🔧 修复：初始化 vit_pending 属性
+        # 这对于 PP 模式很重要，确保所有请求对象都有这个属性
+        # False 表示不需要等待 VIT 计算（默认值）
+        self.vit_pending: bool = False
+
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices = []

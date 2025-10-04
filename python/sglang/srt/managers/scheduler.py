@@ -109,6 +109,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    Modality,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -445,6 +446,34 @@ class Scheduler(
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
 
+        # Init VIT Scheduler Client (for VLM models)
+        self.vit_client = None
+        if self.model_config.is_multimodal and self.pp_group.is_first_rank:
+            enable_vit_scheduler = os.environ.get("SGLANG_VIT_SCHEDULER_ENABLED", "0") == "1"
+            if enable_vit_scheduler:
+                from sglang.srt.managers.vit_scheduler_client import VITSchedulerClient
+
+                vit_zmq_host = os.environ.get("SGLANG_VIT_SCHEDULER_HOST", "localhost")
+                vit_zmq_port = int(os.environ.get("SGLANG_VIT_SCHEDULER_PORT", "5555"))
+                vit_timeout_ms = int(os.environ.get("SGLANG_VIT_SCHEDULER_TIMEOUT_MS", "5000"))
+
+                self.vit_client = VITSchedulerClient(
+                    zmq_host=vit_zmq_host,
+                    zmq_port=vit_zmq_port,
+                    timeout_ms=vit_timeout_ms,
+                    enable=True,
+                )
+
+                logger.info(
+                    f"[Scheduler] VIT Scheduler Client initialized: "
+                    f"host={vit_zmq_host}, port={vit_zmq_port}, timeout={vit_timeout_ms}ms"
+                )
+                # Local cache for VIT embeddings to bridge races between worker drain and queue state
+                self._vit_embedding_cache: Dict[str, torch.Tensor] = {}
+
+            else:
+                logger.info("[Scheduler] VIT Scheduler disabled, using synchronous ViT computation")
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -657,6 +686,9 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            # Poll VIT results (async)
+            self.poll_vit_results()
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -678,6 +710,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Poll VIT results (async)
+            self.poll_vit_results()
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -725,6 +760,10 @@ class Scheduler(
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
         while True:
+            # 🔧 修复：在循环开始就轮询 VIT 结果
+            # 这样即使 PP 通信阻塞，也能在下一次循环时获取 VIT 结果
+            self.poll_vit_results()
+
             server_is_idle = True
             for mb_id in range(self.pp_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -732,6 +771,7 @@ class Scheduler(
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
+
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -795,13 +835,29 @@ class Scheduler(
                     # send out reqs to the next stage
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
-                        point_to_point_pyobj(
-                            recv_reqs,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.cpu_group,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
-                        )
+                        # 🔧 流水线并行修复：不要在这里转发请求给 PP1
+                        # PP0 应该等待 VIT 完成后，在 Prefill 阶段才转发 hidden states
+                        # 这样 PP0 才能正确处理 VIT embedding 并进行 Prefill
+                        # recv_reqs 只包含新到达的请求，不应该在这里转发
+                        # 正确的流程：
+                        # 1. PP0 收到请求 → 提交 VIT 任务 → 加入 waiting_queue
+                        # 2. PP0 等待 VIT 完成 → poll_vit_results() 更新 embedding
+                        # 3. PP0 Prefill → 发送 hidden states 给 PP1
+                        # 4. PP1 收到 hidden states → 继续处理
+
+                        # 注意：这里的 recv_reqs 是从 tokenizer 收到的新请求
+                        # 不应该转发给 PP1，因为 PP0 还没有处理 Prefill
+                        # PP1 会在 PP0 Prefill 后通过 hidden states 接收到请求信息
+
+                        # 因此，注释掉这段代码：
+                        # point_to_point_pyobj(
+                        #     recv_reqs,
+                        #     self.pp_rank * self.tp_size + dp_offset,
+                        #     self.world_group.cpu_group,
+                        #     self.pp_rank * self.tp_size + dp_offset,
+                        #     (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        # )
+                        pass
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
@@ -839,15 +895,12 @@ class Scheduler(
             else:
                 recv_reqs = None
         else:
+            # 🔧 修复：PP1+ 不应该从 PP0 接收新请求
+            # 在流水线并行中，PP0 应该先处理 VIT + Prefill，然后通过 hidden states 传递给 PP1
+            # PP1 不需要接收原始请求，只需要接收 hidden states
+            # 因此，PP1+ 的 recv_requests() 应该返回空列表
             if self.attn_tp_rank == 0:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.pp_rank - 1) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
-                )
+                recv_reqs = []
             else:
                 recv_reqs = None
 
@@ -893,6 +946,15 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        # 🔧 修复：确保所有接收到的请求都有 vit_pending 属性
+        # 这对于 PP 模式很重要，因为 PP1 接收的请求可能没有这个属性
+        if recv_reqs is not None:
+            for recv_req in recv_reqs:
+                # 只处理 Req 对象（不是控制请求）
+                if hasattr(recv_req, 'rid') and not hasattr(recv_req, 'vit_pending'):
+                    recv_req.vit_pending = False
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -953,6 +1015,12 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # 🔧 修复：在 PP 模式下，从 TokenizedGenerateReqInput 中读取 vit_pending
+            # 这样 PP1 就能知道 PP0 是否已经提交了 VIT 任务
+            if hasattr(recv_req, 'vit_pending'):
+                req.vit_pending = recv_req.vit_pending
+                logger.info(f"[Scheduler] 🔄 Inherited vit_pending={recv_req.vit_pending} from recv_req for {req.rid}")
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
@@ -990,6 +1058,48 @@ class Scheduler(
                 req.origin_input_ids, image_inputs
             )
             req.extend_image_inputs(image_inputs)
+
+            # Submit ViT computation to VIT Scheduler (if enabled) - ASYNC
+            if self.vit_client is not None and req.multimodal_inputs is not None:
+                vit_submitted = False
+                image_count = 0
+                for mm_item in req.multimodal_inputs.mm_items:
+                    if mm_item.modality == Modality.IMAGE and mm_item.pixel_values is not None:
+                        image_count += 1
+                        # 异步提交 ViT 任务（立即返回，不等待）
+                        # 诊断日志：确认 vit_client 实例与线程
+                        try:
+                            import threading as _thr
+                            logger.info(
+                                f"[Scheduler] VIT submit thread={_thr.current_thread().name}, "
+                                f"vit_client_id={id(self.vit_client)}, pending_dict_id={id(self.vit_client.pending_requests)}"
+                            )
+                        except Exception:
+                            pass
+                        success = self.vit_client.submit_async(
+                            request_id=req.rid,
+                            pixel_values=mm_item.pixel_values,
+                            image_grid_thw=mm_item.image_grid_thw,
+                        )
+
+                        if success:
+                            vit_submitted = True
+                            logger.info(f"[Scheduler] ✅ VIT task submitted for request {req.rid}")
+                        else:
+                            logger.warning(f"[Scheduler] ⚠️ Failed to submit VIT task for request {req.rid}")
+                            break
+
+                # 标记请求为等待 VIT 计算
+                if vit_submitted:
+                    req.vit_pending = True
+                    # 🔧 修复：在 PP 模式下，也设置 recv_req.vit_pending
+                    # 这样 PP0 发送给 PP1 的请求就会包含 vit_pending 信息
+                    recv_req.vit_pending = True
+                    logger.info(f"[Scheduler] 🕐 Request {req.rid} marked as vit_pending (images={image_count})")
+                else:
+                    req.vit_pending = False
+                    recv_req.vit_pending = False
+                    logger.info(f"[Scheduler] ⚠️ Request {req.rid} NOT marked as vit_pending")
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1070,6 +1180,102 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def poll_vit_results(self):
+        """轮询 VIT Scheduler 的计算结果（异步）"""
+        if self.vit_client is None:
+            return
+
+        # 强制日志：确认此方法被调用
+        if hasattr(self, '_poll_count'):
+            self._poll_count += 1
+        else:
+            self._poll_count = 1
+            logger.info(f"[Scheduler] 🔍 poll_vit_results() is being called")
+
+        # 每 100 次打印一次
+        if self._poll_count % 100 == 0:
+            pending_count = sum(1 for req in self.waiting_queue if hasattr(req, 'vit_pending') and req.vit_pending)
+            try:
+                import threading as _thr
+                res_len = 0
+                try:
+                    res_len = len(getattr(self.vit_client, "_results", {}) or {})
+                except Exception:
+                    res_len = -1
+                logger.info(
+                    f"[Scheduler] 🔍 poll_vit_results() called {self._poll_count} times, pending={pending_count}; "
+                    f"thread={_thr.current_thread().name}, vit_client_id={id(self.vit_client)}, pending_len={len(self.vit_client.pending_requests)}, results_len={res_len}"
+                )
+            except Exception:
+                logger.info(f"[Scheduler] 🔍 poll_vit_results() called {self._poll_count} times, pending={pending_count}")
+
+        # 获取所有已完成的 VIT 计算结果
+        _res_len_before = 0
+        try:
+            _res_len_before = len(getattr(self.vit_client, "_results", {}) or {})
+        except Exception:
+            pass
+        results = self.vit_client.poll_results()
+        _res_len_after = 0
+        try:
+            _res_len_after = len(getattr(self.vit_client, "_results", {}) or {})
+        except Exception:
+            pass
+
+        if not results:
+            # 检查是否有等待 VIT 的请求
+            pending_count = sum(1 for req in self.waiting_queue if hasattr(req, 'vit_pending') and req.vit_pending)
+            if pending_count > 0 or _res_len_before > 0:
+                logger.info(
+                    f"[Scheduler]  No VIT results drained this round. pending={pending_count}, "
+                    f"client_results_len_before={_res_len_before}, after={_res_len_after}"
+                )
+            return
+
+        logger.info(f"[Scheduler]  Received {len(results)} VIT results (client_results_len_before={_res_len_before} -> after={_res_len_after})")
+
+        # 更新对应请求的 precomputed_features
+        for request_id, embedding in results.items():
+            found = False
+            # 在 waiting_queue 中查找请求
+            for req in self.waiting_queue:
+                if req.rid == request_id and hasattr(req, 'vit_pending') and req.vit_pending:
+                    # 找到了！更新 embedding
+                    if req.multimodal_inputs is not None:
+                        for mm_item in req.multimodal_inputs.mm_items:
+                            if mm_item.modality == Modality.IMAGE:
+                                _emb = embedding.to(self.device)
+                                mm_item.precomputed_features = _emb
+                                try:
+                                    logger.info(
+                                        f"[Scheduler] ✅ VIT embedding ready for request {req.rid}; "
+                                        f"shape={tuple(_emb.shape)}, dtype={_emb.dtype}, device={_emb.device}"
+                                    )
+                                except Exception:
+                                    logger.info(f"[Scheduler] ✅ VIT embedding ready for request {req.rid}")
+
+                    # 标记 VIT 计算完成
+                    req.vit_pending = False
+                    found = True
+                    break
+
+            if not found:
+                # 可能是调度竞争：先缓存，待请求重新进入队列时再应用
+                try:
+                    if hasattr(self, "_vit_embedding_cache"):
+                        self._vit_embedding_cache[request_id] = embedding
+                        try:
+                            logger.info(
+                                f"[Scheduler] 💾 Cached VIT embedding for {request_id} (waiting_queue miss); "
+                                f"shape={tuple(embedding.shape)}, dtype={embedding.dtype}, device={embedding.device}"
+                            )
+                        except Exception:
+                            logger.info(f"[Scheduler] 💾 Cached VIT embedding for {request_id} (waiting_queue miss)")
+                    else:
+                        logger.warning(f"[Scheduler] ⚠️ VIT result for {request_id} not found; cache unavailable")
+                except Exception as e:
+                    logger.warning(f"[Scheduler] ⚠️ VIT result for {request_id} not found and cache failed: {e}")
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1078,6 +1284,35 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.add(req)
         else:
             self.waiting_queue.append(req)
+            # If VIT result arrived earlier and was cached, apply it now to unblock PP0
+            try:
+                if (
+                    getattr(self.pp_group, "is_first_rank", False)
+                    and hasattr(req, "rid")
+                    and hasattr(req, "vit_pending")
+                    and req.vit_pending
+                    and hasattr(self, "_vit_embedding_cache")
+                    and req.rid in self._vit_embedding_cache
+                ):
+                    embedding = self._vit_embedding_cache.pop(req.rid)
+                    if req.multimodal_inputs is not None:
+                        for mm_item in req.multimodal_inputs.mm_items:
+                            if mm_item.modality == Modality.IMAGE:
+                                mm_item.precomputed_features = embedding.to(self.device)
+                                logger.info(f"[Scheduler]  Applied cached VIT embedding for request {req.rid}")
+                                try:
+                                    _emb = getattr(mm_item, 'precomputed_features', None)
+                                    if _emb is not None:
+                                        logger.info(
+                                            f"[Scheduler] ⓨ Applied cached VIT embedding details for {req.rid}; "
+                                            f"shape={tuple(_emb.shape)}, dtype={_emb.dtype}, device={_emb.device}"
+                                        )
+                                except Exception:
+                                    pass
+
+                    req.vit_pending = False
+            except Exception as e:
+                logger.warning(f"[Scheduler]  Failed to apply cached VIT embedding: {e}")
 
     def _extend_requests_to_queue(self, reqs: List[Req]):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1398,8 +1633,31 @@ class Scheduler(
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
-        # Get requests from the waiting queue to a new prefill batch
+        # 🔧 流水线并行：分类请求，优先处理 VIT 已完成的请求
+        # 只在 PP0 上检查 vit_pending，PP1 不需要检查
+        vit_ready_reqs = []
+        vit_pending_reqs = []
+
         for req in self.waiting_queue:
+            # 只在 PP0 上检查 vit_pending
+            if self.pp_group.is_first_rank:
+                has_vit_pending = hasattr(req, 'vit_pending')
+                vit_pending_value = getattr(req, 'vit_pending', None)
+
+                if has_vit_pending and vit_pending_value:
+                    vit_pending_reqs.append(req)
+                    continue
+
+            vit_ready_reqs.append(req)
+
+        # 记录跳过的请求（只在有 pending 请求时打印）
+        if vit_pending_reqs and self.pp_group.is_first_rank:
+            logger.info(f"[Scheduler] ⏭️ Skipping {len(vit_pending_reqs)} requests waiting for VIT (ready={len(vit_ready_reqs)})")
+
+        # Get requests from the waiting queue to a new prefill batch
+        # 优先处理 VIT 已完成的请求
+        for req in vit_ready_reqs:
+
             if (
                 self.lora_paths
                 and len(

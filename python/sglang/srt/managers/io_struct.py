@@ -477,6 +477,10 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # 🔧 修复：添加 vit_pending 字段用于 PP 模式
+    # 在 PP 模式下，PP0 需要告诉 PP1 哪些请求正在等待 VIT 计算
+    vit_pending: bool = False
+
 
 @dataclass
 class EmbeddingReqInput:

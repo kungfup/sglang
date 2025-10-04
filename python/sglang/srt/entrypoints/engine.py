@@ -654,6 +654,43 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    # Launch VIT Scheduler if enabled
+    vit_scheduler_proc = None
+    if server_args.enable_vit_scheduler and server_args.node_rank == 0:
+        from sglang.srt.configs.model_config import ModelConfig
+
+        # Check if model is multimodal
+        model_config = ModelConfig(
+            model_path=server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            model_override_args="{}",
+        )
+
+        if model_config.is_multimodal:
+            logger.info("Launching VIT Scheduler process...")
+
+            reader, writer = mp.Pipe(duplex=False)
+            vit_scheduler_proc = mp.Process(
+                target=run_vit_scheduler_process,
+                args=(server_args, writer),
+            )
+            vit_scheduler_proc.start()
+
+            # Wait for VIT Scheduler to be ready
+            data = reader.recv()
+            if data != "ready":
+                raise RuntimeError(f"VIT Scheduler failed to start: {data}")
+
+            logger.info("VIT Scheduler is ready")
+
+            # Set environment variables for main Scheduler
+            os.environ["SGLANG_VIT_SCHEDULER_ENABLED"] = "1"
+            os.environ["SGLANG_VIT_SCHEDULER_HOST"] = "localhost"
+            os.environ["SGLANG_VIT_SCHEDULER_PORT"] = str(server_args.vit_scheduler_port)
+            os.environ["SGLANG_VIT_SCHEDULER_TIMEOUT_MS"] = "15000"  # 增加到 15 秒，避免首次计算超时
+        else:
+            logger.info("Model is not multimodal, VIT Scheduler disabled")
+
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -777,3 +814,35 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, scheduler_info
+
+
+def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer):
+    """Run VIT Scheduler process"""
+    try:
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.managers.vit_scheduler import start_vit_scheduler
+
+        # Load model config
+        model_config = ModelConfig(
+            model_path=server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            model_override_args="{}",
+        )
+
+        # Start VIT Scheduler (this will block)
+        # NOTE: start_vit_scheduler will send "ready" signal via pipe_writer when ZMQ is listening
+        start_vit_scheduler(
+            model_config=model_config,
+            device=server_args.vit_scheduler_device,
+            zmq_port=server_args.vit_scheduler_port,
+            batch_size=server_args.vit_scheduler_batch_size,
+            batch_timeout_ms=server_args.vit_scheduler_batch_timeout_ms,
+            cache_size_mb=server_args.vit_scheduler_cache_size_mb,
+            pipe_writer=pipe_writer,
+        )
+    except Exception as e:
+        logger.error(f"VIT Scheduler process failed: {e}")
+        import traceback
+        traceback.print_exc()
+        pipe_writer.send(f"error: {e}")
+        raise
