@@ -1475,7 +1475,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                     # Mark the request as finished due to length limit
                     req = self.reqs[sorted_indices[0]]
-                    req.finished_reason = FINISH_LENGTH()
+                    # 🔧 FIX: FINISH_LENGTH requires a length parameter
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids) if hasattr(req, 'output_ids') else req.sampling_params.max_new_tokens)
                 break
 
             first_iter = False

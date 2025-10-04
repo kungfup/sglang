@@ -246,12 +246,16 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             consecutive_again = 0  # 🔧 FIX: Track consecutive zmq.Again
             max_consecutive_again = 5  # 🔧 FIX: Allow up to 5 consecutive zmq.Again before giving up
 
-            # Debug: log socket state before recv loop
+            # 🔧 节流：每10000次打印一次
             try:
                 import os as _os
                 if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
-                    sock_fd = getattr(self.recv_from_decode_forwarded, 'FD', None) if self.recv_from_decode_forwarded else None
-                    logger.info(f"[PREFILL-PP{self.pp_rank}] _drain START: socket={self.recv_from_decode_forwarded is not None} fd={sock_fd} max_iters={max_iters}")
+                    if not hasattr(self, '_drain_start_count'):
+                        self._drain_start_count = 0
+                    self._drain_start_count += 1
+                    if self._drain_start_count % 10000 == 1:
+                        sock_fd = getattr(self.recv_from_decode_forwarded, 'FD', None) if self.recv_from_decode_forwarded else None
+                        logger.info(f"[PREFILL-PP{self.pp_rank}] _drain START: socket={self.recv_from_decode_forwarded is not None} fd={sock_fd} max_iters={max_iters} (count={self._drain_start_count})")
             except Exception:
                 pass
             while it < max_iters:
@@ -268,15 +272,21 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                         pass
                 except zmq.Again:
                     consecutive_again += 1  # 🔧 FIX: Increment counter
-                    # 🔧 DEBUG: Log zmq.Again (only first few times to avoid log flood)
-                    # Suppress verbose logging unless SGLANG_SEMIPD_TRACE is enabled
-                    if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-                        if consecutive_again <= 3:
-                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain zmq.Again at it={it} consecutive={consecutive_again} ps_gen={ps_gen} ps_auth={ps_auth}")
+                    # 🔧 节流：每10000次打印一次
+                    if not hasattr(self, '_drain_again_count'):
+                        self._drain_again_count = 0
+                    self._drain_again_count += 1
+                    if self._drain_again_count % 10000 == 1:
+                        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain zmq.Again at it={it} consecutive={consecutive_again} ps_gen={ps_gen} ps_auth={ps_auth} (count={self._drain_again_count})")
                     # 🔧 FIX: Only break after multiple consecutive zmq.Again
                     if consecutive_again >= max_consecutive_again:
-                        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-                            logger.info(f"[PREFILL-PP{self.pp_rank}] _drain giving up after {consecutive_again} consecutive zmq.Again")
+                        if not hasattr(self, '_drain_giving_up_count'):
+                            self._drain_giving_up_count = 0
+                        self._drain_giving_up_count += 1
+                        if self._drain_giving_up_count % 10000 == 1:
+                            if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                                logger.info(f"[PREFILL-PP{self.pp_rank}] _drain giving up after {consecutive_again} consecutive zmq.Again (count={self._drain_giving_up_count})")
                         break
                     continue  # 🔧 FIX: Continue trying instead of breaking immediately
                 except Exception as e:
@@ -359,14 +369,19 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
             # Summary (throttled)
             try:
-                semi_pd_log_info_throttle(
-                    logger,
-                    key=f"pp{self.pp_rank}.poller.summary",
-                    msg=(
-                        f"[PREFILL-PP{self.pp_rank}] TRACE poller ps.gen={ps_gen} ps.auth={ps_auth} wq={len(self.waiting_queue)} inbox={len(self._auth_inbox)}"
-                    ),
-                    interval_ms=1000,
-                )
+                # Additional count-based guard to avoid screen flooding
+                if not hasattr(self, '_poller_summary_count'):
+                    self._poller_summary_count = 0
+                self._poller_summary_count += 1
+                if self._poller_summary_count % 100000 == 1:
+                    semi_pd_log_info_throttle(
+                        logger,
+                        key=f"pp{self.pp_rank}.poller.summary",
+                        msg=(
+                            f"[PREFILL-PP{self.pp_rank}] TRACE poller ps.gen={ps_gen} ps.auth={ps_auth} wq={len(self.waiting_queue)} inbox={len(self._auth_inbox)}"
+                        ),
+                        interval_ms=60000,
+                    )
             except Exception:
                 pass
 
@@ -413,10 +428,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         # Optional trace: show who triggered EXTEND and the authorized rids
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-            try:
-                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE to_extend_batch rids={resp.rids}")
-            except Exception:
-                pass
+            # 🔧 节流：每10000次打印一次
+            if not hasattr(self, '_to_extend_batch_count'):
+                self._to_extend_batch_count = 0
+            self._to_extend_batch_count += 1
+            if self._to_extend_batch_count % 10000 == 1:
+                try:
+                    logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE to_extend_batch rids={resp.rids} (count={self._to_extend_batch_count})")
+                except Exception:
+                    pass
 
         关键原理：
         1. D-Scheduler预先分配所有KV Cache资源
@@ -542,12 +562,16 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         This ensures PP event loop doesn't block while maintaining Semi-PD authorization flow.
         """
         # 🔧 DEBUG: Log function entry (throttled to avoid log flood)
-        # Suppress verbose logging unless SGLANG_SEMIPD_TRACE is enabled
-        if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-            wq_len = len(self.waiting_queue)
-            inbox_len = len(getattr(self, '_auth_inbox', []))
-            if wq_len > 0 or inbox_len > 0:
-                logger.info(f"[PREFILL-PP{self.pp_rank}] get_next_batch_to_run ENTER: wq={wq_len} inbox={inbox_len}")
+        # 🔧 节流：每500次打印一次
+        if not hasattr(self, '_get_next_batch_count'):
+            self._get_next_batch_count = 0
+        self._get_next_batch_count += 1
+        if self._get_next_batch_count % 100000 == 1:
+            if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
+                wq_len = len(self.waiting_queue)
+                inbox_len = len(getattr(self, '_auth_inbox', []))
+                if wq_len > 0 or inbox_len > 0:
+                    logger.info(f"[PREFILL-PP{self.pp_rank}] get_next_batch_to_run ENTER: wq={wq_len} inbox={inbox_len} (count={self._get_next_batch_count})")
 
         # 🔧 CRITICAL: Drain forwarded requests and authorizations using the proper drain function
         # This must happen in every call to ensure we don't miss messages
@@ -825,8 +849,13 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
     def run_batch(self, batch: ScheduleBatch):
         # Optional trace: who actually triggers model execution on PREFILL
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-            try:
-                logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE run_batch(reqlen={len(batch.reqs) if batch else 0})")
-            except Exception:
-                pass
+            # 🔧 节流：每10000次打印一次
+            if not hasattr(self, '_run_batch_count'):
+                self._run_batch_count = 0
+            self._run_batch_count += 1
+            if self._run_batch_count % 10000 == 1:
+                try:
+                    logger.info(f"[PREFILL-PP{self.pp_rank}] TRACE run_batch(reqlen={len(batch.reqs) if batch else 0}) (count={self._run_batch_count})")
+                except Exception:
+                    pass
         return super().run_batch(batch)

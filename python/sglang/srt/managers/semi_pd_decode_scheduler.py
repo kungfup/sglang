@@ -410,6 +410,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
+        # 🔧 DEBUG: Log new_token_ratio being used
+        if self.pp_rank > 0 and os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+            logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 PrefillAdder init: new_token_ratio={self.new_token_ratio:.3f}, waiting_queue={len(self.waiting_queue)}, running={len(self.running_batch.reqs)}")
         adder = PrefillAdder(
             self.page_size,  # v0.4.8 requires page_size as first parameter
             self.tree_cache,
@@ -434,10 +437,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 f"[DECODE-PP{self.pp_rank}] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}"
             )
         if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
-            try:
-                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.begin waiting={len(self.waiting_queue)} rids={'ALL' if rids is None else len(rids)}")
-            except Exception:
-                pass
+            # 🔧 节流：每10000次打印一次
+            if not hasattr(self, '_gnbp_begin_count'):
+                self._gnbp_begin_count = 0
+            self._gnbp_begin_count += 1
+            if self._gnbp_begin_count % 10000 == 1:
+                try:
+                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.begin waiting={len(self.waiting_queue)} rids={'ALL' if rids is None else len(rids)} (count={self._gnbp_begin_count})")
+                except Exception:
+                    pass
         for req in self.waiting_queue:
             # Semi-PD
             if rids is not None and req.rid not in rids:
@@ -470,6 +478,13 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 # v0.4.8 removed enable_hierarchical_cache parameter
             )
             if res != AddReqResult.CONTINUE:
+                # 🔧 DEBUG: Log why add_one_req failed
+                if self.pp_rank > 0 and os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+                    if not hasattr(self, '_add_req_fail_count'):
+                        self._add_req_fail_count = 0
+                    self._add_req_fail_count += 1
+                    if self._add_req_fail_count % 10000 == 1:
+                        logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 add_one_req failed: res={res}, rid={req.rid}, can_run_list_sz={len(adder.can_run_list)} (count={self._add_req_fail_count})")
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -487,10 +502,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
-                try:
-                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.no_can_run waiting={len(self.waiting_queue)} running={len(self.running_batch.reqs)} new_token_ratio={self.new_token_ratio:.3f}")
-                except Exception:
-                    pass
+                # 🔧 节流：每10000次打印一次
+                if not hasattr(self, '_gnbp_no_can_run_count'):
+                    self._gnbp_no_can_run_count = 0
+                self._gnbp_no_can_run_count += 1
+                if self._gnbp_no_can_run_count % 10000 == 1:
+                    try:
+                        logger.info(f"[DECODE-PP{self.pp_rank}] TRACE gnbp.no_can_run waiting={len(self.waiting_queue)} running={len(self.running_batch.reqs)} new_token_ratio={self.new_token_ratio:.3f} (count={self._gnbp_no_can_run_count})")
+                    except Exception:
+                        pass
             return None
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -563,10 +583,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # Optional trace: who requested authorization and with which candidate rids
         # keep a concise trace; drop heavy stack to reduce log noise
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-            try:
-                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE get_next_prefill_batch rids={recv_req.rids}")
-            except Exception:
-                pass
+            # 🔧 节流：每10000次打印一次
+            if not hasattr(self, '_get_next_prefill_batch_count'):
+                self._get_next_prefill_batch_count = 0
+            self._get_next_prefill_batch_count += 1
+            if self._get_next_prefill_batch_count % 10000 == 1:
+                try:
+                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE get_next_prefill_batch rids={recv_req.rids} (count={self._get_next_prefill_batch_count})")
+                except Exception:
+                    pass
 
         # quiet
 
@@ -581,7 +606,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             # Best-effort StepTag to help P align logs; not used for control gating
             try:
                 self.bridge_socket.send_pyobj(StepTag(mb_id=None, phase=phase, pp_rank=getattr(self, 'pp_rank', None), req_ids=list(recv_req.rids or [])))
-                logger.info(f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN")
+                # 🔧 节流：每10000次打印一次
+                if not hasattr(self, '_auth_begin_count'):
+                    self._auth_begin_count = 0
+                self._auth_begin_count += 1
+                if self._auth_begin_count % 10000 == 1:
+                    logger.info(f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN (count={self._auth_begin_count})")
             except Exception:
                 pass
         except Exception:
@@ -706,9 +736,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                             self.bridge_socket.send_pyobj(
                                 StepTag(mb_id=None, phase="EXTEND", pp_rank=getattr(self, 'pp_rank', None), req_ids=list(approved_rids))
                             )
-                            logger.info(
-                                f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase=EXTEND] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')}"
-                            )
+                            # 🔧 节流：每10000次打印一次
+                            if not hasattr(self, '_auth_begin_extend_count'):
+                                self._auth_begin_extend_count = 0
+                            self._auth_begin_extend_count += 1
+                            if self._auth_begin_extend_count % 10000 == 1:
+                                logger.info(
+                                    f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase=EXTEND] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')} (count={self._auth_begin_extend_count})"
+                                )
                         except Exception:
                             pass
                         # Actually deliver the authorization to PREFILL via the same work-plane channel as PP>0 (p_scheduler_input)
@@ -729,7 +764,16 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     if self.chunked_req:
                         self.tree_cache.cache_unfinished_req(self.chunked_req)
                         self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+
+                    # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 should not use new_token_ratio limit
+                    # because it doesn't execute actual prefill, it just authorizes PREFILL-PP>0
+                    # Temporarily disable new_token_ratio limit for authorization
+                    _saved_new_token_ratio = self.new_token_ratio
+                    logger.info(f"[DECODE-PP{self.pp_rank}] 🔧 PP>0 authorization: setting new_token_ratio from {_saved_new_token_ratio:.3f} to 1.0")
+                    self.new_token_ratio = 1.0  # Allow all requests
                     batch = self.get_new_batch_prefill(None)
+                    self.new_token_ratio = _saved_new_token_ratio  # Restore
+                    logger.info(f"[DECODE-PP{self.pp_rank}] 🔧 PP>0 authorization: restored new_token_ratio to {_saved_new_token_ratio:.3f}, batch={'None' if batch is None else f'sz={len(batch.reqs)}'}")
                     if batch is None:
                         # Fallback: try candidate-driven auth on PP>0 using prealloc queue from forwarded reqs
                         try:
@@ -737,7 +781,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                             while getattr(self, "_spd_prealloc_queue", None) and len(slice_rids) < getattr(self, "_spd_max_auth_rids", 32):
                                 slice_rids.append(self._spd_prealloc_queue.popleft())
                             if slice_rids:
+                                # 🔧 CRITICAL FIX: Also disable new_token_ratio limit for fallback path
+                                _saved_new_token_ratio = self.new_token_ratio
+                                self.new_token_ratio = 1.0  # Allow all requests
                                 batch = self.get_new_batch_prefill(slice_rids)
+                                self.new_token_ratio = _saved_new_token_ratio  # Restore
                                 # push back if not used
                                 if batch is None:
                                     for rid in reversed(slice_rids):
@@ -781,17 +829,27 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     )
                     try:
                         if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
-                            try:
-                                logger.info(f"[DECODE-PP{self.pp_rank}] TRACE auth.nonempty approved_rids={approved_rids[:3]} sz={len(approved_rids)}")
-                            except Exception:
-                                pass
+                            # 🔧 节流：每10000次打印一次
+                            if not hasattr(self, '_auth_nonempty_count'):
+                                self._auth_nonempty_count = 0
+                            self._auth_nonempty_count += 1
+                            if self._auth_nonempty_count % 10000 == 1:
+                                try:
+                                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE auth.nonempty approved_rids={approved_rids[:3]} sz={len(approved_rids)} (count={self._auth_nonempty_count})")
+                                except Exception:
+                                    pass
                         # send a StepTag for observability on PP>0 async path
                         try:
                             phase = "PRIME_DECODE" if (hasattr(self, 'pp_group') and self.pp_group is not None and self.pp_group.is_last_rank) else "EXTEND"
                             self.bridge_socket.send_pyobj(StepTag(mb_id=None, phase=phase, pp_rank=getattr(self, 'pp_rank', None), req_ids=list(approved_rids)))
-                            logger.info(
-                                f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')}"
-                            )
+                            # 🔧 节流：每10000次打印一次
+                            if not hasattr(self, '_auth_begin_phase_count'):
+                                self._auth_begin_phase_count = 0
+                            self._auth_begin_phase_count += 1
+                            if self._auth_begin_phase_count % 10000 == 1:
+                                logger.info(
+                                    f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')} (count={self._auth_begin_phase_count})"
+                                )
                         except Exception:
                             pass
                         self.send_to_p_instance.send_pyobj(msg)
@@ -815,10 +873,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 msg = self._spd_authorize_outbox[0]
                 self.bridge_socket.send_pyobj(msg)
                 if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-                    try:
-                        logger.info(f"[DECODE-PP{self.pp_rank}] TRACE _maybe_authorize_prefill send queued msg(#rids={len(msg.rids)})\n" + "".join(traceback.format_stack(limit=12)))
-                    except Exception:
-                        pass
+                    # 🔧 节流：每10000次打印一次，移除 traceback
+                    if not hasattr(self, '_maybe_authorize_count'):
+                        self._maybe_authorize_count = 0
+                    self._maybe_authorize_count += 1
+                    if self._maybe_authorize_count % 10000 == 1:
+                        try:
+                            logger.info(f"[DECODE-PP{self.pp_rank}] TRACE _maybe_authorize_prefill send queued msg(#rids={len(msg.rids)}) (count={self._maybe_authorize_count})")
+                        except Exception:
+                            pass
                 self._spd_authorize_outbox.popleft()
                 semi_pd_log_info_throttle(
                     logger,
@@ -1030,12 +1093,17 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 hidden_states=None,
             )
 
-        # Optional trace: who delivered tokens back to DECODE
+        # 🔧 移除 traceback 打印，只保留简单日志
         if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-            try:
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] TRACE process_prefill_result tokens={num_tokens}\n" + "".join(traceback.format_stack(limit=12)))
-            except Exception:
-                pass
+            # 🔧 节流：每10000次打印一次
+            if not hasattr(self, '_process_prefill_result_count'):
+                self._process_prefill_result_count = 0
+            self._process_prefill_result_count += 1
+            if self._process_prefill_result_count % 10000 == 1:
+                try:
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] TRACE process_prefill_result tokens={num_tokens} (count={self._process_prefill_result_count})")
+                except Exception:
+                    pass
 
 
         result = GenerationBatchResult(
@@ -1129,37 +1197,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # - never call super().get_next_batch_to_run() to avoid PREFILL execution on DECODE
         self._maybe_authorize_prefill()
 
-        # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 needs to process requests from DECODE-PP0
-        # These requests are received via recv_requests() and stored in waiting_queue
-        # We need to process them to create decode batches
-        if self.pp_size > 1 and self.pp_rank > 0:
-            # DECODE-PP>0: Process requests from PP0 (received via point_to_point_pyobj)
-            # These are decode requests that need to be processed in this PP stage
-            if self.waiting_queue and self.running_batch.is_empty():
-                # Get requests from waiting_queue and create a decode batch
-                # This is similar to what the base scheduler does
-                from sglang.srt.managers.schedule_batch import ScheduleBatch
-                # Take all requests from waiting_queue
-                reqs = []
-                while self.waiting_queue:
-                    reqs.append(self.waiting_queue.pop(0))  # 🔧 Fix: use pop(0) instead of popleft() for list
-                if reqs:
-                    # Create a decode batch with these requests
-                    self.running_batch = ScheduleBatch.init_new(
-                        reqs=reqs,
-                        req_to_token_pool=self.req_to_token_pool,
-                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        tree_cache=self.tree_cache,
-                        model_config=self.model_config,
-                        enable_overlap=getattr(self, 'enable_overlap', False),
-                        spec_algorithm=getattr(self, 'spec_algorithm', None),
-                        enable_custom_logit_processor=getattr(self, 'enable_custom_logit_processor', False),
-                    )
-                    logger.info(f"[DECODE-PP{self.pp_rank}] Created decode batch from PP0 requests: #reqs={len(reqs)}")
-
-            # 🔧 ADDITIONAL FIX: If PP0 is not sending new requests (autoregressive loop),
-            # PP1 should keep processing the existing running_batch
-            # This is the normal behavior - just continue with the existing batch
+        # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 should NOT manually create batches
+        # The native PP flow will automatically create dummy batches to receive hidden states
+        # We just need to keep the requests in waiting_queue for tracking
+        # The actual batch creation and processing is handled by the native PP event loop
 
         # If we have a ready decode batch queued from PREFILL result, adopt it (PP0 only)
         if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
