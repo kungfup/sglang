@@ -92,9 +92,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
         self._last_candidates = []
 
-        # Glue-only: let DECODE be the single source of streaming.
-        # Prevent PREFILL from calling stream_output in scheduler_output_processor_mixin.
-        self.skip_stream_for_pp = True
+        # 🔧 PP并行修复：只有非最后PP stage的PREFILL才跳过stream_output
+        # - PP0 PREFILL: skip_stream_for_pp = True (不输出)
+        # - PP1 PREFILL: skip_stream_for_pp = False (需要输出到detokenizer)
+        is_last_pp_stage = (self.pp_rank == self.pp_size - 1)
+        self.skip_stream_for_pp = not is_last_pp_stage
+        logger.info(
+            f"[PREFILL-PP{self.pp_rank}] skip_stream_for_pp={self.skip_stream_for_pp} "
+            f"(pp_rank={self.pp_rank}, pp_size={self.pp_size}, is_last={is_last_pp_stage})"
+        )
 
         # （移除临时PP通信测试导入，避免环境缺模块导致噪声告警）
 
@@ -670,6 +676,18 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         else:
             # Non-rank-0 TP workers: will receive resp via broadcast above
             resp = None
+
+        # 🔍 TRACE: awaiting authorization indicator (throttled)
+        try:
+            if self.attn_tp_rank == 0 and (resp is None) and getattr(self, "_awaiting_auth", False):
+                if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
+                    if not hasattr(self, "_await_auth_log_count"):
+                        self._await_auth_log_count = 0
+                    self._await_auth_log_count += 1
+                    if self._await_auth_log_count % 10000 == 1:
+                        logger.info(f"[PREFILL-PP{self.pp_rank}] awaiting authorization: wq={len(self.waiting_queue)} inbox={len(getattr(self, '_auth_inbox', []))}")
+        except Exception:
+            pass
 
         # 🔧 Build EXTEND batch from authorization
         # ALL PP stages: Build batch from waiting_queue using authorization from same-stage DECODE

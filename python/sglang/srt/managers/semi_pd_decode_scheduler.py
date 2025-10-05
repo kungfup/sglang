@@ -98,6 +98,23 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             if hasattr(self, 'pp_group') and self.pp_group is not None:
                 logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: Using SGLang native PP group with ranks {self.pp_group.ranks}")
                 logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: PP group type: {type(self.pp_group)}")
+
+                # 🔧 CRITICAL: 在Semi-PD+PP模式下，只有last_rank (PP1)负责detokenization和输出
+                # 这符合SGLang原生PP设计哲学
+                is_last_rank = getattr(self.pp_group, 'is_last_rank', False)
+                if is_last_rank:
+                    logger.info(f"🎯 [PP_DECODE] PP{pp_rank}: This is LAST_RANK, responsible for:")
+                    logger.info(f"   - Receiving hidden states from PP{pp_rank-1}")
+                    logger.info(f"   - Generating logits and sampling tokens")
+                    logger.info(f"   - Detokenization (via detokenizer process)")
+                    logger.info(f"   - Stream output to client")
+                    logger.info(f"   - EOS detection and request completion")
+                else:
+                    logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: This is NOT last_rank, responsible for:")
+                    logger.info(f"   - Receiving tokens from tokenizer")
+                    logger.info(f"   - Processing hidden states through layers")
+                    logger.info(f"   - Sending hidden states to PP{pp_rank+1}")
+                    logger.info(f"   - NO detokenization or output")
                 logger.info(f"🔗 [PP_DECODE] PP{pp_rank}: is_first_rank={self.pp_group.is_first_rank}, is_last_rank={self.pp_group.is_last_rank}")
             else:
                 logger.warning(f"⚠️ [PP_DECODE] PP{pp_rank}: No PP group available, PP communication disabled")
@@ -682,9 +699,37 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
     def _maybe_authorize_prefill(self):
         # Semi-PD unified clock:
-        # - PP0: disable async authorization (only sync reply path is used)
-        # - PP>0: allow async authorization, but send non-empty authorizations via p_scheduler_input
+        # - PP0: handles authorization and communicates with PREFILL-PP0
+        # - PP>0: DOES NOT authorize PREFILL (PP1 only receives hidden states and generates tokens)
+
+        # 🔧 CRITICAL FIX: In PP mode, only PP0 should authorize PREFILL
+        # PP>0 stages should NOT call this method - they only receive hidden states and generate tokens
+        if getattr(self, 'pp_rank', 0) > 0:
+            # PP>0: Skip authorization entirely
+            # PP1 will receive hidden states from PP0 via NCCL and generate tokens
+            # No need to authorize PREFILL on PP>0
+            return
+
         try:
+            # 🔍 TRACE: probe auth state (throttled) - PP0 only
+            try:
+                if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1","true","yes"):
+                    if not hasattr(self, "_auth_probe_count"):
+                        self._auth_probe_count = 0
+                    self._auth_probe_count += 1
+                    if self._auth_probe_count % 5000 == 1:
+                        logger.info(
+                            f"[DECODE-PP{getattr(self,'pp_rank','?')}] TRACE auth.probe "
+                            f"wq={len(getattr(self,'waiting_queue',[]))} "
+                            f"running={len(self.running_batch.reqs) if getattr(self,'running_batch',None) is not None else 0} "
+                            f"prealloc={len(getattr(self,'_spd_prealloc_queue',[]))} "
+                            f"outbox={len(getattr(self,'_spd_authorize_outbox',[]))} "
+                            f"p_ready={getattr(self,'_p_socket_ready',False)} "
+                            f"ratio={getattr(self,'new_token_ratio',-1):.3f}"
+                        )
+            except Exception:
+                pass
+
             if getattr(self.server_args, 'enable_semi_pd', False):
                 # PP0 strict sync: by default, do NOT push non-empty async authorizations to PP0.
                 # Only nudge with empty auths to clear awaiting flags.
@@ -759,112 +804,10 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         return
                     except Exception:
                         return
-                # For PP>0, build from D waiting queue (ignore candidates) and send to P
-                try:
-                    if self.chunked_req:
-                        self.tree_cache.cache_unfinished_req(self.chunked_req)
-                        self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
 
-                    # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 should not use new_token_ratio limit
-                    # because it doesn't execute actual prefill, it just authorizes PREFILL-PP>0
-                    # Temporarily disable new_token_ratio limit for authorization
-                    _saved_new_token_ratio = self.new_token_ratio
-                    logger.info(f"[DECODE-PP{self.pp_rank}] 🔧 PP>0 authorization: setting new_token_ratio from {_saved_new_token_ratio:.3f} to 1.0")
-                    self.new_token_ratio = 1.0  # Allow all requests
-                    batch = self.get_new_batch_prefill(None)
-                    self.new_token_ratio = _saved_new_token_ratio  # Restore
-                    logger.info(f"[DECODE-PP{self.pp_rank}] 🔧 PP>0 authorization: restored new_token_ratio to {_saved_new_token_ratio:.3f}, batch={'None' if batch is None else f'sz={len(batch.reqs)}'}")
-                    if batch is None:
-                        # Fallback: try candidate-driven auth on PP>0 using prealloc queue from forwarded reqs
-                        try:
-                            slice_rids = []
-                            while getattr(self, "_spd_prealloc_queue", None) and len(slice_rids) < getattr(self, "_spd_max_auth_rids", 32):
-                                slice_rids.append(self._spd_prealloc_queue.popleft())
-                            if slice_rids:
-                                # 🔧 CRITICAL FIX: Also disable new_token_ratio limit for fallback path
-                                _saved_new_token_ratio = self.new_token_ratio
-                                self.new_token_ratio = 1.0  # Allow all requests
-                                batch = self.get_new_batch_prefill(slice_rids)
-                                self.new_token_ratio = _saved_new_token_ratio  # Restore
-                                # push back if not used
-                                if batch is None:
-                                    for rid in reversed(slice_rids):
-                                        self._spd_prealloc_queue.appendleft(rid)
-                        except Exception:
-                            pass
-                    if batch is None:
-                        # nudge P to clear awaiting flag and keep recv posted (rate-limited)
-                        if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
-                            try:
-                                semi_pd_log_info_throttle(
-                                    logger,
-                                    key=f"pp{self.pp_rank}.auth.empty",
-                                    msg=f"[DECODE-PP{self.pp_rank}] TRACE auth.empty waiting={len(self.waiting_queue)} running={len(self.running_batch.reqs)} cand={len(getattr(self,'_spd_prealloc_queue',[]))}"
-                                )
-                            except Exception:
-                                pass
-                        import time as _t
-                        _min_int = float(os.environ.get("SGLANG_SEMIPD_EMPTY_AUTH_MIN_S","0.2"))
-                        _now = _t.time()
-                        if _now - getattr(self, "_last_empty_auth_ts", 0.0) >= _min_int:
-                            try:
-                                # Send empty auth via bridge (control plane) to clear awaiting flag quickly
-                                self.bridge_socket.send_pyobj(GetNextPrefillBatchOutput(
-                                    rids=[], chunked_rid=None, req_pool_indices=[], prefix_lens=[], extend_input_lens=[]
-                                ))
-                            except Exception:
-                                pass
-                            self._last_empty_auth_ts = _now
-                        return
-                    approved_rids = [r.rid for r in batch.reqs]
-                    req_pool_indices = [r.req_pool_idx for r in batch.reqs]
-                    prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
-                    extend_input_lens = [r.extend_input_len for r in batch.reqs]
-                    msg = GetNextPrefillBatchOutput(
-                        rids=approved_rids,
-                        chunked_rid=(self.chunked_req.rid if self.chunked_req else None),
-                        req_pool_indices=req_pool_indices,
-                        prefix_lens=prefix_lens,
-                        extend_input_lens=extend_input_lens,
-                    )
-                    try:
-                        if os.environ.get("SGLANG_SEMIPD_TRACE","0").lower() in ("1","true","yes"):
-                            # 🔧 节流：每10000次打印一次
-                            if not hasattr(self, '_auth_nonempty_count'):
-                                self._auth_nonempty_count = 0
-                            self._auth_nonempty_count += 1
-                            if self._auth_nonempty_count % 10000 == 1:
-                                try:
-                                    logger.info(f"[DECODE-PP{self.pp_rank}] TRACE auth.nonempty approved_rids={approved_rids[:3]} sz={len(approved_rids)} (count={self._auth_nonempty_count})")
-                                except Exception:
-                                    pass
-                        # send a StepTag for observability on PP>0 async path
-                        try:
-                            phase = "PRIME_DECODE" if (hasattr(self, 'pp_group') and self.pp_group is not None and self.pp_group.is_last_rank) else "EXTEND"
-                            self.bridge_socket.send_pyobj(StepTag(mb_id=None, phase=phase, pp_rank=getattr(self, 'pp_rank', None), req_ids=list(approved_rids)))
-                            # 🔧 节流：每10000次打印一次
-                            if not hasattr(self, '_auth_begin_phase_count'):
-                                self._auth_begin_phase_count = 0
-                            self._auth_begin_phase_count += 1
-                            if self._auth_begin_phase_count % 10000 == 1:
-                                logger.info(
-                                    f"[IPC][role=D→P][pp_rank={getattr(self,'pp_rank','?')}][mb_id=-][phase={phase}] SEND AUTH_BEGIN bridge={getattr(self.port_args,'bridge_ipc_name','?')} (count={self._auth_begin_phase_count})"
-                                )
-                        except Exception:
-                            pass
-                        self.send_to_p_instance.send_pyobj(msg)
-                        semi_pd_log_info_throttle(
-                            logger,
-                            key=f"pp{self.pp_rank}.p2d.gnp.send",
-                            msg=(
-                                f"[DECODE-PP{self.pp_rank}] (PP>0) →P GetNextPrefillBatchOutput: #rids={len(approved_rids)} via p_scheduler_input={getattr(self.port_args,'p_scheduler_input_ipc_name','?')}"
-                            ),
-                        )
-                    except Exception:
-                        pass
-                    return
-                except Exception:
-                    return
+                # 🔧 NOTE: PP>0 authorization code removed - PP>0 should NOT authorize PREFILL
+                # PP>0 only receives hidden states from PP0 and generates tokens
+                # Authorization is handled by PP0 only
         except Exception:
             pass
         # First try to send any queued authorizations
@@ -1193,9 +1136,14 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Semi-PD decode-only loop:
-        # - proactively authorize PREFILL
+        # - PP0: proactively authorize PREFILL (main coordinator)
+        # - PP>0: NO authorization, just receive hidden states and process
         # - never call super().get_next_batch_to_run() to avoid PREFILL execution on DECODE
-        self._maybe_authorize_prefill()
+
+        # 🔧 CRITICAL: Only PP0 should authorize PREFILL
+        # PP>0 stages just receive hidden states and process them
+        if self.pp_rank == 0:
+            self._maybe_authorize_prefill()
 
         # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 should NOT manually create batches
         # The native PP flow will automatically create dummy batches to receive hidden states

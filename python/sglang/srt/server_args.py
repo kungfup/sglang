@@ -82,7 +82,7 @@ class ServerArgs:
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
-    stream_output: bool = False
+    stream_output: bool = True  # 🔧 CRITICAL: PP1 needs to stream output for detokenization
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     watchdog_timeout: float = 300

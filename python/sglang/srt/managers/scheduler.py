@@ -272,8 +272,25 @@ class Scheduler(
         if self.server_args.enable_semi_pd:
             logger.info(f"[SCHEDULER] Semi-PD模式: 实例角色 {instance_role}")
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            logger.info(f"[SCHEDULER] 当前进程是PP rank 0且注意力TP rank 0，初始化通信socket")
+        # 🔧 PP并行修复：在Semi-PD+PP模式下，DECODE-PP1 (last_rank) 需要初始化 detokenizer 连接
+        # 判断是否需要初始化通信socket
+        should_init_sockets = (self.pp_rank == 0 and self.attn_tp_rank == 0)
+
+        # 🔧 Semi-PD+PP特殊情况：DECODE-PP1 (last_rank) 需要 detokenizer 连接
+        is_decode_last_rank = (
+            self.server_args.enable_semi_pd
+            and instance_role == InstanceRole.DECODE
+            and self.pp_size > 1
+            and self.pp_rank == self.pp_size - 1
+            and self.attn_tp_rank == 0
+        )
+
+        if should_init_sockets or is_decode_last_rank:
+            if should_init_sockets:
+                logger.info(f"[SCHEDULER] 当前进程是PP rank 0且注意力TP rank 0，初始化通信socket")
+            if is_decode_last_rank:
+                logger.info(f"[SCHEDULER] 当前进程是DECODE last_rank (PP{self.pp_rank})，初始化detokenizer连接")
+
             if self.server_args.enable_semi_pd:
                 assert isinstance(port_args, SemiPDPortArgs)
                 if instance_role == InstanceRole.PREFILL:
@@ -284,12 +301,17 @@ class Scheduler(
                         context, zmq.PULL, port_args.p_scheduler_input_ipc_name, True
                     )
                 elif instance_role == InstanceRole.DECODE:
-                    logger.debug(
-                        f"bind to d_scheduler_input_ipc_name: {port_args.d_scheduler_input_ipc_name}"
-                    )
-                    self.recv_from_tokenizer = get_zmq_socket(
-                        context, zmq.PULL, port_args.d_scheduler_input_ipc_name, True
-                    )
+                    if should_init_sockets:
+                        # DECODE-PP0: 接收来自 tokenizer 的请求
+                        logger.debug(
+                            f"bind to d_scheduler_input_ipc_name: {port_args.d_scheduler_input_ipc_name}"
+                        )
+                        self.recv_from_tokenizer = get_zmq_socket(
+                            context, zmq.PULL, port_args.d_scheduler_input_ipc_name, True
+                        )
+                    else:
+                        # DECODE-PP1: 不接收 tokenizer 请求
+                        self.recv_from_tokenizer = None
                 else:
                     raise ValueError(f"Invalid instance role: {instance_role}")
             else:
@@ -297,33 +319,49 @@ class Scheduler(
                     context, zmq.PULL, port_args.scheduler_input_ipc_name, False
                 )
 
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+            # send_to_tokenizer: 只有 PP0 需要
+            if should_init_sockets:
+                self.send_to_tokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
             else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
+                self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
-            self.recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
-            )
-            if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
+            # send_to_detokenizer: PP0 或 DECODE-last_rank 需要
+            if should_init_sockets or is_decode_last_rank:
+                if server_args.skip_tokenizer_init:
+                    # Directly send to the TokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                    )
+                else:
+                    # Send to the DetokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                    )
+                    logger.info(
+                        f"[SCHEDULER] PP{self.pp_rank} {instance_role.name}: "
+                        f"Initialized send_to_detokenizer -> {port_args.detokenizer_ipc_name}"
+                    )
+            else:
+                self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+
+            # recv_from_rpc: 只有 PP0 需要
+            if should_init_sockets:
+                self.recv_from_rpc = get_zmq_socket(
+                    context, zmq.DEALER, port_args.rpc_ipc_name, False
                 )
+                if self.server_args.sleep_on_idle:
+                    self.idle_sleeper = IdleSleeper(
+                        [
+                            self.recv_from_tokenizer,
+                            self.recv_from_rpc,
+                        ]
+                    )
+            else:
+                self.recv_from_rpc = None
         else:
-            logger.info(f"[SCHEDULER] 当前进程不是PP rank 0或注意力TP rank 0，跳过通信socket初始化")
+            logger.info(f"[SCHEDULER] 当前进程不需要通信socket，使用dummy连接")
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
@@ -1053,6 +1091,9 @@ class Scheduler(
                             result.next_token_ids,
                             result.bid,
                         )
+                        # 🔧 DEBUG: Log next_token_ids for Semi-PD + PP debugging
+                        if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
+                            logger.info(f"[PP{self.pp_rank}] Sending tokens to PP0: next_token_ids.shape={next_token_ids.shape if next_token_ids is not None else None}, cur_batch.reqs={len(self.cur_batch.reqs)}, mb_id={mb_id}")
                         # Send token packet with explicit tag
                         if self.cur_batch.return_logprob:
                             send_tok = (
@@ -1102,6 +1143,54 @@ class Scheduler(
                             all_gather_group=self.attn_tp_group
                         )
                     )
+
+                    # 🔧 CRITICAL FIX: For Semi-PD DECODE-PP0 (first_rank), process received tokens from PP1
+                    # In native PP mode, first_rank receives next_token_ids from last_rank and processes output
+                    # This is the standard PP pattern: PP1 generates tokens → sends to PP0 → PP0 processes output
+                    is_semi_pd_decode_first = (
+                        getattr(self.server_args, 'enable_semi_pd', False)
+                        and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+                        and self.pp_group is not None
+                        and self.pp_group.is_first_rank
+                    )
+
+                    if is_semi_pd_decode_first and "next_token_ids" in next_pp_outputs.tensors:
+                        # Update batch with received tokens
+                        mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+
+                        # Extract logits_output if present
+                        logits_output_args = {
+                            k[len("logits_output.") :]: v
+                            for k, v in next_pp_outputs.tensors.items()
+                            if k.startswith("logits_output.")
+                        }
+                        if len(logits_output_args) > 0:
+                            logits_output = LogitsProcessorOutput(**logits_output_args)
+                        else:
+                            logits_output = None
+
+                        # Create output_result with received tokens
+                        output_result = GenerationBatchResult(
+                            logits_output=logits_output,
+                            pp_hidden_states_proxy_tensors=None,
+                            next_token_ids=next_pp_outputs["next_token_ids"],
+                            extend_input_len_per_req=next_pp_outputs.tensors.get(
+                                "extend_input_len_per_req", None
+                            ),
+                            extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                                "extend_logprob_start_len_per_req", None
+                            ),
+                            bid=bids[next_mb_id],
+                            can_run_cuda_graph=result.can_run_cuda_graph if result is not None else False,
+                        )
+
+                        # Process batch result with received tokens
+                        try:
+                            logger.info(f"[DECODE-PP{self.pp_rank}] Processing received tokens from PP1: next_mb_id={next_mb_id}, batch.reqs={len(mbs[next_mb_id].reqs)}, next_token_ids.shape={next_pp_outputs['next_token_ids'].shape}")
+                            self.process_batch_result(mbs[next_mb_id], output_result)
+                            last_mbs[next_mb_id] = mbs[next_mb_id]
+                        except Exception:
+                            logger.exception("[SEMI_PD_PP] DECODE-PP0 processing received tokens failed; continue loop")
 
                     # 🔧 CRITICAL FIX: Semi-PD DECODE-PP>0 needs to sync batch with PP0
                     # When DECODE-PP1 receives hidden states from PP0, it needs to create a batch
@@ -1275,6 +1364,26 @@ class Scheduler(
                                         logger.info(f"[PP{self.pp_rank}] dropped {dropped} control-plane msgs on cross-PP forward")
                                 except Exception:
                                     pass
+                            # Fallback: when no new recv_reqs this tick, forward running_batch.reqs to keep PP1 in sync
+                            if (
+                                getattr(self, 'instance_role', None) == InstanceRole.DECODE
+                                and getattr(self.pp_group, 'is_first_rank', False)
+                                and (not fwd_reqs)
+                                and getattr(self, 'running_batch', None) is not None
+                                and getattr(self.running_batch, 'reqs', None)
+                                and len(self.running_batch.reqs) > 0
+                            ):
+                                fwd_reqs = [x for x in self.running_batch.reqs if isinstance(x, allowed_types)]
+                                try:
+                                    from sglang.srt.utils import semi_pd_log_info_throttle as _th
+                                    _th(
+                                        logger,
+                                        key=f"pp{getattr(self,'pp_rank','?')}.decode.pp0.forward_fallback",
+                                        msg=f"[PP{self.pp_rank}] FWD FALLBACK using running_batch.reqs: count={len(fwd_reqs)}",
+                                        interval_ms=2000,
+                                    )
+                                except Exception:
+                                    pass
 
                         # 🔧 CRITICAL FIX: Semi-PD PREFILL doesn't forward requests via point_to_point_pyobj
                         # - PREFILL: receives work via IPC from DECODE, doesn't use point_to_point_pyobj
@@ -1379,6 +1488,9 @@ class Scheduler(
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
+                # 🔧 DEBUG: Log received requests for Semi-PD + PP debugging
+                if getattr(self.server_args, 'enable_semi_pd', False) and getattr(self, 'instance_role', None) == InstanceRole.DECODE:
+                    logger.info(f"[DECODE-PP{self.pp_rank}] recv_reqs via point_to_point_pyobj: count={len(recv_reqs) if recv_reqs else 0}, types={[type(r).__name__ for r in (recv_reqs or [])[:3]]}")
             else:
                 recv_reqs = None
 
@@ -2252,12 +2364,28 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
+        # 🔧 CRITICAL FIX: In Semi-PD + PP mode, DECODE-PP0 (first_rank) handles output
+        # DECODE-PP1 only generates tokens and sends them back to PP0
+        # This is different from native PP where last_rank handles output
+        is_semi_pd_decode_first = (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+            and self.pp_size > 1
+            and self.pp_group is not None
+            and self.pp_group.is_first_rank
+        )
+
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
+            # 🔧 CRITICAL FIX: For Semi-PD DECODE-PP0, process decode results even for IDLE batch
+            # because PP0 maintains the running_batch and needs to handle output
+            if is_semi_pd_decode_first:
+                logger.info(f"[PROCESS_BATCH_RESULT] PP{self.pp_rank} DECODE first_rank: Processing IDLE batch as decode for output")
+                self.process_batch_result_decode(batch, result, launch_done)
+            elif self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():

@@ -600,6 +600,19 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
+    # 🔧 Semi-PD+PP: 设置PP流式输出来源为last_rank（符合SGLang原生PP设计）
+    if server_args.enable_semi_pd and server_args.pp_size > 1:
+        # SGLang原生PP设计：只有last_rank负责detokenization和输出
+        os.environ["SGLANG_PP_STREAM_SOURCE"] = "last"
+        logger.info(f"🔧 [SEMI-PD+PP] Set SGLANG_PP_STREAM_SOURCE=last (PP{server_args.pp_size-1} will handle output)")
+
+    # 🔧 Semi-PD+PP: 多模态detokenizer模式设置
+    if server_args.enable_semi_pd:
+        # 对于多模态模型，启用增量detokenizer模式
+        if not os.environ.get("SGLANG_MM_DETOKENIZER_MODE"):
+            os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "incremental"
+            logger.info(f"🔧 [SEMI-PD] Set SGLANG_MM_DETOKENIZER_MODE=incremental for multimodal models")
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
@@ -1232,10 +1245,12 @@ def _launch_semi_pd_subprocesses(
     logger.info("🚀 [SEMI-PD] Launching Detokenizer process...")
     detoken_reader, detoken_writer = mp.Pipe(duplex=False)
 
-    # 🔧 在PP模式下，使用第一个PP stage的端口配置（回退以匹配你的 Semi-PD+PP IPC 假设）
+    # 🔧 在PP模式下，使用最后一个PP stage的端口配置（符合SGLang原生PP设计）
+    # SGLang原生PP设计：只有last_rank负责detokenization和输出
     if server_args.dp_size == 1 and server_args.pp_size > 1:
-        port_args = port_args_per_pp[0]
-        logger.info(f"🔧 [SEMI-PD] Using PP0 port configuration for detokenizer")
+        port_args = port_args_per_pp[-1]  # 使用最后一个PP stage (PP1)
+        logger.info(f"🔧 [SEMI-PD+PP] Using PP{server_args.pp_size-1} (last_rank) port configuration for detokenizer")
+        logger.info(f"🔧 [SEMI-PD+PP] Detokenizer will connect to PP{server_args.pp_size-1} scheduler")
 
     detoken_proc = mp.Process(
         target=run_detokenizer_process,

@@ -497,26 +497,47 @@ class SchedulerOutputProcessorMixin:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
-        # PP 流式来源守卫（可配置）：默认仅允许 PP stage-0 + attn_tp_rank==0 输出
+        # PP 流式来源守卫（可配置）
+        # 🔧 CRITICAL: In Semi-PD + PP, DECODE-PP0 (first_rank) handles output, not last_rank
+        # This is because PP0 maintains the running_batch with actual requests
+        # throttle log
+        if not hasattr(self, "_stream_log_tick"):
+            self._stream_log_tick = 0
+        self._stream_log_tick += 1
+        _so_log = (self._stream_log_tick % 100 == 0)
+
         try:
             if getattr(self.server_args, 'enable_semi_pd', False):
                 if getattr(self, 'attn_tp_rank', 0) != 0:
+                    if _so_log:
+                        logger.info(f"[STREAM_OUTPUT] Skipping: attn_tp_rank={getattr(self, 'attn_tp_rank', 0)} != 0")
                     return
                 pp_group = getattr(self, 'pp_group', None)
-                src_mode = os.environ.get("SGLANG_PP_STREAM_SOURCE", "stage0").lower()
-                if pp_group is not None:
-                    if src_mode in ("stage0", "first"):
-                        if not getattr(pp_group, 'is_first_rank', False):
-                            return
-                    elif src_mode in ("lastrank", "last"):
-                        if not getattr(pp_group, 'is_last_rank', False):
-                            return
-                    else:
-                        # 默认回退到 stage0
-                        if not getattr(pp_group, 'is_first_rank', False):
-                            return
-        except Exception:
-            pass
+                # 🔧 CRITICAL: For Semi-PD + PP, always use "first" mode (DECODE-PP0 handles output)
+                # Ignore SGLANG_PP_STREAM_SOURCE environment variable
+                from sglang.semi_pd.utils import InstanceRole
+                instance_role = getattr(self, 'instance_role', None)
+                if pp_group is not None and instance_role == InstanceRole.DECODE:
+                    is_first = getattr(pp_group, 'is_first_rank', False)
+                    is_last = getattr(pp_group, 'is_last_rank', False)
+                    if _so_log:
+                        logger.info(f"[STREAM_OUTPUT] Semi-PD + PP: pp_rank={getattr(self, 'pp_rank', '?')}, is_first_rank={is_first}, is_last_rank={is_last}")
+                    # In Semi-PD + PP, only DECODE-PP0 (first_rank) handles output
+                    if not is_first:
+                        if _so_log:
+                            logger.info(f"[STREAM_OUTPUT] Skipping: Semi-PD + PP mode, not first_rank")
+                        return
+                if _so_log:
+                    logger.info(f"[STREAM_OUTPUT] ✅ Passed PP guard, proceeding with output")
+        except Exception as e:
+            logger.exception(f"[STREAM_OUTPUT] Exception in PP guard: {e}")
+
+        # 🔧 DEBUG: Log reqs list for Semi-PD + PP debugging
+        if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1 and _so_log:
+            logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} reqs count={len(reqs)}, skip_req={skip_req is not None}")
+            for i, req in enumerate(reqs[:3]):  # Log first 3 reqs
+                logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} req[{i}]: rid={req.rid}, finished={req.finished()}, output_ids_len={len(req.output_ids)}, stream={req.stream}")
+
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -738,6 +759,10 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
+            # 🔧 DEBUG: Log sending to detokenizer for Semi-PD + PP debugging
+            if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
+                logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} Sending {len(rids)} requests to detokenizer: rids={rids[:3]}")
+
             # CRITICAL FIX: Don't skip detokenizer for multimodal models
             # The original code skipped detokenizer for VL models, causing content=None
             # We need detokenizer to convert tokens to text for proper responses
@@ -774,6 +799,10 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states,
                 )
             )
+        else:
+            # 🔧 DEBUG: Log when no requests to send for Semi-PD + PP debugging
+            if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
+                logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} No requests to send to detokenizer (rids is empty)")
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
