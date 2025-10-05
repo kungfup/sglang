@@ -474,6 +474,11 @@ class Scheduler(
             else:
                 logger.info("[Scheduler] VIT Scheduler disabled, using synchronous ViT computation")
 
+        # 🔧 VIT 流水线并行：保存最近接收的请求，用于转发给 PP1
+        self._last_recv_reqs = []
+        # 🔧 VIT 流水线并行：保存 VIT 完成的请求，用于转发给 PP1
+        self._vit_ready_reqs = []
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -759,26 +764,74 @@ class Scheduler(
         ]
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
+
+        # 🔧 日志控制：避免空闲循环时日志爆炸
+        loop_counter = 0
+        last_log_counter = 0
+
         while True:
             # 🔧 修复：在循环开始就轮询 VIT 结果
             # 这样即使 PP 通信阻塞，也能在下一次循环时获取 VIT 结果
             self.poll_vit_results()
 
             server_is_idle = True
+            loop_counter += 1
+            should_log = (loop_counter - last_log_counter >= 10000)
+
             for mb_id in range(self.pp_size):
+                if should_log:
+                    logger.info(f"[PP{self.pp_rank}] 🔄 Loop iteration: mb_id={mb_id}/{self.pp_size} (counter={loop_counter})")
+
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
-                recv_reqs = self.recv_requests()
-                self.process_input_requests(recv_reqs)
+                # 🔧 VIT 流水线并行架构：
+                # - PP0: 接收来自 Tokenizer Manager 的请求，处理 VIT 逻辑，转发给 PP1
+                # - PP1: 只接收来自 PP0 的请求，不接收来自 Tokenizer Manager 的请求
+
+                if self.pp_group.is_first_rank:
+                    # PP0: 接收来自 Tokenizer Manager 的请求
+                    recv_reqs = self.recv_requests()
+                    if recv_reqs or should_log:
+                        logger.info(f"[PP{self.pp_rank}] 📨 recv_requests returned {len(recv_reqs) if recv_reqs else 0} requests")
+                    self.process_input_requests(recv_reqs)
+                    # 保存 recv_reqs 以便后续转发给 PP1
+                    self._last_recv_reqs = recv_reqs
+                else:
+                    # PP1: 接收来自 PP0 的请求
+                    if self.attn_tp_rank == 0:
+                        dp_offset = self.attn_dp_rank * self.attn_tp_size
+                        if should_log:
+                            logger.info(f"[PP{self.pp_rank}] 📥 Receiving request metadata from PP{self.pp_rank-1}...")
+                        from sglang.srt.utils import point_to_point_pyobj
+                        prev_reqs = point_to_point_pyobj(
+                            [],
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            (self.pp_rank - 1) * self.tp_size + dp_offset,
+                            self.pp_rank * self.tp_size + dp_offset,
+                        )
+                        if prev_reqs:
+                            logger.info(f"[PP{self.pp_rank}] 📥 Received {len(prev_reqs)} TokenizedGenerateReqInput from PP{self.pp_rank-1}")
+                            self.process_input_requests(prev_reqs)
+                        elif should_log:
+                            logger.info(f"[PP{self.pp_rank}] 📥 Received 0 requests from PP{self.pp_rank-1}")
 
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
+                if mbs[mb_id] or should_log:
+                    logger.info(f"[PP{self.pp_rank}] 📦 get_next_batch_to_run: batch={'None' if mbs[mb_id] is None else f'#reqs={len(mbs[mb_id].reqs)}'}")
 
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
+                    logger.info(f"[PP{self.pp_rank}] 🚀 Running batch: mb_id={mb_id}, forward_mode={self.cur_batch.forward_mode}")
                     result = self.run_batch(self.cur_batch)
+                    logger.info(f"[PP{self.pp_rank}] ✅ Batch completed: mb_id={mb_id}")
+                else:
+                    if should_log:
+                        logger.info(f"[PP{self.pp_rank}] ⏭️ No batch to run for mb_id={mb_id}")
+                    result = None
 
                 # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
@@ -792,21 +845,28 @@ class Scheduler(
                                 "next_token_ids": next_token_ids,
                             }
                         )
+                        logger.info(f"[PP{self.pp_rank}] 📤 Sending output tokens to PP{self.pp_rank-1}: mb_id={mb_id}")
                         # send the output from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        logger.info(f"[PP{self.pp_rank}] ✅ Output tokens sent: mb_id={mb_id}")
+                    else:
+                        if should_log:
+                            logger.info(f"[PP{self.pp_rank}] ⏭️ No output to send (cur_batch is None): mb_id={mb_id}")
 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
+                    logger.info(f"[PP{self.pp_rank}] 📥 Receiving output from PP{self.pp_rank+1}: next_mb_id={next_mb_id}")
                     next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
+                    logger.info(f"[PP{self.pp_rank}] ✅ Received output: next_mb_id={next_mb_id}")
                     mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                     output_result = GenerationBatchResult(
                         logits_output=None,
@@ -815,10 +875,15 @@ class Scheduler(
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
                         bid=bids[next_mb_id],
-                        can_run_cuda_graph=result.can_run_cuda_graph,
+                        can_run_cuda_graph=result.can_run_cuda_graph if result else False,
                     )
+                    logger.info(f"[PP{self.pp_rank}] 🔄 Processing batch result: next_mb_id={next_mb_id}")
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
+                    logger.info(f"[PP{self.pp_rank}] ✅ Batch result processed: next_mb_id={next_mb_id}")
+                else:
+                    if should_log:
+                        logger.info(f"[PP{self.pp_rank}] ⏭️ No output to receive (mbs[{next_mb_id}] is None)")
 
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
@@ -827,46 +892,68 @@ class Scheduler(
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
+                        if should_log:
+                            logger.info(f"[PP{self.pp_rank}] 📤 Sending previous output tokens to PP{self.pp_rank+1}")
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        if should_log:
+                            logger.info(f"[PP{self.pp_rank}] ✅ Previous output tokens sent")
 
-                    # send out reqs to the next stage
+                    # 🔧 VIT 流水线并行：PP0 转发请求给 PP1
+                    # 只转发非 VIT pending 的请求（VIT 完成后才转发）
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
-                        # 🔧 流水线并行修复：不要在这里转发请求给 PP1
-                        # PP0 应该等待 VIT 完成后，在 Prefill 阶段才转发 hidden states
-                        # 这样 PP0 才能正确处理 VIT embedding 并进行 Prefill
-                        # recv_reqs 只包含新到达的请求，不应该在这里转发
-                        # 正确的流程：
-                        # 1. PP0 收到请求 → 提交 VIT 任务 → 加入 waiting_queue
-                        # 2. PP0 等待 VIT 完成 → poll_vit_results() 更新 embedding
-                        # 3. PP0 Prefill → 发送 hidden states 给 PP1
-                        # 4. PP1 收到 hidden states → 继续处理
+                        from sglang.srt.utils import point_to_point_pyobj
+                        reqs_to_forward = []
 
-                        # 注意：这里的 recv_reqs 是从 tokenizer 收到的新请求
-                        # 不应该转发给 PP1，因为 PP0 还没有处理 Prefill
-                        # PP1 会在 PP0 Prefill 后通过 hidden states 接收到请求信息
+                        # 1. 转发新收到的非 VIT pending 请求
+                        if hasattr(self, '_last_recv_reqs'):
+                            for req in self._last_recv_reqs:
+                                if not (hasattr(req, 'vit_pending') and req.vit_pending):
+                                    reqs_to_forward.append(req)
 
-                        # 因此，注释掉这段代码：
-                        # point_to_point_pyobj(
-                        #     recv_reqs,
-                        #     self.pp_rank * self.tp_size + dp_offset,
-                        #     self.world_group.cpu_group,
-                        #     self.pp_rank * self.tp_size + dp_offset,
-                        #     (self.pp_rank + 1) * self.tp_size + dp_offset,
-                        # )
-                        pass
+                        # 2. 转发 VIT 完成的请求
+                        if hasattr(self, '_vit_ready_reqs') and self._vit_ready_reqs:
+                            for req in self._vit_ready_reqs:
+                                if hasattr(req, '_original_recv_req'):
+                                    reqs_to_forward.append(req._original_recv_req)
+                                    logger.info(f"[PP{self.pp_rank}] 📤 Forwarding VIT-ready request {req.rid}")
+                            # 清空已转发的 VIT 请求
+                            self._vit_ready_reqs = []
+
+                        if reqs_to_forward or should_log:
+                            logger.info(f"[PP{self.pp_rank}] 📤 Forwarding {len(reqs_to_forward)} TokenizedGenerateReqInput to PP{self.pp_rank+1}")
+
+                        # 转发请求给 PP1（即使为空也发送 size=0，保证握手）
+                        point_to_point_pyobj(
+                            reqs_to_forward,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+                        if reqs_to_forward or should_log:
+                            logger.info(f"[PP{self.pp_rank}] ✅ Request metadata forwarded")
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        logger.info(f"[PP{self.pp_rank}] 📤 Sending hidden_states to PP{self.pp_rank+1}: mb_id={mb_id}")
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        logger.info(f"[PP{self.pp_rank}] ✅ Hidden_states sent: mb_id={mb_id}")
+                    else:
+                        if should_log:
+                            logger.info(f"[PP{self.pp_rank}] ⏭️ No hidden_states to send (cur_batch is None): mb_id={mb_id}")
 
                 pp_outputs = next_pp_outputs
+
+            # 🔧 重置日志计数器
+            if should_log:
+                last_log_counter = loop_counter
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -1020,6 +1107,10 @@ class Scheduler(
             if hasattr(recv_req, 'vit_pending'):
                 req.vit_pending = recv_req.vit_pending
                 logger.info(f"[Scheduler] 🔄 Inherited vit_pending={recv_req.vit_pending} from recv_req for {req.rid}")
+
+            # 🔧 VIT 流水线并行：保存原始请求，用于 VIT 完成后转发给 PP1
+            if self.pp_group.is_first_rank:
+                req._original_recv_req = recv_req
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1192,8 +1283,8 @@ class Scheduler(
             self._poll_count = 1
             logger.info(f"[Scheduler] 🔍 poll_vit_results() is being called")
 
-        # 每 100 次打印一次
-        if self._poll_count % 100 == 0:
+        # 每 10000 次打印一次
+        if self._poll_count % 10000 == 0:
             pending_count = sum(1 for req in self.waiting_queue if hasattr(req, 'vit_pending') and req.vit_pending)
             try:
                 import threading as _thr
@@ -1223,9 +1314,9 @@ class Scheduler(
             pass
 
         if not results:
-            # 检查是否有等待 VIT 的请求
+            # 🔧 减少日志：只在每 10000 次打印一次
             pending_count = sum(1 for req in self.waiting_queue if hasattr(req, 'vit_pending') and req.vit_pending)
-            if pending_count > 0 or _res_len_before > 0:
+            if (pending_count > 0 or _res_len_before > 0) and self._poll_count % 10000 == 0:
                 logger.info(
                     f"[Scheduler]  No VIT results drained this round. pending={pending_count}, "
                     f"client_results_len_before={_res_len_before}, after={_res_len_after}"
@@ -1256,6 +1347,12 @@ class Scheduler(
 
                     # 标记 VIT 计算完成
                     req.vit_pending = False
+                    # 🔧 VIT 流水线并行：将 VIT 完成的请求添加到待转发列表
+                    if hasattr(self, '_vit_ready_reqs'):
+                        # 需要找到原始的 TokenizedGenerateReqInput
+                        # 我们需要从 req 中提取原始请求信息
+                        self._vit_ready_reqs.append(req)
+                        logger.info(f"[Scheduler] 📋 Added VIT-ready request {req.rid} to forward queue")
                     found = True
                     break
 
@@ -1650,9 +1747,13 @@ class Scheduler(
 
             vit_ready_reqs.append(req)
 
-        # 记录跳过的请求（只在有 pending 请求时打印）
+        # 🔧 减少日志：只在每 10000 次打印一次
         if vit_pending_reqs and self.pp_group.is_first_rank:
-            logger.info(f"[Scheduler] ⏭️ Skipping {len(vit_pending_reqs)} requests waiting for VIT (ready={len(vit_ready_reqs)})")
+            if not hasattr(self, '_skip_vit_log_count'):
+                self._skip_vit_log_count = 0
+            self._skip_vit_log_count += 1
+            if self._skip_vit_log_count % 10000 == 0:
+                logger.info(f"[Scheduler] ⏭️ Skipping {len(vit_pending_reqs)} requests waiting for VIT (ready={len(vit_ready_reqs)}) [logged every 10000 times]")
 
         # Get requests from the waiting queue to a new prefill batch
         # 优先处理 VIT 已完成的请求
