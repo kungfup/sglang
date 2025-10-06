@@ -426,6 +426,11 @@ class VITSchedulerClient:
                         resp.embedding_dtype,
                     )
 
+                    # 🔍 检查从共享内存读取的 embedding 是否包含 NaN
+                    if torch.isnan(emb).any():
+                        logger.error(f"[VIT Client] ❌ Loaded embedding contains NaN! shape={emb.shape}")
+                    else:
+                        logger.info(f"[VIT Client] ✅ Loaded embedding is valid: shape={emb.shape}, min={emb.min().item():.4f}, max={emb.max().item():.4f}")
 
                     info = self.pending_requests.pop(resp.request_id, None)
                     if info is not None:

@@ -51,11 +51,15 @@ class VITResponse:
 
 class VITModelRunner:
     """VIT 模型运行器"""
-    
+
     def __init__(self, model_config, device: str = "cuda:0"):
         self.model_config = model_config
         self.device = device
         self.vit_model = None
+
+        # 初始化 load_config（复用官方加载逻辑需要）
+        from sglang.srt.configs.load_config import LoadConfig
+        self.load_config = LoadConfig()
         
     def load_model(self):
         """加载 ViT 模型"""
@@ -63,65 +67,166 @@ class VITModelRunner:
 
         logger.info(f"[VIT Runner] Loading ViT model type: {model_type}")
 
+        # 🔧 VIT 模型不使用量化（FP8 量化会导致 NaN）
+        # 即使主模型使用了量化，VIT 模型也应该使用 float32
+        logger.info(f"[VIT Runner] VIT model will use float32 (no quantization)")
+
         # 创建 ViT 模型
         if model_type == "qwen2_5_vl":
             from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
             self.vit_model = Qwen2_5_VisionTransformer(
                 self.model_config.hf_config.vision_config,
                 norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
+                quant_config=None,  # 🔧 不使用量化
             )
         elif model_type == "qwen2_vl":
             from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
             self.vit_model = Qwen2VisionTransformer(
                 self.model_config.hf_config.vision_config,
                 norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
+                quant_config=None,  # 🔧 不使用量化
             )
         else:
             raise ValueError(f"Unsupported model type for VIT Scheduler: {model_type}")
 
-        # 加载权重
-        logger.info(f"[VIT Runner] Loading ViT weights from {self.model_config.model_path}")
+        # 加载权重（复用官方加载逻辑，仅过滤 visual.* 权重）
+        logger.info(f"[VIT Runner] Loading ViT weights (official loader, visual.* only) from {self.model_config.model_path}")
+        from sglang.srt.model_loader.loader import get_model_loader, DefaultModelLoader
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
 
-        from safetensors import safe_open
-        import glob
+        # 🔧 关键修复：不创建完整模型（会触发 PP group 初始化），直接用 loader 获取权重
+        loader = get_model_loader(self.load_config)
 
-        # 查找所有 safetensors 文件
-        model_files = glob.glob(f"{self.model_config.model_path}/*.safetensors")
-        if not model_files:
-            raise ValueError(f"No safetensors files found in {self.model_config.model_path}")
+        # 获取所有权重的迭代器（不需要真实模型对象，只需要 model_config）
+        all_weights_iter = loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                model_or_path=self.model_config.model_path,
+                revision=getattr(self.model_config, 'revision', None),
+                prefix="",
+                fall_back_to_pt=True
+            )
+        )
 
-        logger.info(f"[VIT Runner] Found {len(model_files)} safetensors files")
-
-        # 加载 ViT 权重
-        vit_params = dict(self.vit_model.named_parameters())
+        # 收集 visual.* 权重，应用官方命名映射逻辑
+        params_dict = dict(self.vit_model.named_parameters())
         loaded_count = 0
 
-        for model_file in sorted(model_files):
-            with safe_open(model_file, framework="pt", device=str(self.device)) as f:
-                for key in f.keys():
-                    if key.startswith("visual."):
-                        # 移除 "visual." 前缀
-                        vit_key = key[len("visual."):]
-                        if vit_key in vit_params:
-                            tensor = f.get_tensor(key)
-                            vit_params[vit_key].data.copy_(tensor)
+        for name, tensor in all_weights_iter:
+            if not name.startswith("visual."):
+                continue
+
+            # 去掉 "visual." 前缀
+            vit_name = name[len("visual."):]
+
+            # 🔧 应用官方命名映射：attn.qkv. → attn.qkv_proj.
+            if ".attn.qkv." in vit_name:
+                vit_name = vit_name.replace(".attn.qkv.", ".attn.qkv_proj.")
+
+            # 🔧 处理堆叠参数（qkv_proj）
+            # Qwen2-VL 的视觉模块使用 qkv_proj 融合 q/k/v
+            if vit_name in params_dict:
+                param = params_dict[vit_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+                # 检查是否是 qkv_proj 的分片加载
+                if "qkv_proj" in vit_name:
+                    # 需要判断当前是 q/k/v 中的哪一个
+                    if ".q_proj." in name:
+                        loaded_shard_id = "q"
+                    elif ".k_proj." in name:
+                        loaded_shard_id = "k"
+                    elif ".v_proj." in name:
+                        loaded_shard_id = "v"
+                    else:
+                        # 已经是 qkv_proj，直接加载
+                        loaded_shard_id = None
+
+                    if loaded_shard_id is not None:
+                        # 使用 loaded_shard_id 参数
+                        from inspect import signature
+                        sig = signature(weight_loader)
+                        if "loaded_shard_id" in sig.parameters:
+                            weight_loader(param, tensor, loaded_shard_id=loaded_shard_id)
+                        else:
+                            weight_loader(param, tensor)
+                    else:
+                        weight_loader(param, tensor)
+                else:
+                    weight_loader(param, tensor)
+
+                loaded_count += 1
+            else:
+                # 参数不存在，可能是 q_proj/k_proj/v_proj 需要融合到 qkv_proj
+                # 尝试找到对应的 qkv_proj 参数
+                if ".q_proj." in name or ".k_proj." in name or ".v_proj." in name:
+                    # 替换为 qkv_proj
+                    qkv_name = vit_name.replace(".q_proj.", ".qkv_proj.").replace(".k_proj.", ".qkv_proj.").replace(".v_proj.", ".qkv_proj.")
+                    if qkv_name in params_dict:
+                        param = params_dict[qkv_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+                        # 确定是 q/k/v 中的哪一个
+                        if ".q_proj." in name:
+                            loaded_shard_id = "q"
+                        elif ".k_proj." in name:
+                            loaded_shard_id = "k"
+                        elif ".v_proj." in name:
+                            loaded_shard_id = "v"
+
+                        from inspect import signature
+                        sig = signature(weight_loader)
+                        if "loaded_shard_id" in sig.parameters:
+                            weight_loader(param, tensor, loaded_shard_id=loaded_shard_id)
+                            loaded_count += 1
+                        else:
+                            weight_loader(param, tensor)
                             loaded_count += 1
 
-        logger.info(f"[VIT Runner] Loaded {loaded_count} ViT parameters")
+        logger.info(f"[VIT Runner] Loaded {loaded_count} visual weights from checkpoint")
 
         self.vit_model.to(self.device)
         self.vit_model.eval()
 
-        logger.info(f"[VIT Runner] ViT model loaded on {self.device}")
+        logger.info(f"[VIT Runner] ✅ ViT weights loaded via official path; model ready on {self.device}")
+
+        # 🔍 检查 VIT 模型的 dtype
+        first_param = next(self.vit_model.parameters())
+        logger.info(f"[VIT Runner] ViT model loaded on {self.device}, dtype={first_param.dtype}")
+
+        # 🔍 检查是否有 NaN 参数
+        nan_count = 0
+        for name, param in self.vit_model.named_parameters():
+            if torch.isnan(param).any():
+                logger.error(f"[VIT Runner] ❌ Parameter {name} contains NaN!")
+                nan_count += 1
+        if nan_count > 0:
+            logger.error(f"[VIT Runner] ❌ Found {nan_count} parameters with NaN!")
+        else:
+            logger.info(f"[VIT Runner] ✅ All parameters are valid (no NaN)")
     
     def compute(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
         """计算 ViT embedding"""
         pixel_values = pixel_values.to(self.device)
         image_grid_thw = image_grid_thw.to(self.device)
-        
+
+        # 🔍 检查输入数据
+        if torch.isnan(pixel_values).any():
+            logger.error(f"[VIT Runner] ❌ Input pixel_values contains NaN!")
+        if torch.isinf(pixel_values).any():
+            logger.error(f"[VIT Runner] ❌ Input pixel_values contains Inf!")
+        logger.info(f"[VIT Runner] 📊 Input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}, min={pixel_values.min().item():.4f}, max={pixel_values.max().item():.4f}")
+        logger.info(f"[VIT Runner] 📊 Input image_grid_thw: {image_grid_thw}")
+
         with torch.no_grad():
             embedding = self.vit_model(pixel_values, grid_thw=image_grid_thw)
-        
+
+        # 🔍 检查输出数据
+        if torch.isnan(embedding).any():
+            logger.error(f"[VIT Runner] ❌ Output embedding contains NaN!")
+        if torch.isinf(embedding).any():
+            logger.error(f"[VIT Runner] ❌ Output embedding contains Inf!")
+        logger.info(f"[VIT Runner] 📊 Output embedding: shape={embedding.shape}, dtype={embedding.dtype}, min={embedding.min().item() if not torch.isnan(embedding).any() else 'nan'}, max={embedding.max().item() if not torch.isnan(embedding).any() else 'nan'}")
+
         return embedding
 
 
@@ -338,13 +443,22 @@ class VITScheduler:
         else:
             # 计算 ViT
             embedding = self.model_runner.compute(pixel_values, image_grid_thw)
-            
+
+            # 🔍 检查 embedding 是否包含 NaN
+            if torch.isnan(embedding).any():
+                logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+            else:
+                logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
+
             # 更新缓存
             self._update_cache(hash_val, embedding)
-        
+
         # 保存到共享内存
         embedding_shm_name = f"vit_emb_{request.request_id}"
         self._save_tensor_to_shm(embedding, embedding_shm_name)
+
+        # 🔍 检查保存到共享内存后是否仍然有效
+        logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
         
         compute_time = time.time() - start_time
         self.total_compute_time += compute_time

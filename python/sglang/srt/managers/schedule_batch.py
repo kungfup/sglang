@@ -339,6 +339,34 @@ class MultimodalInputs:
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
 
+    def to_dict(self) -> dict:
+        """Convert MultimodalInputs to dict format for serialization."""
+        result = {
+            "mm_items": self.mm_items,
+        }
+
+        optional_args = [
+            "image_pad_len",
+            "num_image_tokens",
+            "mrope_positions",
+            "mrope_position_delta",
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "slice_start_id",
+            "slice_end_id",
+            "video_token_id",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_token_id",
+        ]
+        for arg in optional_args:
+            value = getattr(self, arg, None)
+            if value is not None:
+                result[arg] = value
+
+        return result
+
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(

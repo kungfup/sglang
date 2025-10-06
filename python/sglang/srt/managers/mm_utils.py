@@ -277,7 +277,12 @@ def _get_precomputed_embedding(
         result = torch.concat(precomputed_features)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
+        logger.info(f"[MM Utils] ✅ Using precomputed embedding: shape={result.shape}, dtype={result.dtype}, device={result.device}")
+        logger.info(f"[MM Utils] 📊 Precomputed embedding stats: min={result.min().item():.4f}, max={result.max().item():.4f}, mean={result.mean().item():.4f}, std={result.std().item():.4f}")
         return result
+    else:
+        logger.info(f"[MM Utils] ❌ No precomputed embedding found, will call VIT model")
+        return None
     return None
 
 
@@ -303,6 +308,9 @@ def _get_chunked_prefill_embedding(
         embedding_per_req = embedding_cache.get(embedding_items_hash)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
+            # 🔍 添加日志：打印原生 VIT 模型计算的 embedding 数值
+            logger.info(f"[MM Utils] 🔧 Native VIT embedding computed: shape={embedding_per_req.shape}, dtype={embedding_per_req.dtype}")
+            logger.info(f"[MM Utils] 📊 Native VIT embedding stats: min={embedding_per_req.min().item():.4f}, max={embedding_per_req.max().item():.4f}, mean={embedding_per_req.mean().item():.4f}, std={embedding_per_req.std().item():.4f}")
             if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. Consider increasing the "

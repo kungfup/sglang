@@ -813,6 +813,19 @@ class Scheduler(
                         )
                         if prev_reqs:
                             logger.info(f"[PP{self.pp_rank}] 📥 Received {len(prev_reqs)} TokenizedGenerateReqInput from PP{self.pp_rank-1}")
+
+                            # 🔍 检查接收到的请求是否包含 precomputed_features
+                            for recv_req in prev_reqs:
+                                if hasattr(recv_req, 'mm_inputs') and recv_req.mm_inputs is not None:
+                                    if isinstance(recv_req.mm_inputs, dict) and 'mm_items' in recv_req.mm_inputs:
+                                        mm_items = recv_req.mm_inputs['mm_items']
+                                        for i, mm_item in enumerate(mm_items):
+                                            has_precomputed = hasattr(mm_item, 'precomputed_features') and mm_item.precomputed_features is not None
+                                            if has_precomputed:
+                                                logger.info(f"[PP{self.pp_rank}] ✅ Request {recv_req.rid} mm_item[{i}] has precomputed_features: shape={mm_item.precomputed_features.shape}")
+                                            else:
+                                                logger.warning(f"[PP{self.pp_rank}] ❌ Request {recv_req.rid} mm_item[{i}] has NO precomputed_features!")
+
                             self.process_input_requests(prev_reqs)
                         elif should_log:
                             logger.info(f"[PP{self.pp_rank}] 📥 Received 0 requests from PP{self.pp_rank-1}")
@@ -918,7 +931,23 @@ class Scheduler(
                         if hasattr(self, '_vit_ready_reqs') and self._vit_ready_reqs:
                             for req in self._vit_ready_reqs:
                                 if hasattr(req, '_original_recv_req'):
-                                    reqs_to_forward.append(req._original_recv_req)
+                                    original_req = req._original_recv_req
+
+                                    # 🔧 关键修复：将 VIT embedding 复制到原始请求的 mm_inputs
+                                    if req.multimodal_inputs is not None and original_req.mm_inputs is not None:
+                                        # 确保 mm_inputs 是 dict 格式
+                                        if not isinstance(original_req.mm_inputs, dict):
+                                            logger.error(f"[PP{self.pp_rank}] ❌ mm_inputs is not dict: {type(original_req.mm_inputs)}")
+                                        else:
+                                            # 将更新后的 mm_items（包含 precomputed_features）复制到原始请求
+                                            original_req.mm_inputs["mm_items"] = req.multimodal_inputs.mm_items
+                                            logger.info(f"[PP{self.pp_rank}] 🔧 Updated mm_inputs for request {req.rid} with VIT embedding")
+
+                                    # 🔧 关键修复：将 vit_pending 设置为 False，告诉 PP1 VIT 已经完成
+                                    original_req.vit_pending = False
+                                    logger.info(f"[PP{self.pp_rank}] 🔧 Set vit_pending=False for request {req.rid}")
+
+                                    reqs_to_forward.append(original_req)
                                     logger.info(f"[PP{self.pp_rank}] 📤 Forwarding VIT-ready request {req.rid}")
                             # 清空已转发的 VIT 请求
                             self._vit_ready_reqs = []
