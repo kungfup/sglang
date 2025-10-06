@@ -548,6 +548,7 @@ def run_scheduler_process(
     1. DECODE进程先启动，加载模型权重，生成IPC信息
     2. PREFILL进程后启动，通过IPC共享模型权重，避免重复加载
     """
+
     # 🔧 设置Semi-PD PP模式的环境变量
     os.environ["SGLANG_ENABLE_SEMI_PD"] = "1"
     os.environ["SGLANG_PP_RANK"] = str(pp_rank)

@@ -252,18 +252,14 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             consecutive_again = 0  # 🔧 FIX: Track consecutive zmq.Again
             max_consecutive_again = 5  # 🔧 FIX: Allow up to 5 consecutive zmq.Again before giving up
 
-            # 🔧 节流：每10000次打印一次
-            try:
-                import os as _os
-                if _os.getenv("SGLANG_SEMIPD_TRACE") == "1":
-                    if not hasattr(self, '_drain_start_count'):
-                        self._drain_start_count = 0
-                    self._drain_start_count += 1
-                    if self._drain_start_count % 10000 == 1:
-                        sock_fd = getattr(self.recv_from_decode_forwarded, 'FD', None) if self.recv_from_decode_forwarded else None
-                        logger.info(f"[PREFILL-PP{self.pp_rank}] _drain START: socket={self.recv_from_decode_forwarded is not None} fd={sock_fd} max_iters={max_iters} (count={self._drain_start_count})")
-            except Exception:
-                pass
+            # 🔧 DEBUG: Always log first 5 calls to verify this function is being called
+            if not hasattr(self, '_drain_start_count'):
+                self._drain_start_count = 0
+            self._drain_start_count += 1
+
+            if self._drain_start_count <= 5:
+                sock_fd = getattr(self.recv_from_decode_forwarded, 'FD', None) if self.recv_from_decode_forwarded else None
+                logger.info(f"[PREFILL-PP{self.pp_rank}] _drain #{self._drain_start_count}: socket={self.recv_from_decode_forwarded is not None} fd={sock_fd} max_iters={max_iters}")
             while it < max_iters:
                 it += 1
                 try:
@@ -568,16 +564,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         This ensures PP event loop doesn't block while maintaining Semi-PD authorization flow.
         """
         # 🔧 DEBUG: Log function entry (throttled to avoid log flood)
-        # 🔧 节流：每500次打印一次
         if not hasattr(self, '_get_next_batch_count'):
             self._get_next_batch_count = 0
         self._get_next_batch_count += 1
-        if self._get_next_batch_count % 100000 == 1:
-            if os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes"):
-                wq_len = len(self.waiting_queue)
-                inbox_len = len(getattr(self, '_auth_inbox', []))
-                if wq_len > 0 or inbox_len > 0:
-                    logger.info(f"[PREFILL-PP{self.pp_rank}] get_next_batch_to_run ENTER: wq={wq_len} inbox={inbox_len} (count={self._get_next_batch_count})")
+
+        # 🔧 DEBUG: Always log first 5 calls to verify this function is being called
+        if self._get_next_batch_count <= 5:
+            wq_len = len(self.waiting_queue)
+            inbox_len = len(getattr(self, '_auth_inbox', []))
+            logger.info(f"[PREFILL-PP{self.pp_rank}] get_next_batch_to_run #{self._get_next_batch_count}: wq={wq_len} inbox={inbox_len}")
 
         # 🔧 CRITICAL: Drain forwarded requests and authorizations using the proper drain function
         # This must happen in every call to ensure we don't miss messages

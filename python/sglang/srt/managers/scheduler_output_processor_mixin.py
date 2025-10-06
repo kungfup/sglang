@@ -800,8 +800,8 @@ class SchedulerOutputProcessorMixin:
                 )
             )
         else:
-            # 🔧 DEBUG: Log when no requests to send for Semi-PD + PP debugging
-            if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
+            # 🔧 DEBUG: Log when no requests to send for Semi-PD + PP debugging (throttled)
+            if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1 and _so_log:
                 logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} No requests to send to detokenizer (rids is empty)")
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
