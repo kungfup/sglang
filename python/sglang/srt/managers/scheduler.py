@@ -1366,6 +1366,12 @@ class Scheduler(
                             if mm_item.modality == Modality.IMAGE:
                                 _emb = embedding.to(self.device)
                                 mm_item.precomputed_features = _emb
+
+                                # 🔧 记录 image_hash 用于后续释放
+                                if not hasattr(req, '_vit_image_hash'):
+                                    req._vit_image_hash = mm_item.hash
+                                    logger.info(f"[Scheduler] 📝 Recorded image_hash={mm_item.hash} for request {req.rid}")
+
                                 try:
                                     logger.info(
                                         f"[Scheduler] ✅ VIT embedding ready for request {req.rid}; "
@@ -1954,6 +1960,19 @@ class Scheduler(
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
+
+                    # 🔧 事件驱动释放：PP0 在 forward 完成后立即通知 VIT Scheduler 释放 embedding
+                    # 只在 PREFILL 阶段释放（DECODE 阶段不需要 VIT embedding）
+                    if hasattr(self, 'vit_client') and self.vit_client and self.vit_client.enable:
+                        if batch.forward_mode.is_prefill():
+                            for req in batch.reqs:
+                                # 使用之前记录的 image_hash
+                                if hasattr(req, '_vit_image_hash'):
+                                    image_hash = req._vit_image_hash
+                                    self.vit_client.notify_embedding_consumed(image_hash)
+                                    logger.info(f"[PP{self.pp_rank}] 🗑️ Notified VIT Scheduler to free embedding: hash={image_hash}, req_id={req.rid}")
+                                    # 清除标记，避免重复释放
+                                    delattr(req, '_vit_image_hash')
                 bid = model_worker_batch.bid
             else:
                 (

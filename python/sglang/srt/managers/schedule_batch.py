@@ -266,10 +266,10 @@ class MultimodalDataItem:
 
         if self.is_image():
             self.hash = hash_feature(self.pixel_values)
-            self.pad_value = self.hash % (2**31 - 1)
+            self.pad_value = self.hash % (1 << 30)
         elif self.is_audio():
             self.hash = hash_feature(self.audio_features)
-            self.pad_value = self.hash % (2**31 - 1)
+            self.pad_value = self.hash % (1 << 30)
         else:
             raise ValueError(f"Unknown modality: {self.modality}")
 

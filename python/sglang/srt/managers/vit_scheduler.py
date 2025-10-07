@@ -206,41 +206,63 @@ class VITModelRunner:
     
     def compute(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
         """计算 ViT embedding"""
-        pixel_values = pixel_values.to(self.device)
-        image_grid_thw = image_grid_thw.to(self.device)
+        try:
+            logger.info(f"[VIT Runner] 🚀 Starting compute: pixel_values.shape={pixel_values.shape}, device={pixel_values.device}")
 
-        # 🔍 检查输入数据
-        if torch.isnan(pixel_values).any():
-            logger.error(f"[VIT Runner] ❌ Input pixel_values contains NaN!")
-        if torch.isinf(pixel_values).any():
-            logger.error(f"[VIT Runner] ❌ Input pixel_values contains Inf!")
-        logger.info(f"[VIT Runner] 📊 Input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}, min={pixel_values.min().item():.4f}, max={pixel_values.max().item():.4f}")
-        logger.info(f"[VIT Runner] 📊 Input image_grid_thw: {image_grid_thw}")
+            # 确保 CUDA 操作在正确的设备上执行
+            with torch.cuda.device(self.device):
+                # 移动到 GPU（添加超时保护）
+                logger.info(f"[VIT Runner] 📥 Moving tensors to {self.device}...")
+                pixel_values = pixel_values.to(self.device, non_blocking=False)
+                image_grid_thw = image_grid_thw.to(self.device, non_blocking=False)
 
-        with torch.no_grad():
-            embedding = self.vit_model(pixel_values, grid_thw=image_grid_thw)
+                # 同步 CUDA 操作，确保数据已经传输完成
+                torch.cuda.synchronize(self.device)
+                logger.info(f"[VIT Runner] ✅ Tensors moved to {self.device}")
 
-        # 🔍 检查输出数据
-        if torch.isnan(embedding).any():
-            logger.error(f"[VIT Runner] ❌ Output embedding contains NaN!")
-        if torch.isinf(embedding).any():
-            logger.error(f"[VIT Runner] ❌ Output embedding contains Inf!")
-        logger.info(f"[VIT Runner] 📊 Output embedding: shape={embedding.shape}, dtype={embedding.dtype}, min={embedding.min().item() if not torch.isnan(embedding).any() else 'nan'}, max={embedding.max().item() if not torch.isnan(embedding).any() else 'nan'}")
+                # 🔍 检查输入数据
+                if torch.isnan(pixel_values).any():
+                    logger.error(f"[VIT Runner] ❌ Input pixel_values contains NaN!")
+                if torch.isinf(pixel_values).any():
+                    logger.error(f"[VIT Runner] ❌ Input pixel_values contains Inf!")
+                logger.info(f"[VIT Runner] 📊 Input pixel_values: shape={pixel_values.shape}, dtype={pixel_values.dtype}, min={pixel_values.min().item():.4f}, max={pixel_values.max().item():.4f}")
+                logger.info(f"[VIT Runner] 📊 Input image_grid_thw: {image_grid_thw}")
 
-        return embedding
+                # 执行 ViT 前向传播
+                logger.info(f"[VIT Runner] 🔄 Running ViT forward pass...")
+                with torch.no_grad():
+                    embedding = self.vit_model(pixel_values, grid_thw=image_grid_thw)
+
+                # 同步 CUDA 操作，确保计算完成
+                torch.cuda.synchronize(self.device)
+                logger.info(f"[VIT Runner] ✅ ViT forward pass completed")
+
+                # 🔍 检查输出数据
+                if torch.isnan(embedding).any():
+                    logger.error(f"[VIT Runner] ❌ Output embedding contains NaN!")
+                if torch.isinf(embedding).any():
+                    logger.error(f"[VIT Runner] ❌ Output embedding contains Inf!")
+                logger.info(f"[VIT Runner] 📊 Output embedding: shape={embedding.shape}, dtype={embedding.dtype}, min={embedding.min().item() if not torch.isnan(embedding).any() else 'nan'}, max={embedding.max().item() if not torch.isnan(embedding).any() else 'nan'}")
+
+                return embedding
+
+        except Exception as e:
+            logger.error(f"[VIT Runner] ❌ Error in compute: {e}", exc_info=True)
+            raise
 
 
 class VITScheduler:
     """
     VIT Scheduler - 独立的 ViT 计算调度器
-    
+
     功能:
     1. 接收来自主 Scheduler 的 ViT 计算请求
     2. 批量计算 ViT
-    3. 缓存 embedding
+    3. 缓存 embedding（LRU 策略）
     4. 返回结果给主 Scheduler
+    5. 事件驱动释放缓存
     """
-    
+
     def __init__(
         self,
         model_config,
@@ -248,7 +270,7 @@ class VITScheduler:
         zmq_port: int = 5555,
         batch_size: int = 4,
         batch_timeout_ms: float = 10.0,
-        cache_size_mb: int = 1024,
+        cache_size_mb: int = None,
     ):
         """
         Args:
@@ -257,15 +279,23 @@ class VITScheduler:
             zmq_port: ZMQ 通信端口
             batch_size: 批量计算的最大 batch size
             batch_timeout_ms: 批量计算的超时时间（毫秒）
-            cache_size_mb: Embedding 缓存大小（MB）
+            cache_size_mb: Embedding 缓存大小（MB），默认从环境变量读取
         """
         self.model_config = model_config
         self.device = device
         self.zmq_port = zmq_port
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0
+
+        # 缓存大小配置（从环境变量读取，默认 2048 MB）
+        if cache_size_mb is None:
+            cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "2048"))
         self.cache_size_mb = cache_size_mb
-        
+        self.max_cache_size_bytes = cache_size_mb * 1024 * 1024
+
+        # 测压模式开关（禁用缓存以准确测试性能）
+        self.benchmark_mode = os.environ.get("SGLANG_VIT_BENCHMARK_MODE", "0") == "1"
+
         # 初始化 ZMQ（使用 PAIR 模式，一对一最可靠）
         self.context = zmq.Context()
 
@@ -283,10 +313,17 @@ class VITScheduler:
         self.model_runner = VITModelRunner(model_config, device)
         self.model_runner.load_model()
 
-        # 初始化缓存
-        self.embedding_cache: Dict[int, torch.Tensor] = {}
+        # 初始化缓存（使用 OrderedDict 实现 LRU）
+        from collections import OrderedDict
+        self.embedding_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.cache_size_bytes = 0
-        self.max_cache_size_bytes = cache_size_mb * 1024 * 1024
+
+        # 日志输出
+        if self.benchmark_mode:
+            logger.warning("[VIT Scheduler] ⚠️ Benchmark mode enabled: cache is DISABLED")
+        else:
+            logger.info(f"[VIT Scheduler] Cache enabled: {cache_size_mb} MB (LRU strategy, ~{cache_size_mb // 132} embeddings)")
+            logger.info(f"[VIT Scheduler] Event-driven cache release enabled")
 
         # 批处理队列
         self.pending_requests: List[VITRequest] = []  # 不再需要 client_id
@@ -415,85 +452,174 @@ class VITScheduler:
         if self.total_requests % 100 == 0:
             self._log_stats()
 
+        # 定期清理显存碎片（每 10 个批次）
+        if self.total_requests % 10 == 0:
+            torch.cuda.empty_cache()
+
     def _process_single_request(self, request: VITRequest) -> VITResponse:
         """处理单个请求"""
         start_time = time.time()
-        
-        # 从共享内存加载输入
-        pixel_values = self._load_tensor_from_shm(
-            request.pixel_values_shm_name,
-            request.pixel_values_shape,
-            request.pixel_values_dtype,
-        )
-        image_grid_thw = self._load_tensor_from_shm(
-            request.image_grid_thw_shm_name,
-            request.image_grid_thw_shape,
-            request.image_grid_thw_dtype,
-        )
-        
-        # 计算 hash
-        hash_val = self._compute_hash(pixel_values, image_grid_thw)
-        
-        # 查询缓存
-        from_cache = False
-        if hash_val in self.embedding_cache:
-            embedding = self.embedding_cache[hash_val]
-            from_cache = True
-            self.cache_hits += 1
-        else:
-            # 计算 ViT
-            embedding = self.model_runner.compute(pixel_values, image_grid_thw)
 
-            # 🔍 检查 embedding 是否包含 NaN
-            if torch.isnan(embedding).any():
-                logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+        try:
+            logger.info(f"[VIT Scheduler] 🔄 Processing request: {request.request_id}")
+
+            # 从共享内存加载输入
+            logger.info(f"[VIT Scheduler] 📥 Loading tensors from shared memory...")
+            pixel_values = self._load_tensor_from_shm(
+                request.pixel_values_shm_name,
+                request.pixel_values_shape,
+                request.pixel_values_dtype,
+            )
+            logger.info(f"[VIT Scheduler] ✅ Loaded pixel_values: shape={pixel_values.shape}")
+
+            image_grid_thw = self._load_tensor_from_shm(
+                request.image_grid_thw_shm_name,
+                request.image_grid_thw_shape,
+                request.image_grid_thw_dtype,
+            )
+            logger.info(f"[VIT Scheduler] ✅ Loaded image_grid_thw: shape={image_grid_thw.shape}")
+
+            # 计算 hash
+            logger.info(f"[VIT Scheduler] 🔢 Computing hash...")
+            hash_val = self._compute_hash(pixel_values, image_grid_thw)
+            logger.info(f"[VIT Scheduler] ✅ Hash computed: {hash_val}")
+
+            # 查询缓存（使用 LRU 更新）
+            from_cache = False
+            embedding = self._get_cached_embedding(hash_val)
+            if embedding is not None:
+                from_cache = True
+                self.cache_hits += 1
+                logger.info(f"[VIT Scheduler] ✅ Cache hit: hash={hash_val}")
             else:
-                logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
+                # 计算 ViT
+                logger.info(f"[VIT Scheduler] 🚀 Cache miss, computing ViT embedding...")
+                embedding = self.model_runner.compute(pixel_values, image_grid_thw)
+                logger.info(f"[VIT Scheduler] ✅ ViT computation completed")
 
-            # 更新缓存
-            self._update_cache(hash_val, embedding)
+                # 🔍 检查 embedding 是否包含 NaN
+                if torch.isnan(embedding).any():
+                    logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+                else:
+                    logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
 
-        # 保存到共享内存
-        embedding_shm_name = f"vit_emb_{request.request_id}"
-        self._save_tensor_to_shm(embedding, embedding_shm_name)
+                # 更新缓存（LRU）
+                logger.info(f"[VIT Scheduler] 💾 Updating cache...")
+                self._update_cache(hash_val, embedding)
+                logger.info(f"[VIT Scheduler] ✅ Cache updated")
 
-        # 🔍 检查保存到共享内存后是否仍然有效
-        logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
-        
-        compute_time = time.time() - start_time
-        self.total_compute_time += compute_time
-        
-        # 构造响应
-        response = VITResponse(
-            request_id=request.request_id,
-            embedding_shm_name=embedding_shm_name,
-            embedding_shape=tuple(embedding.shape),
-            embedding_dtype=str(embedding.dtype).replace('torch.', ''),
-            compute_time=compute_time,
-            from_cache=from_cache,
-        )
-        
-        return response
+            # 保存到共享内存
+            logger.info(f"[VIT Scheduler] 💾 Saving embedding to shared memory...")
+            embedding_shm_name = f"vit_emb_{request.request_id}"
+            self._save_tensor_to_shm(embedding, embedding_shm_name)
+
+            # 🔍 检查保存到共享内存后是否仍然有效
+            logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
+
+            compute_time = time.time() - start_time
+            self.total_compute_time += compute_time
+
+            # 构造响应
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_shm_name=embedding_shm_name,
+                embedding_shape=tuple(embedding.shape),
+                embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                compute_time=compute_time,
+                from_cache=from_cache,
+            )
+
+            logger.info(f"[VIT Scheduler] ✅ Request processed: {request.request_id}, compute_time={compute_time*1000:.1f}ms")
+            return response
+
+        except Exception as e:
+            logger.error(f"[VIT Scheduler] ❌ Error processing request {request.request_id}: {e}", exc_info=True)
+            raise
     
     def _update_cache(self, hash_val: int, embedding: torch.Tensor):
-        """更新缓存"""
+        """更新缓存（LRU 策略）"""
+        # 测压模式：不缓存
+        if self.benchmark_mode:
+            return
+
+        # 如果已在缓存中，更新访问时间
+        if hash_val in self.embedding_cache:
+            self.embedding_cache.move_to_end(hash_val)
+            return
+
         embedding_size = embedding.element_size() * embedding.nelement()
-        
-        # 如果缓存已满，移除最旧的条目
+
+        # LRU 驱逐：移除最久未使用的条目
         while self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
             if len(self.embedding_cache) == 0:
                 break
-            old_hash = next(iter(self.embedding_cache))
-            old_embedding = self.embedding_cache.pop(old_hash)
-            self.cache_size_bytes -= old_embedding.element_size() * old_embedding.nelement()
-        
-        # 添加新条目
-        self.embedding_cache[hash_val] = embedding.cpu()
+            lru_hash, lru_embedding = self.embedding_cache.popitem(last=False)
+            evicted_size = lru_embedding.element_size() * lru_embedding.nelement()
+            self.cache_size_bytes -= evicted_size
+            logger.warning(f"[VIT Scheduler] 🗑️ Evicted LRU embedding (fallback): hash={lru_hash}, size={evicted_size/1024/1024:.2f} MB")
+
+        # 添加新条目（直接存储在 GPU，不调用 .cpu()）
+        self.embedding_cache[hash_val] = embedding
         self.cache_size_bytes += embedding_size
-    
+
+    def _get_cached_embedding(self, hash_val: int) -> Optional[torch.Tensor]:
+        """查询缓存（更新 LRU）"""
+        # 测压模式：不使用缓存
+        if self.benchmark_mode:
+            return None
+
+        if hash_val in self.embedding_cache:
+            # 更新访问时间
+            self.embedding_cache.move_to_end(hash_val)
+            return self.embedding_cache[hash_val]
+        return None
+
+    def _free_cache(self, hash_val: int):
+        """释放缓存（事件驱动）"""
+        if hash_val in self.embedding_cache:
+            embedding = self.embedding_cache.pop(hash_val)
+            freed_size = embedding.element_size() * embedding.nelement()
+            self.cache_size_bytes -= freed_size
+            logger.info(f"[VIT Scheduler] 🗑️ Freed embedding (event-driven): hash={hash_val}, size={freed_size/1024/1024:.2f} MB")
+
+    def _drain_free_signals(self):
+        """持续检查并处理所有待处理的释放信号（非阻塞）"""
+        processed_count = 0
+        while True:
+            try:
+                message = self.socket.recv(zmq.NOBLOCK)
+                request_dict = pickle.loads(message)
+
+                # 只处理释放信号，其他消息不处理（避免打乱请求顺序）
+                if request_dict.get("type") == "free_embedding":
+                    image_hash = request_dict["image_hash"]
+                    self._free_cache(image_hash)
+                    processed_count += 1
+                else:
+                    # 非释放信号，直接处理
+                    if "test" in request_dict and request_dict["test"] == "connection_test":
+                        self.socket.send(pickle.dumps({"test_response": "ok"}))
+                    else:
+                        # 这是一个 VIT 计算请求，添加到待处理队列
+                        request = VITRequest(**request_dict)
+                        self.pending_requests.append(request)
+                        self.total_requests += 1
+                        logger.info(f"[VIT Scheduler] Received request (via drain): {request.request_id}")
+                    # 🔧 修复：继续处理后续消息，而不是 break
+                    # 这样可以确保所有待处理的消息都被接收
+            except zmq.Again:
+                # 没有更多消息了
+                break
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] Error draining free signals: {e}", exc_info=True)
+                break
+
+        if processed_count > 0:
+            logger.info(f"[VIT Scheduler] 🔄 Drained {processed_count} free signals")
+
     def run(self):
-        """主循环（支持批量处理）"""
-        logger.info("[VIT Scheduler] Starting main loop (batch mode)")
+        """主循环（支持批量处理 + 事件驱动释放）"""
+        logger.info("[VIT Scheduler] Starting main loop (batch mode + event-driven release)")
 
         try:
             while True:
@@ -504,6 +630,12 @@ class VITScheduler:
                         message = self.socket.recv(zmq.NOBLOCK)
 
                         request_dict = pickle.loads(message)
+
+                        # 处理释放信号（事件驱动）
+                        if request_dict.get("type") == "free_embedding":
+                            image_hash = request_dict["image_hash"]
+                            self._free_cache(image_hash)
+                            continue
 
                         # 检查是否是测试消息
                         if "test" in request_dict and request_dict["test"] == "connection_test":
@@ -536,7 +668,12 @@ class VITScheduler:
                 if should_compute:
                     self._process_batch()
                     self.last_batch_time = time.time()
+
+                    # 🔧 处理批次后立即检查释放信号（避免延迟）
+                    self._drain_free_signals()
                 else:
+                    # 🔧 休眠前也检查释放信号
+                    self._drain_free_signals()
                     # 短暂休眠，避免 CPU 空转
                     time.sleep(0.001)
                     

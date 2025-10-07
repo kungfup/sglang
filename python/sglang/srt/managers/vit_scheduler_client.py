@@ -14,6 +14,7 @@ import pickle
 import logging
 import threading
 from queue import Queue, Empty
+from collections import deque
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 from multiprocessing import shared_memory
@@ -133,7 +134,9 @@ class VITSchedulerClient:
         self.timeout_count = 0
 
         # 后台通信线程（唯一持有 socket）
-        self._tx_queue: Queue = Queue()
+        # 🔧 使用 deque 代替 Queue，支持从队列开头插入（用于重新入队）
+        self._tx_queue: deque = deque()
+        self._tx_queue_lock = threading.Lock()
         self._results: Dict[str, torch.Tensor] = {}
         self._results_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -228,7 +231,8 @@ class VITSchedulerClient:
 
             # 将请求投递到后台线程发送（避免跨线程触碰 ZMQ socket）
             try:
-                self._tx_queue.put_nowait((request_id, asdict(request)))
+                with self._tx_queue_lock:
+                    self._tx_queue.append((request_id, asdict(request)))
             except Exception as e:
                 logger.error(f"[VIT Client] ❌ Failed to enqueue request {request_id}: {e}")
                 raise
@@ -397,19 +401,30 @@ class VITSchedulerClient:
             try:
                 # 尽量一次性发送多条，避免频繁系统调用
                 for _ in range(32):
+                    msg_type = None
+                    msg_data = None
+
+                    # 从 deque 中取出消息
+                    with self._tx_queue_lock:
+                        if len(self._tx_queue) == 0:
+                            break
+                        msg_type, msg_data = self._tx_queue.popleft()
+
                     try:
-                        request_id, req_dict = self._tx_queue.get_nowait()
-                    except Empty:
-                        break
-                    try:
-                        self.socket.send(pickle.dumps(req_dict), zmq.NOBLOCK)
-                        logger.debug(f"[VIT Client] 📤 sent {request_id}")
+                        # msg_type 可以是 request_id（计算请求）或 "free"（释放信号）
+                        self.socket.send(pickle.dumps(msg_data), zmq.NOBLOCK)
+                        if msg_type == "free":
+                            logger.info(f"[VIT Client] 📤 sent free signal: hash={msg_data.get('image_hash')}")
+                        else:
+                            logger.info(f"[VIT Client] 📤 sent VIT request: {msg_type}")
                     except zmq.Again:
-                        # Socket not ready. Requeue and retry later.
-                        self._tx_queue.put((request_id, req_dict))
+                        # Socket not ready. Requeue to the FRONT and retry later.
+                        logger.warning(f"[VIT Client] ⚠️ Socket not ready (zmq.Again), requeuing message to FRONT: {msg_type}")
+                        with self._tx_queue_lock:
+                            self._tx_queue.appendleft((msg_type, msg_data))  # ← 放到队列开头！
                         break
                     except Exception as e:
-                        logger.error(f"[VIT Client] ❌ send error for {request_id}: {e}")
+                        logger.error(f"[VIT Client] ❌ send error for {msg_type}: {e}")
             except Exception as e:
                 logger.error(f"[VIT Client] ❌ send-phase error: {e}")
 
@@ -455,10 +470,30 @@ class VITSchedulerClient:
                     break
 
             # Avoid busy spinning
-            if self._tx_queue.empty():
+            with self._tx_queue_lock:
+                queue_is_empty = len(self._tx_queue) == 0
+            if queue_is_empty:
                 time.sleep(0.0005)
 
         logger.info("[VIT Client] 🧵 worker exit")
+
+    def notify_embedding_consumed(self, image_hash: int):
+        """通知 VIT Scheduler 释放 embedding（事件驱动释放）"""
+        if not self.enable:
+            logger.warning(f"[VIT Client] ⚠️ notify_embedding_consumed called but VIT client is disabled")
+            return
+
+        message = {
+            "type": "free_embedding",
+            "image_hash": image_hash,
+        }
+        try:
+            # 通过后台线程发送（非阻塞）
+            with self._tx_queue_lock:
+                self._tx_queue.append(("free", message))
+            logger.info(f"[VIT Client] 📝 Queued free signal for hash={image_hash}")
+        except Exception as e:
+            logger.warning(f"[VIT Client] Failed to send free signal for hash={image_hash}: {e}")
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
