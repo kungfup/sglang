@@ -774,7 +774,8 @@ def data_hash(data) -> int:
 
 def tensor_hash(tensor_list) -> int:
     """
-    hash a tensor or a tensor list
+    Hash a tensor or a list of tensors.
+    It prioritizes using the GPU if available, and falls back to the CPU on failure.
     """
     tensor = tensor_list
     if isinstance(tensor_list, list):

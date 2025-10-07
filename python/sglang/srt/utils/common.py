@@ -503,7 +503,7 @@ def make_layers(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + get_offloader().wrap_modules(
             (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                layer_fn(idx=idx, prefix=add_prefix(str(idx), prefix))
                 for idx in range(start_layer, end_layer)
             ),
             **offloader_kwargs,

@@ -51,9 +51,23 @@ class PPMissingLayer(torch.nn.Identity):
 
     def forward(self, *args, **kwargs):
         """
-        Return the first arg from args or the first value from kwargs.
+        For Qwen2 decoder layers, the signature is:
+            forward(positions, hidden_states, forward_batch, residual)
+        And they return:
+            (hidden_states, residual)
 
-        Wraps the input in a tuple if `self.return_tuple` is True.
+        So we need to return (args[1], args[3]) when return_tuple=True.
         """
-        input = args[0] if args else next(iter(kwargs.values()))
-        return (input,) if self.return_tuple else input
+        if self.return_tuple:
+            # For decoder layers: return (hidden_states, residual)
+            # args = (positions, hidden_states, forward_batch, residual)
+            if len(args) >= 4:
+                return (args[1], args[3])  # (hidden_states, residual)
+            else:
+                # Fallback for other cases
+                input = args[0] if args else next(iter(kwargs.values()))
+                return (input,)
+        else:
+            # For single return value layers
+            input = args[0] if args else next(iter(kwargs.values()))
+            return input

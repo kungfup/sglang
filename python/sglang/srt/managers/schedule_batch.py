@@ -252,7 +252,7 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashing the data
+        Set the pad value after first hashing the data.
         """
         from sglang.srt.managers.mm_utils import hash_feature
 
@@ -263,7 +263,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = self.hash % (2**31 - 1)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

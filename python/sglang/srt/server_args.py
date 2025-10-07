@@ -201,6 +201,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
+    pipeline_model_parallel_layer_split: Optional[List[int]] = None
     max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
@@ -1540,6 +1541,15 @@ class ServerArgs:
             help="The pipeline parallelism size.",
         )
         parser.add_argument(
+            "--pipeline-model-parallel-layer-split",
+            type=int,
+            nargs="+",
+            default=ServerArgs.pipeline_model_parallel_layer_split,
+            help="The layer split for pipeline parallelism. This is a list of integers, "
+            "where each integer is the number of layers for a pipeline stage. "
+            "The sum of the integers should be the total number of layers.",
+        )
+        parser.add_argument(
             "--max-micro-batch-size",
             type=int,
             default=ServerArgs.max_micro_batch_size,
@@ -2847,8 +2857,8 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None
-                and not self.enable_mixed_chunk
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+                # and not self.enable_mixed_chunk  # Allow mixed chunk with PP for better performance
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding."
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

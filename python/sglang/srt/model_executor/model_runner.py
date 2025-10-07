@@ -44,7 +44,10 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -680,9 +683,51 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
+                pipeline_model_parallel_layer_split=self.server_args.pipeline_model_parallel_layer_split,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
+
+            # ---- Ensure Pipeline-Parallel group uses NCCL backend for better performance ----
+            try:
+                current_pp = get_pp_group()
+                cur_backend = torch.distributed.get_backend(current_pp.device_group)
+            except Exception:
+                current_pp = None
+                cur_backend = None
+
+            if self.device == "cuda" and self.pp_size > 1 and cur_backend != "nccl":
+                # Recreate PP group with NCCL backend for ranks in the same PP stage
+                ranks_same_stage = list(
+                    range(self.pp_rank * self.tp_size, (self.pp_rank + 1) * self.tp_size)
+                )
+
+                pp_device_group = dist.new_group(ranks=ranks_same_stage, backend="nccl")
+                # Also create CPU group (gloo) for compatibility
+                pp_cpu_group = dist.new_group(ranks=ranks_same_stage, backend="gloo")
+
+                # Construct new GroupCoordinator and replace global _PP reference
+                new_pp = GroupCoordinator(
+                    group_ranks=[ranks_same_stage],
+                    local_rank=self.tp_rank,
+                    torch_distributed_backend="nccl",
+                    use_pynccl=False,
+                    use_pymscclpp=False,
+                    use_custom_all_reduce=False,
+                    use_hpu_communicator=False,
+                    use_xpu_communicator=False,
+                    use_npu_communicator=False,
+                    group_name="pp",
+                    use_message_queue_broadcaster=False,
+                )
+                new_pp.device_group = pp_device_group  # type: ignore
+                new_pp.cpu_group = pp_cpu_group  # type: ignore
+
+                import sglang.srt.distributed.parallel_state as _ps
+
+                _ps._PP = new_pp  # type: ignore
+                logger.info("Recreated PP group with NCCL backend: %s", ranks_same_stage)
+
             initialize_dp_attention(
                 server_args=self.server_args,
                 model_config=self.model_config,
