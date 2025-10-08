@@ -408,7 +408,6 @@ class VITSchedulerClient:
                 submit_time = info.get('submit_time', now)
                 retry = info.get('retry', 0)
 
-                # 情况 1：未发送成功（sent=False）
                 if not sent and (now - submit_time) > self._send_timeout_s:
                     payload = info.get('payload')
                     if payload is not None:
@@ -419,21 +418,8 @@ class VITSchedulerClient:
                         info['submit_time'] = now
                         logger.warning(f"[VIT Client] 🔁 Requeue unsent request {rid} (retry={info['retry']})")
 
-                # 情况 2：已发送但长期无响应（sent=True but no response）
-                # 这种情况可能是消息在 ZMQ 缓冲区中丢失，或 VIT Scheduler 未收到
-                if sent and (now - submit_time) > self._send_timeout_s * 3:
-                    payload = info.get('payload')
-                    if payload is not None:
-                        with self._tx_queue_lock:
-                            # 重发请求
-                            self._tx_queue.appendleft((rid, payload))
-                        info['retry'] = retry + 1
-                        info['submit_time'] = now
-                        info['sent'] = False  # 重置 sent 标志，等待重新发送
-                        logger.warning(f"[VIT Client] 🔁 Requeue sent-but-no-response request {rid} (retry={info['retry']}, elapsed={now - submit_time:.1f}s)")
-
-                # 丢弃条件：长时间未响应 或 重试过多
-                if (now - submit_time) > self._drop_timeout_s or info.get('retry', 0) >= self._max_retries:
+                # 丢弃条件：长时间未发出 或 重试过多仍未发出
+                if (not sent and (now - submit_time) > self._drop_timeout_s) or (not sent and info.get('retry', 0) >= self._max_retries):
                     to_drop.append(rid)
 
             for rid in to_drop:
@@ -442,7 +428,7 @@ class VITSchedulerClient:
                     self._cleanup_shm(info.get('pixel_values_shm_name', ''))
                     self._cleanup_shm(info.get('image_grid_thw_shm_name', ''))
                     self.timeout_count += 1
-                    logger.error(f"[VIT Client] ⏱️ Drop pending request {rid} after retries={info.get('retry',0)}, elapsed={now - info.get('submit_time', now):.1f}s; cleaned SHM and marked timeout")
+                    logger.error(f"[VIT Client] ⏱️ Drop pending request {rid} after retries={info.get('retry',0)}; cleaned SHM and marked timeout")
         return out
 
     def _worker_main(self):
