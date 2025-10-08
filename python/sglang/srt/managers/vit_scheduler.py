@@ -14,7 +14,7 @@ import zmq
 import pickle
 import logging
 import hashlib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
 from queue import Queue, Empty
 import threading
@@ -328,13 +328,40 @@ class VITScheduler:
         # 批处理队列
         self.pending_requests: List[VITRequest] = []  # 不再需要 client_id
         self.last_batch_time = time.time()
-        
+
         # 统计信息
         self.total_requests = 0
         self.cache_hits = 0
         self.total_compute_time = 0.0
-        
+
+        # 🔧 方案 2B: 更频繁地检查 free 信号（简化版，不使用单独线程）
+        import threading
+        self._cache_lock = threading.Lock()  # 保护 embedding_cache 的锁
+
+        # 🔧 方案 4A: 共享内存超时清理
+        self._shm_registry: Dict[str, float] = {}  # shm_name -> 创建时间
+        self._shm_registry_lock = threading.Lock()
+        self._shm_timeout_seconds = 10.0  # 共享内存超时时间（秒）
+
+        # 🔧 新优化: 单独线程处理 free 信号
+        self._free_signal_queue = []  # free 信号队列
+        self._free_signal_queue_lock = threading.Lock()
+        self._free_signal_thread = None
+        self._stop_free_signal_thread = threading.Event()
+
+        # 🔧 新优化: 动态批处理大小
+        self._dynamic_batch_size = batch_size  # 当前动态批处理大小
+        self._min_batch_size = max(1, batch_size // 2)  # 最小批处理大小
+        self._max_batch_size = batch_size * 2  # 最大批处理大小
+        self._last_gpu_memory_check = time.time()
+        self._gpu_memory_check_interval = 1.0  # GPU 显存检查间隔（秒）
+
+        # 🔧 新增: 正在处理的请求集合（防止重复处理）
+        self._processing_requests: Set[str] = set()  # 正在处理的 request_id
+        self._processing_lock = threading.Lock()
+
         logger.info("[VIT Scheduler] Initialized successfully")
+        logger.info(f"[VIT Scheduler] 🔧 Dynamic batch size enabled: min={self._min_batch_size}, max={self._max_batch_size}, initial={self._dynamic_batch_size}")
     
     def _compute_hash(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> int:
         """计算输入的 hash 值"""
@@ -370,33 +397,149 @@ class VITScheduler:
     def _save_tensor_to_shm(self, tensor: torch.Tensor, shm_name: str):
         """保存 tensor 到共享内存"""
         from multiprocessing import shared_memory
-        
+
         # 创建共享内存
         tensor_cpu = tensor.cpu()
         nbytes = tensor_cpu.element_size() * tensor_cpu.nelement()
         shm = shared_memory.SharedMemory(create=True, size=nbytes, name=shm_name)
-        
+
         # 写入数据
         shm_tensor = torch.frombuffer(shm.buf, dtype=tensor_cpu.dtype).reshape(tensor_cpu.shape)
         shm_tensor.copy_(tensor_cpu)
-        
+
         # 关闭共享内存（不删除，等待接收方读取）
         shm.close()
-    
+
+        # 🔧 方案 4A: 注册共享内存，记录创建时间
+        with self._shm_registry_lock:
+            self._shm_registry[shm_name] = time.time()
+            logger.debug(f"[VIT Scheduler] 📝 Registered SHM: {shm_name}")
+
+    def _cleanup_timeout_shm(self):
+        """🔧 方案 4A: 清理超时的共享内存"""
+        from multiprocessing import shared_memory
+
+        now = time.time()
+        to_cleanup = []
+
+        with self._shm_registry_lock:
+            for shm_name, create_time in list(self._shm_registry.items()):
+                if now - create_time > self._shm_timeout_seconds:
+                    to_cleanup.append(shm_name)
+
+        for shm_name in to_cleanup:
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shm.close()
+                shm.unlink()
+                with self._shm_registry_lock:
+                    self._shm_registry.pop(shm_name, None)
+                logger.warning(
+                    f"[VIT Scheduler] 🗑️ Cleaned up timeout SHM: {shm_name} "
+                    f"(age: {now - create_time:.1f}s > {self._shm_timeout_seconds}s)"
+                )
+            except FileNotFoundError:
+                # 共享内存已被删除（正常情况）
+                with self._shm_registry_lock:
+                    self._shm_registry.pop(shm_name, None)
+                logger.debug(f"[VIT Scheduler] ✅ SHM already cleaned: {shm_name}")
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] ❌ Failed to cleanup SHM {shm_name}: {e}")
+
+    def _unregister_shm(self, shm_name: str):
+        """🔧 方案 4A: 从注册表中移除共享内存（当 Client 成功读取后调用）"""
+        with self._shm_registry_lock:
+            if shm_name in self._shm_registry:
+                self._shm_registry.pop(shm_name)
+                logger.debug(f"[VIT Scheduler] ✅ Unregistered SHM: {shm_name}")
+
+    def _get_gpu_memory_usage(self) -> float:
+        """🔧 新优化: 获取 GPU 显存使用率"""
+        try:
+            # 获取当前设备
+            device_id = int(self.device.split(':')[1]) if ':' in self.device else 0
+
+            # 获取显存信息
+            total_memory = torch.cuda.get_device_properties(device_id).total_memory
+            allocated_memory = torch.cuda.memory_allocated(device_id)
+
+            usage_ratio = allocated_memory / total_memory
+            return usage_ratio
+        except Exception as e:
+            logger.error(f"[VIT Scheduler] ❌ Failed to get GPU memory usage: {e}")
+            return 0.5  # 默认返回 50%
+
+    def _adjust_dynamic_batch_size(self):
+        """🔧 新优化: 根据 GPU 显存使用情况动态调整批处理大小"""
+        now = time.time()
+
+        # 检查是否需要更新（避免频繁检查）
+        if now - self._last_gpu_memory_check < self._gpu_memory_check_interval:
+            return
+
+        self._last_gpu_memory_check = now
+
+        # 获取 GPU 显存使用率
+        memory_usage = self._get_gpu_memory_usage()
+
+        old_batch_size = self._dynamic_batch_size
+
+        # 根据显存使用率调整批处理大小
+        if memory_usage > 0.85:
+            # 显存使用率 > 85%，减小批处理大小
+            self._dynamic_batch_size = max(self._min_batch_size, self._dynamic_batch_size - 1)
+            logger.warning(
+                f"[VIT Scheduler] 🔧 GPU memory high ({memory_usage:.1%}), "
+                f"reducing batch size: {old_batch_size} -> {self._dynamic_batch_size}"
+            )
+        elif memory_usage < 0.60:
+            # 显存使用率 < 60%，增加批处理大小
+            self._dynamic_batch_size = min(self._max_batch_size, self._dynamic_batch_size + 1)
+            logger.info(
+                f"[VIT Scheduler] 🔧 GPU memory low ({memory_usage:.1%}), "
+                f"increasing batch size: {old_batch_size} -> {self._dynamic_batch_size}"
+            )
+
+        # 如果批处理大小发生变化，记录日志
+        if self._dynamic_batch_size != old_batch_size:
+            logger.info(
+                f"[VIT Scheduler] 📊 Dynamic batch size adjusted: {old_batch_size} -> {self._dynamic_batch_size} "
+                f"(memory usage: {memory_usage:.1%})"
+            )
+
     def _process_batch(self):
-        """批量处理请求"""
+        """🔧 新优化: 批量处理请求（动态批处理大小 + 分批处理）"""
         if not self.pending_requests:
             return
 
-        batch_start_time = time.time()
-        batch_size = len(self.pending_requests)
+        # 🔧 新优化: 动态调整批处理大小
+        self._adjust_dynamic_batch_size()
 
-        logger.info(f"[VIT Scheduler] Processing batch of {batch_size} requests")
+        batch_start_time = time.time()
+        total_pending = len(self.pending_requests)
+
+        # 🔧 新优化: 使用动态批处理大小
+        actual_batch_size = min(total_pending, self._dynamic_batch_size)
+        batch_to_process = self.pending_requests[:actual_batch_size]
+        remaining_requests = self.pending_requests[actual_batch_size:]
+
+        if total_pending > self._dynamic_batch_size:
+            logger.warning(
+                f"[VIT Scheduler] ⚠️ Pending requests ({total_pending}) exceeds dynamic_batch_size ({self._dynamic_batch_size}). "
+                f"Processing {actual_batch_size} requests, {len(remaining_requests)} remaining in queue."
+            )
+        else:
+            logger.info(f"[VIT Scheduler] Processing batch of {actual_batch_size} requests (dynamic_batch_size={self._dynamic_batch_size})")
 
         # 逐个处理（后续可以优化为真正的批量计算）
-        for request in self.pending_requests:
+        for request in batch_to_process:
             try:
                 response = self._process_single_request(request)
+
+                # 🔧 新增: 跳过 None 响应（重复请求或共享内存不存在）
+                if response is None:
+                    logger.warning(f"[VIT Scheduler] ⚠️ Skipping None response for {request.request_id}")
+                    continue
 
                 # 发送响应：直接发送消息
                 message_data = pickle.dumps(asdict(response))
@@ -442,11 +585,14 @@ class VITScheduler:
             except Exception as e:
                 logger.error(f"[VIT Scheduler] Error processing request {request.request_id}: {e}", exc_info=True)
 
-        # 清空队列
-        self.pending_requests.clear()
+        # 🔧 方案 3B: 将剩余请求放回队列
+        self.pending_requests = remaining_requests
 
         batch_time = time.time() - batch_start_time
-        logger.info(f"[VIT Scheduler] Batch processed in {batch_time*1000:.1f}ms")
+        logger.info(
+            f"[VIT Scheduler] Batch processed in {batch_time*1000:.1f}ms, "
+            f"remaining in queue: {len(self.pending_requests)}"
+        )
 
         # 定期打印统计信息
         if self.total_requests % 100 == 0:
@@ -456,135 +602,226 @@ class VITScheduler:
         if self.total_requests % 10 == 0:
             torch.cuda.empty_cache()
 
+        # 🔧 方案 4A: 定期清理超时的共享内存（每 10 个批次）
+        if self.total_requests % 10 == 0:
+            self._cleanup_timeout_shm()
+
     def _process_single_request(self, request: VITRequest) -> VITResponse:
-        """处理单个请求"""
+        """🔧 新增: 处理单个请求（支持重复请求检测和 cache 回退）"""
         start_time = time.time()
 
         try:
             logger.info(f"[VIT Scheduler] 🔄 Processing request: {request.request_id}")
 
-            # 从共享内存加载输入
-            logger.info(f"[VIT Scheduler] 📥 Loading tensors from shared memory...")
-            pixel_values = self._load_tensor_from_shm(
-                request.pixel_values_shm_name,
-                request.pixel_values_shape,
-                request.pixel_values_dtype,
-            )
-            logger.info(f"[VIT Scheduler] ✅ Loaded pixel_values: shape={pixel_values.shape}")
+            # 🔧 新增: 检查是否正在处理中（防止重复处理）
+            with self._processing_lock:
+                if request.request_id in self._processing_requests:
+                    logger.warning(f"[VIT Scheduler] ⚠️ Request {request.request_id} is already being processed, skipping duplicate")
+                    # 返回一个空响应，让 VIT Client 继续等待
+                    return None
+                self._processing_requests.add(request.request_id)
 
-            image_grid_thw = self._load_tensor_from_shm(
-                request.image_grid_thw_shm_name,
-                request.image_grid_thw_shape,
-                request.image_grid_thw_dtype,
-            )
-            logger.info(f"[VIT Scheduler] ✅ Loaded image_grid_thw: shape={image_grid_thw.shape}")
+            try:
+                # 从共享内存加载输入
+                logger.info(f"[VIT Scheduler] 📥 Loading tensors from shared memory...")
+                try:
+                    pixel_values = self._load_tensor_from_shm(
+                        request.pixel_values_shm_name,
+                        request.pixel_values_shape,
+                        request.pixel_values_dtype,
+                    )
+                    logger.info(f"[VIT Scheduler] ✅ Loaded pixel_values: shape={pixel_values.shape}")
 
-            # 计算 hash
-            logger.info(f"[VIT Scheduler] 🔢 Computing hash...")
-            hash_val = self._compute_hash(pixel_values, image_grid_thw)
-            logger.info(f"[VIT Scheduler] ✅ Hash computed: {hash_val}")
+                    image_grid_thw = self._load_tensor_from_shm(
+                        request.image_grid_thw_shm_name,
+                        request.image_grid_thw_shape,
+                        request.image_grid_thw_dtype,
+                    )
+                    logger.info(f"[VIT Scheduler] ✅ Loaded image_grid_thw: shape={image_grid_thw.shape}")
 
-            # 查询缓存（使用 LRU 更新）
-            from_cache = False
-            embedding = self._get_cached_embedding(hash_val)
-            if embedding is not None:
-                from_cache = True
-                self.cache_hits += 1
-                logger.info(f"[VIT Scheduler] ✅ Cache hit: hash={hash_val}")
-            else:
-                # 计算 ViT
-                logger.info(f"[VIT Scheduler] 🚀 Cache miss, computing ViT embedding...")
-                embedding = self.model_runner.compute(pixel_values, image_grid_thw)
-                logger.info(f"[VIT Scheduler] ✅ ViT computation completed")
+                except FileNotFoundError as e:
+                    # 🔧 新增: 共享内存不存在，可能是重复请求（共享内存已被删除）
+                    logger.warning(f"[VIT Scheduler] ⚠️ Shared memory not found for {request.request_id}: {e}")
+                    logger.warning(f"[VIT Scheduler] 🔍 This is likely a duplicate/retry request. Checking cache...")
 
-                # 🔍 检查 embedding 是否包含 NaN
-                if torch.isnan(embedding).any():
-                    logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+                    # 尝试从 cache 中查找（使用 request_id 的 hash）
+                    # 注意：我们无法计算 hash（因为没有 pixel_values），所以只能返回 None
+                    # 让 VIT Client 继续等待原始请求的响应
+                    logger.warning(f"[VIT Scheduler] ⚠️ Cannot compute hash without pixel_values, skipping request {request.request_id}")
+                    return None
+
+                # 计算 hash
+                logger.info(f"[VIT Scheduler] 🔢 Computing hash...")
+                hash_val = self._compute_hash(pixel_values, image_grid_thw)
+                logger.info(f"[VIT Scheduler] ✅ Hash computed: {hash_val}")
+
+                # 查询缓存（使用 LRU 更新）
+                from_cache = False
+                embedding = self._get_cached_embedding(hash_val)
+                if embedding is not None:
+                    from_cache = True
+                    self.cache_hits += 1
+                    logger.info(f"[VIT Scheduler] ✅ Cache hit: hash={hash_val}")
                 else:
-                    logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
+                    # 计算 ViT
+                    logger.info(f"[VIT Scheduler] 🚀 Cache miss, computing ViT embedding...")
+                    embedding = self.model_runner.compute(pixel_values, image_grid_thw)
+                    logger.info(f"[VIT Scheduler] ✅ ViT computation completed")
 
-                # 更新缓存（LRU）
-                logger.info(f"[VIT Scheduler] 💾 Updating cache...")
-                self._update_cache(hash_val, embedding)
-                logger.info(f"[VIT Scheduler] ✅ Cache updated")
+                    # 🔍 检查 embedding 是否包含 NaN
+                    if torch.isnan(embedding).any():
+                        logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+                    else:
+                        logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
 
-            # 保存到共享内存
-            logger.info(f"[VIT Scheduler] 💾 Saving embedding to shared memory...")
-            embedding_shm_name = f"vit_emb_{request.request_id}"
-            self._save_tensor_to_shm(embedding, embedding_shm_name)
+                    # 更新缓存（LRU）
+                    logger.info(f"[VIT Scheduler] 💾 Updating cache...")
+                    self._update_cache(hash_val, embedding)
+                    logger.info(f"[VIT Scheduler] ✅ Cache updated")
 
-            # 🔍 检查保存到共享内存后是否仍然有效
-            logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
+                # 保存到共享内存
+                logger.info(f"[VIT Scheduler] 💾 Saving embedding to shared memory...")
+                embedding_shm_name = f"vit_emb_{request.request_id}"
+                self._save_tensor_to_shm(embedding, embedding_shm_name)
 
-            compute_time = time.time() - start_time
-            self.total_compute_time += compute_time
+                # 🔍 检查保存到共享内存后是否仍然有效
+                logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
 
-            # 构造响应
-            response = VITResponse(
-                request_id=request.request_id,
-                embedding_shm_name=embedding_shm_name,
-                embedding_shape=tuple(embedding.shape),
-                embedding_dtype=str(embedding.dtype).replace('torch.', ''),
-                compute_time=compute_time,
-                from_cache=from_cache,
-            )
+                compute_time = time.time() - start_time
+                self.total_compute_time += compute_time
 
-            logger.info(f"[VIT Scheduler] ✅ Request processed: {request.request_id}, compute_time={compute_time*1000:.1f}ms")
-            return response
+                # 构造响应
+                response = VITResponse(
+                    request_id=request.request_id,
+                    embedding_shm_name=embedding_shm_name,
+                    embedding_shape=tuple(embedding.shape),
+                    embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                    compute_time=compute_time,
+                    from_cache=from_cache,
+                )
+
+                logger.info(f"[VIT Scheduler] ✅ Request processed: {request.request_id}, compute_time={compute_time*1000:.1f}ms")
+                return response
+
+            finally:
+                # 🔧 新增: 清理 processing 标记
+                with self._processing_lock:
+                    self._processing_requests.discard(request.request_id)
 
         except Exception as e:
             logger.error(f"[VIT Scheduler] ❌ Error processing request {request.request_id}: {e}", exc_info=True)
+            # 🔧 新增: 清理 processing 标记
+            with self._processing_lock:
+                self._processing_requests.discard(request.request_id)
             raise
     
     def _update_cache(self, hash_val: int, embedding: torch.Tensor):
-        """更新缓存（LRU 策略）"""
+        """🔧 方案 2B: 更新缓存（LRU 策略，线程安全）"""
         # 测压模式：不缓存
         if self.benchmark_mode:
             return
 
-        # 如果已在缓存中，更新访问时间
-        if hash_val in self.embedding_cache:
-            self.embedding_cache.move_to_end(hash_val)
-            return
+        with self._cache_lock:
+            # 如果已在缓存中，更新访问时间
+            if hash_val in self.embedding_cache:
+                self.embedding_cache.move_to_end(hash_val)
+                return
 
-        embedding_size = embedding.element_size() * embedding.nelement()
+            embedding_size = embedding.element_size() * embedding.nelement()
 
-        # LRU 驱逐：移除最久未使用的条目
-        while self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
-            if len(self.embedding_cache) == 0:
-                break
-            lru_hash, lru_embedding = self.embedding_cache.popitem(last=False)
-            evicted_size = lru_embedding.element_size() * lru_embedding.nelement()
-            self.cache_size_bytes -= evicted_size
-            logger.warning(f"[VIT Scheduler] 🗑️ Evicted LRU embedding (fallback): hash={lru_hash}, size={evicted_size/1024/1024:.2f} MB")
+            # LRU 驱逐：移除最久未使用的条目
+            while self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
+                if len(self.embedding_cache) == 0:
+                    break
+                lru_hash, lru_embedding = self.embedding_cache.popitem(last=False)
+                evicted_size = lru_embedding.element_size() * lru_embedding.nelement()
+                self.cache_size_bytes -= evicted_size
+                logger.warning(f"[VIT Scheduler] 🗑️ Evicted LRU embedding (fallback): hash={lru_hash}, size={evicted_size/1024/1024:.2f} MB")
 
-        # 添加新条目（直接存储在 GPU，不调用 .cpu()）
-        self.embedding_cache[hash_val] = embedding
-        self.cache_size_bytes += embedding_size
+            # 添加新条目（直接存储在 GPU，不调用 .cpu()）
+            self.embedding_cache[hash_val] = embedding
+            self.cache_size_bytes += embedding_size
 
     def _get_cached_embedding(self, hash_val: int) -> Optional[torch.Tensor]:
-        """查询缓存（更新 LRU）"""
+        """🔧 方案 2B: 查询缓存（更新 LRU，线程安全）"""
         # 测压模式：不使用缓存
         if self.benchmark_mode:
             return None
 
-        if hash_val in self.embedding_cache:
-            # 更新访问时间
-            self.embedding_cache.move_to_end(hash_val)
-            return self.embedding_cache[hash_val]
-        return None
+        with self._cache_lock:
+            if hash_val in self.embedding_cache:
+                # 更新访问时间
+                self.embedding_cache.move_to_end(hash_val)
+                return self.embedding_cache[hash_val]
+            return None
 
     def _free_cache(self, hash_val: int):
-        """释放缓存（事件驱动）"""
-        if hash_val in self.embedding_cache:
-            embedding = self.embedding_cache.pop(hash_val)
-            freed_size = embedding.element_size() * embedding.nelement()
-            self.cache_size_bytes -= freed_size
-            logger.info(f"[VIT Scheduler] 🗑️ Freed embedding (event-driven): hash={hash_val}, size={freed_size/1024/1024:.2f} MB")
+        """🔧 方案 2B: 释放缓存（事件驱动，线程安全）"""
+        with self._cache_lock:
+            if hash_val in self.embedding_cache:
+                embedding = self.embedding_cache.pop(hash_val)
+                freed_size = embedding.element_size() * embedding.nelement()
+                self.cache_size_bytes -= freed_size
+                logger.info(f"[VIT Scheduler] 🗑️ Freed embedding (event-driven): hash={hash_val}, size={freed_size/1024/1024:.2f} MB")
+
+    def _start_free_signal_thread(self):
+        """🔧 新优化: 启动单独线程处理 free 信号"""
+        import threading
+        self._free_signal_thread = threading.Thread(
+            target=self._free_signal_thread_worker,
+            daemon=True,
+            name="VIT-FreeSignal"
+        )
+        self._free_signal_thread.start()
+        logger.info("[VIT Scheduler] 🧵 Started free signal processing thread")
+
+    def _stop_free_signal_thread_func(self):
+        """🔧 新优化: 停止 free signal 线程"""
+        if self._free_signal_thread is not None:
+            logger.info("[VIT Scheduler] 🧵 Stopping free signal thread...")
+            self._stop_free_signal_thread.set()
+            self._free_signal_thread.join(timeout=2.0)
+            logger.info("[VIT Scheduler] 🧵 Free signal thread stopped")
+
+    def _free_signal_thread_worker(self):
+        """🔧 新优化: 单独线程处理 free 信号（持续运行）"""
+        logger.info("[VIT Scheduler] 🧵 Free signal thread worker started")
+
+        processed_count = 0
+        last_log_time = time.time()
+
+        while not self._stop_free_signal_thread.is_set():
+            try:
+                # 从队列中获取 free 信号
+                free_signals_to_process = []
+                with self._free_signal_queue_lock:
+                    if self._free_signal_queue:
+                        free_signals_to_process = self._free_signal_queue[:]
+                        self._free_signal_queue.clear()
+
+                # 处理 free 信号
+                for image_hash in free_signals_to_process:
+                    self._free_cache(image_hash)
+                    processed_count += 1
+
+                # 定期打印统计信息
+                if time.time() - last_log_time > 10.0 and processed_count > 0:
+                    logger.info(f"[VIT Scheduler] 🧵 Free signal thread: processed {processed_count} signals")
+                    last_log_time = time.time()
+
+                # 短暂休眠，避免 CPU 空转
+                time.sleep(0.001)
+
+            except Exception as e:
+                if not self._stop_free_signal_thread.is_set():
+                    logger.error(f"[VIT Scheduler] 🧵 Error in free signal thread: {e}", exc_info=True)
+                time.sleep(0.1)  # 出错后休眠更长时间
+
+        logger.info(f"[VIT Scheduler] 🧵 Free signal thread stopped (processed {processed_count} signals)")
 
     def _drain_free_signals(self):
-        """持续检查并处理所有待处理的释放信号（非阻塞）"""
-        processed_count = 0
+        """🔧 新优化: 检查并将 free 信号添加到队列（由单独线程处理）"""
+        queued_count = 0
         while True:
             try:
                 message = self.socket.recv(zmq.NOBLOCK)
@@ -593,8 +830,10 @@ class VITScheduler:
                 # 只处理释放信号，其他消息不处理（避免打乱请求顺序）
                 if request_dict.get("type") == "free_embedding":
                     image_hash = request_dict["image_hash"]
-                    self._free_cache(image_hash)
-                    processed_count += 1
+                    # 🔧 新优化: 将 free 信号添加到队列，由单独线程处理
+                    with self._free_signal_queue_lock:
+                        self._free_signal_queue.append(image_hash)
+                    queued_count += 1
                 else:
                     # 非释放信号，直接处理
                     if "test" in request_dict and request_dict["test"] == "connection_test":
@@ -614,27 +853,35 @@ class VITScheduler:
                 logger.error(f"[VIT Scheduler] Error draining free signals: {e}", exc_info=True)
                 break
 
-        if processed_count > 0:
-            logger.info(f"[VIT Scheduler] 🔄 Drained {processed_count} free signals")
+        if queued_count > 0:
+            logger.debug(f"[VIT Scheduler] 🔄 Queued {queued_count} free signals for processing")
 
     def run(self):
-        """主循环（支持批量处理 + 事件驱动释放）"""
-        logger.info("[VIT Scheduler] Starting main loop (batch mode + event-driven release)")
+        """🔧 新优化: 主循环（单独线程处理 free 信号 + 动态批处理大小）"""
+        logger.info("[VIT Scheduler] Starting main loop (dynamic batch size + dedicated free signal thread)")
+
+        # 🔧 新优化: 启动单独线程处理 free 信号
+        self._start_free_signal_thread()
 
         try:
             while True:
+                # 🔧 新优化: 在收集请求前先检查 free 信号（将信号添加到队列）
+                self._drain_free_signals()
+
                 # 收集请求（非阻塞）
-                while len(self.pending_requests) < self.batch_size:
+                # 🔧 新优化: 使用动态批处理大小
+                while len(self.pending_requests) < self._dynamic_batch_size:
                     try:
                         # PAIR socket 接收消息
                         message = self.socket.recv(zmq.NOBLOCK)
 
                         request_dict = pickle.loads(message)
 
-                        # 处理释放信号（事件驱动）
+                        # 🔧 新优化: 处理释放信号（添加到队列，由单独线程处理）
                         if request_dict.get("type") == "free_embedding":
                             image_hash = request_dict["image_hash"]
-                            self._free_cache(image_hash)
+                            with self._free_signal_queue_lock:
+                                self._free_signal_queue.append(image_hash)
                             continue
 
                         # 检查是否是测试消息
@@ -658,18 +905,21 @@ class VITScheduler:
                         logger.error(f"[VIT Scheduler] Error receiving request: {e}", exc_info=True)
                         break
 
-                # 判断是否执行批量计算
+                # 🔧 新优化: 判断是否执行批量计算（使用动态批处理大小）
                 should_compute = (
-                    len(self.pending_requests) >= self.batch_size or
+                    len(self.pending_requests) >= self._dynamic_batch_size or
                     (len(self.pending_requests) > 0 and
                      time.time() - self.last_batch_time > self.batch_timeout)
                 )
 
                 if should_compute:
+                    # 🔧 方案 2B: 处理批次前再次检查 free 信号
+                    self._drain_free_signals()
+
                     self._process_batch()
                     self.last_batch_time = time.time()
 
-                    # 🔧 处理批次后立即检查释放信号（避免延迟）
+                    # 🔧 方案 2B: 处理批次后立即检查释放信号（避免延迟）
                     self._drain_free_signals()
                 else:
                     # 🔧 休眠前也检查释放信号
@@ -699,8 +949,12 @@ class VITScheduler:
         )
     
     def cleanup(self):
-        """清理资源"""
+        """🔧 新优化: 清理资源（包括停止 free signal 线程）"""
         logger.info("[VIT Scheduler] Cleaning up...")
+
+        # 🔧 新优化: 停止 free signal 线程
+        self._stop_free_signal_thread_func()
+
         self.socket.close()
         self.context.term()
         logger.info("[VIT Scheduler] Cleanup complete")
