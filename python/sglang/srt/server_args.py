@@ -94,7 +94,7 @@ class ServerArgs:
 
     # VIT Scheduler options (for VLM models)
     enable_vit_scheduler: bool = False
-    vit_scheduler_port: int = 5555
+    vit_scheduler_port: int = None  # 🔧 修改: 默认为 None，将基于 --port 动态生成
     vit_scheduler_device: str = "cuda:0"
     vit_scheduler_batch_size: int = 4
     vit_scheduler_batch_timeout_ms: float = 10.0

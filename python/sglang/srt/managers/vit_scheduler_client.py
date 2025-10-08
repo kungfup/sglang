@@ -15,7 +15,7 @@ import logging
 import threading
 from queue import Queue, Empty
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, asdict
 from multiprocessing import shared_memory
 
@@ -39,11 +39,44 @@ class VITRequest:
 
 @dataclass
 class VITResponse:
-    """VIT 计算响应"""
+    """VIT 计算响应（使用 CUDA IPC）
+
+    Attributes:
+        request_id: 请求 ID
+        embedding_ipc_handle: CUDA IPC handle 和 offset
+            - handle: List[int] - 序列化的 cudaIpcMemHandle_t (64 字节)
+            - offset: int - tensor 在 storage 中的偏移量（字节）
+        embedding_shape: Embedding tensor 的 shape
+        embedding_dtype: Embedding tensor 的 dtype (如 "float32")
+        embedding_device: Embedding tensor 的 device (如 "cuda:0")
+        image_hash: 图片的 hash 值（用于 cache 管理）
+        compute_time: 计算耗时（秒）
+        from_cache: 是否从 cache 中获取
+    """
     request_id: str
-    embedding_shm_name: str
+    # 🔧 CUDA IPC: 使用 IPC handle 代替 CPU 共享内存
+    embedding_ipc_handle: Tuple[List[int], int]  # (handle, offset)
     embedding_shape: Tuple[int, ...]
     embedding_dtype: str
+    embedding_device: str  # 新增: 设备信息
+    image_hash: int  # 新增: 用于 cache 管理
+    # 保留原有字段
+    compute_time: float
+    from_cache: bool
+
+
+@dataclass
+class VITResult:
+    """VIT 计算结果（包含 embedding 和 metadata）
+
+    Attributes:
+        embedding: 计算得到的 embedding tensor
+        image_hash: VIT Scheduler 计算的 hash 值（用于 cache 释放）
+        compute_time: 计算耗时（毫秒）
+        from_cache: 是否从 cache 中获取
+    """
+    embedding: torch.Tensor
+    image_hash: int  # 🔧 关键: VIT Scheduler 计算的 hash，用于 cache 释放
     compute_time: float
     from_cache: bool
 
@@ -347,12 +380,12 @@ class VITSchedulerClient:
             logger.error(f"[VIT Client] Error getting result for {request_id}: {e}", exc_info=True)
             return None
 
-    def poll_results(self) -> Dict[str, torch.Tensor]:
+    def poll_results(self) -> Dict[str, VITResult]:
         """
         非阻塞地取走后台线程收到的全部结果；不再触碰 ZMQ socket。
 
         Returns:
-            字典：request_id -> embedding tensor（可能为空）
+            字典：request_id -> VITResult（包含 embedding 和 metadata）
         """
         if not self.enable:
             return {}
@@ -369,7 +402,7 @@ class VITSchedulerClient:
             )
 
         # 仅访问内存缓冲区，不跨线程访问 socket
-        out: Dict[str, torch.Tensor] = {}
+        out: Dict[str, VITResult] = {}
         lock = getattr(self, "_results_lock", None)
         if lock is not None:
             with lock:
@@ -493,33 +526,97 @@ class VITSchedulerClient:
                     resp_dict = pickle.loads(msg)
                     resp = VITResponse(**resp_dict)
 
-                    emb = self._load_tensor_from_shm(
-                        resp.embedding_shm_name,
-                        resp.embedding_shape,
-                        resp.embedding_dtype,
-                    )
+                    # 🔧 CUDA IPC: 从 IPC handle 重建 embedding
+                    try:
+                        from functools import reduce
+                        from sglang.semi_pd.utils import convert_ipc_handle_to_tensor
 
-                    # 🔍 检查从共享内存读取的 embedding 是否包含 NaN
+                        ipc_handle, offset = resp.embedding_ipc_handle
+                        shape = resp.embedding_shape
+                        dtype_str = resp.embedding_dtype
+                        device_str = resp.embedding_device
+
+                        # 转换 dtype
+                        dtype = getattr(torch, dtype_str)
+
+                        # 🔧 关键: 使用 PP0 的设备 (GPU 0)
+                        # VIT Scheduler 和 PP0 都在 GPU 0 上，同一张卡，无需跨 GPU 访问
+                        device = torch.device("cuda:0")  # PP0 在 GPU 0
+
+                        # 计算 size
+                        size = reduce(lambda x, y: x * y, shape)
+
+                        logger.info(
+                            f"[VIT Client] 🔗 Opening CUDA IPC handle: "
+                            f"request_id={resp.request_id}, shape={shape}, dtype={dtype_str}, "
+                            f"device={device}, offset={offset}"
+                        )
+
+                        # 从 IPC handle 重建 tensor
+                        emb = convert_ipc_handle_to_tensor(
+                            (ipc_handle, offset),
+                            size,
+                            dtype,
+                            device
+                        )
+
+                        # Reshape
+                        emb = emb.view(shape)
+
+                        logger.info(
+                            f"[VIT Client] ✅ Opened CUDA IPC handle: "
+                            f"shape={emb.shape}, device={emb.device}"
+                        )
+
+                    except Exception as e:
+                        logger.error(
+                            f"[VIT Client] ❌ Failed to open CUDA IPC handle for "
+                            f"{resp.request_id}: {e}",
+                            exc_info=True
+                        )
+                        # 跳过这个响应，继续处理下一个
+                        continue
+
+                    # 验证 embedding
                     if torch.isnan(emb).any():
-                        logger.error(f"[VIT Client] ❌ Loaded embedding contains NaN! shape={emb.shape}")
+                        logger.error(
+                            f"[VIT Client] ❌ Loaded embedding contains NaN! "
+                            f"shape={emb.shape}"
+                        )
                     else:
-                        logger.info(f"[VIT Client] ✅ Loaded embedding is valid: shape={emb.shape}, min={emb.min().item():.4f}, max={emb.max().item():.4f}")
+                        logger.info(
+                            f"[VIT Client] ✅ Loaded embedding is valid: "
+                            f"shape={emb.shape}, min={emb.min().item():.4f}, "
+                            f"max={emb.max().item():.4f}"
+                        )
 
+                    # 🔧 CUDA IPC: 清理输入共享内存（pixel_values 和 image_grid_thw）
+                    # 注意：不再需要清理 embedding 共享内存（因为使用 CUDA IPC）
                     info = self.pending_requests.pop(resp.request_id, None)
                     if info is not None:
                         self._cleanup_shm(info.get('pixel_values_shm_name', ''))
                         self._cleanup_shm(info.get('image_grid_thw_shm_name', ''))
 
+                    # 🔧 关键修改: 存储 VITResult（包含 embedding 和 image_hash）
+                    vit_result = VITResult(
+                        embedding=emb,
+                        image_hash=resp.image_hash,  # 🔧 VIT Scheduler 计算的 hash
+                        compute_time=resp.compute_time,
+                        from_cache=resp.from_cache,
+                    )
+
                     with self._results_lock:
-                        self._results[resp.request_id] = emb
+                        self._results[resp.request_id] = vit_result
                         logger.info(
                             f"[VIT Client] 🔧 Worker put result into _results: {resp.request_id}, "
-                            f"_results_len={len(self._results)}"
+                            f"_results_len={len(self._results)}, image_hash={resp.image_hash}"
                         )
 
                     self.completed_count += 1
                     logger.info(
-                        f"[VIT Client] 📥 received {resp.request_id}, compute_time={resp.compute_time*1000:.1f}ms"
+                        f"[VIT Client] 📥 received {resp.request_id}, "
+                        f"compute_time={resp.compute_time*1000:.1f}ms, "
+                        f"from_cache={resp.from_cache}, hash={resp.image_hash}"
                     )
                 except zmq.Again:
                     break

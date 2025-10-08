@@ -40,11 +40,28 @@ class VITRequest:
 
 @dataclass
 class VITResponse:
-    """VIT 计算响应"""
+    """VIT 计算响应（使用 CUDA IPC）
+
+    Attributes:
+        request_id: 请求 ID
+        embedding_ipc_handle: CUDA IPC handle 和 offset
+            - handle: List[int] - 序列化的 cudaIpcMemHandle_t (64 字节)
+            - offset: int - tensor 在 storage 中的偏移量（字节）
+        embedding_shape: Embedding tensor 的 shape
+        embedding_dtype: Embedding tensor 的 dtype (如 "float32")
+        embedding_device: Embedding tensor 的 device (如 "cuda:0")
+        image_hash: 图片的 hash 值（用于 cache 管理）
+        compute_time: 计算耗时（秒）
+        from_cache: 是否从 cache 中获取
+    """
     request_id: str
-    embedding_shm_name: str  # 共享内存名称
+    # 🔧 CUDA IPC: 使用 IPC handle 代替 CPU 共享内存
+    embedding_ipc_handle: Tuple[List[int], int]  # (handle, offset)
     embedding_shape: Tuple[int, ...]
     embedding_dtype: str
+    embedding_device: str  # 新增: 设备信息
+    image_hash: int  # 新增: 用于 cache 管理
+    # 保留原有字段
     compute_time: float
     from_cache: bool
 
@@ -607,17 +624,30 @@ class VITScheduler:
             self._cleanup_timeout_shm()
 
     def _process_single_request(self, request: VITRequest) -> VITResponse:
-        """🔧 新增: 处理单个请求（支持重复请求检测和 cache 回退）"""
+        """🔧 CUDA IPC: 处理单个请求（使用 CUDA IPC 代替 CPU 共享内存）
+
+        Args:
+            request: VIT 请求
+
+        Returns:
+            VITResponse: 包含 CUDA IPC handle 的响应
+
+        Raises:
+            FileNotFoundError: 共享内存不存在（重复请求）
+            RuntimeError: CUDA IPC 创建失败
+        """
         start_time = time.time()
 
         try:
             logger.info(f"[VIT Scheduler] 🔄 Processing request: {request.request_id}")
 
-            # 🔧 新增: 检查是否正在处理中（防止重复处理）
+            # 🔧 检查是否正在处理中（防止重复处理）
             with self._processing_lock:
                 if request.request_id in self._processing_requests:
-                    logger.warning(f"[VIT Scheduler] ⚠️ Request {request.request_id} is already being processed, skipping duplicate")
-                    # 返回一个空响应，让 VIT Client 继续等待
+                    logger.warning(
+                        f"[VIT Scheduler] ⚠️ Request {request.request_id} is already being processed, "
+                        "skipping duplicate"
+                    )
                     return None
                 self._processing_requests.add(request.request_id)
 
@@ -640,14 +670,13 @@ class VITScheduler:
                     logger.info(f"[VIT Scheduler] ✅ Loaded image_grid_thw: shape={image_grid_thw.shape}")
 
                 except FileNotFoundError as e:
-                    # 🔧 新增: 共享内存不存在，可能是重复请求（共享内存已被删除）
-                    logger.warning(f"[VIT Scheduler] ⚠️ Shared memory not found for {request.request_id}: {e}")
-                    logger.warning(f"[VIT Scheduler] 🔍 This is likely a duplicate/retry request. Checking cache...")
-
-                    # 尝试从 cache 中查找（使用 request_id 的 hash）
-                    # 注意：我们无法计算 hash（因为没有 pixel_values），所以只能返回 None
-                    # 让 VIT Client 继续等待原始请求的响应
-                    logger.warning(f"[VIT Scheduler] ⚠️ Cannot compute hash without pixel_values, skipping request {request.request_id}")
+                    # 共享内存不存在，可能是重复请求
+                    logger.warning(
+                        f"[VIT Scheduler] ⚠️ Shared memory not found for {request.request_id}: {e}"
+                    )
+                    logger.warning(
+                        f"[VIT Scheduler] 🔍 This is likely a duplicate/retry request. Skipping."
+                    )
                     return None
 
                 # 计算 hash
@@ -668,55 +697,89 @@ class VITScheduler:
                     embedding = self.model_runner.compute(pixel_values, image_grid_thw)
                     logger.info(f"[VIT Scheduler] ✅ ViT computation completed")
 
-                    # 🔍 检查 embedding 是否包含 NaN
+                    # 验证 embedding
                     if torch.isnan(embedding).any():
-                        logger.error(f"[VIT Scheduler] ❌ Computed embedding contains NaN! shape={embedding.shape}")
+                        logger.error(
+                            f"[VIT Scheduler] ❌ Computed embedding contains NaN! "
+                            f"shape={embedding.shape}"
+                        )
                     else:
-                        logger.info(f"[VIT Scheduler] ✅ Computed embedding is valid: shape={embedding.shape}, min={embedding.min().item():.4f}, max={embedding.max().item():.4f}")
+                        logger.info(
+                            f"[VIT Scheduler] ✅ Computed embedding is valid: "
+                            f"shape={embedding.shape}, min={embedding.min().item():.4f}, "
+                            f"max={embedding.max().item():.4f}"
+                        )
 
                     # 更新缓存（LRU）
                     logger.info(f"[VIT Scheduler] 💾 Updating cache...")
                     self._update_cache(hash_val, embedding)
                     logger.info(f"[VIT Scheduler] ✅ Cache updated")
 
-                # 保存到共享内存
-                logger.info(f"[VIT Scheduler] 💾 Saving embedding to shared memory...")
-                embedding_shm_name = f"vit_emb_{request.request_id}"
-                self._save_tensor_to_shm(embedding, embedding_shm_name)
-
-                # 🔍 检查保存到共享内存后是否仍然有效
-                logger.info(f"[VIT Scheduler] 📤 Saved embedding to SHM: {embedding_shm_name}")
+                # 🔧 CUDA IPC: 创建 IPC handle（代替保存到 CPU 共享内存）
+                logger.info(f"[VIT Scheduler] 🔗 Creating CUDA IPC handle...")
+                try:
+                    from sglang.semi_pd.utils import get_ipc_handle
+                    ipc_handle, offset = get_ipc_handle(embedding)
+                    logger.info(
+                        f"[VIT Scheduler] ✅ Created CUDA IPC handle: "
+                        f"offset={offset}, device={embedding.device}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[VIT Scheduler] ❌ Failed to create CUDA IPC handle: {e}",
+                        exc_info=True
+                    )
+                    raise RuntimeError(f"Failed to create CUDA IPC handle: {e}")
 
                 compute_time = time.time() - start_time
                 self.total_compute_time += compute_time
 
-                # 构造响应
+                # 🔧 CUDA IPC: 构造响应（使用 IPC handle）
                 response = VITResponse(
                     request_id=request.request_id,
-                    embedding_shm_name=embedding_shm_name,
+                    embedding_ipc_handle=(ipc_handle, offset),
                     embedding_shape=tuple(embedding.shape),
                     embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                    embedding_device=str(embedding.device),
+                    image_hash=hash_val,
                     compute_time=compute_time,
                     from_cache=from_cache,
                 )
 
-                logger.info(f"[VIT Scheduler] ✅ Request processed: {request.request_id}, compute_time={compute_time*1000:.1f}ms")
+                logger.info(
+                    f"[VIT Scheduler] ✅ Request processed: {request.request_id}, "
+                    f"compute_time={compute_time*1000:.1f}ms, from_cache={from_cache}, "
+                    f"hash={hash_val}"
+                )
                 return response
 
             finally:
-                # 🔧 新增: 清理 processing 标记
+                # 清理 processing 标记
                 with self._processing_lock:
                     self._processing_requests.discard(request.request_id)
 
         except Exception as e:
-            logger.error(f"[VIT Scheduler] ❌ Error processing request {request.request_id}: {e}", exc_info=True)
-            # 🔧 新增: 清理 processing 标记
+            logger.error(
+                f"[VIT Scheduler] ❌ Error processing request {request.request_id}: {e}",
+                exc_info=True
+            )
+            # 清理 processing 标记
             with self._processing_lock:
                 self._processing_requests.discard(request.request_id)
             raise
     
     def _update_cache(self, hash_val: int, embedding: torch.Tensor):
-        """🔧 方案 2B: 更新缓存（LRU 策略，线程安全）"""
+        """🔧 CUDA IPC: 更新缓存（LRU 策略，线程安全，保持 embedding 在 GPU 上）
+
+        Args:
+            hash_val: 图片的 hash 值
+            embedding: 计算出的 embedding tensor（必须在 GPU 上）
+
+        Notes:
+            - Embedding 必须保持在 GPU 上，以便通过 CUDA IPC 共享
+            - 使用 LRU 策略驱逐最久未使用的 embedding
+            - 线程安全（使用 _cache_lock）
+        """
         # 测压模式：不缓存
         if self.benchmark_mode:
             return
@@ -725,22 +788,41 @@ class VITScheduler:
             # 如果已在缓存中，更新访问时间
             if hash_val in self.embedding_cache:
                 self.embedding_cache.move_to_end(hash_val)
+                logger.debug(f"[VIT Scheduler] 🔄 Cache hit (LRU update): hash={hash_val}")
                 return
 
             embedding_size = embedding.element_size() * embedding.nelement()
+
+            # 🔧 CUDA IPC: 确保 embedding 在 GPU 上
+            if not embedding.is_cuda:
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ Embedding is not on GPU (device={embedding.device}), "
+                    "moving to GPU for CUDA IPC sharing"
+                )
+                embedding = embedding.to(self.device)
 
             # LRU 驱逐：移除最久未使用的条目
             while self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
                 if len(self.embedding_cache) == 0:
                     break
-                lru_hash, lru_embedding = self.embedding_cache.popitem(last=False)
-                evicted_size = lru_embedding.element_size() * lru_embedding.nelement()
+                oldest_hash, oldest_emb = self.embedding_cache.popitem(last=False)
+                evicted_size = oldest_emb.element_size() * oldest_emb.nelement()
                 self.cache_size_bytes -= evicted_size
-                logger.warning(f"[VIT Scheduler] 🗑️ Evicted LRU embedding (fallback): hash={lru_hash}, size={evicted_size/1024/1024:.2f} MB")
+                logger.info(
+                    f"[VIT Scheduler] 🗑️ Evicted embedding (LRU): hash={oldest_hash}, "
+                    f"size={evicted_size/1024/1024:.1f}MB"
+                )
+                # 🔧 CUDA IPC: 不需要手动释放，Python GC 会自动处理
 
-            # 添加新条目（直接存储在 GPU，不调用 .cpu()）
+            # 添加到缓存（保持在 GPU 上）
             self.embedding_cache[hash_val] = embedding
             self.cache_size_bytes += embedding_size
+
+            logger.info(
+                f"[VIT Scheduler] 💾 Added to cache: hash={hash_val}, "
+                f"size={embedding_size/1024/1024:.1f}MB, "
+                f"total_cache_size={self.cache_size_bytes/1024/1024:.1f}MB"
+            )
 
     def _get_cached_embedding(self, hash_val: int) -> Optional[torch.Tensor]:
         """🔧 方案 2B: 查询缓存（更新 LRU，线程安全）"""

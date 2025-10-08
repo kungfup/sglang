@@ -667,7 +667,14 @@ def _launch_subprocesses(
         )
 
         if model_config.is_multimodal:
-            logger.info("Launching VIT Scheduler process...")
+            # 🔧 动态计算 VIT Scheduler 端口（基于服务器端口）
+            if server_args.vit_scheduler_port is None:
+                # 默认: server_port + 1000
+                # 例如: --port 30019 => vit_scheduler_port = 31019
+                server_args.vit_scheduler_port = server_args.port + 1000
+                logger.info(f"VIT Scheduler port auto-generated: {server_args.vit_scheduler_port} (server_port + 1000)")
+
+            logger.info(f"Launching VIT Scheduler process on port {server_args.vit_scheduler_port}...")
 
             reader, writer = mp.Pipe(duplex=False)
             vit_scheduler_proc = mp.Process(
@@ -681,7 +688,7 @@ def _launch_subprocesses(
             if data != "ready":
                 raise RuntimeError(f"VIT Scheduler failed to start: {data}")
 
-            logger.info("VIT Scheduler is ready")
+            logger.info(f"VIT Scheduler is ready on port {server_args.vit_scheduler_port}")
 
             # Set environment variables for main Scheduler
             os.environ["SGLANG_VIT_SCHEDULER_ENABLED"] = "1"

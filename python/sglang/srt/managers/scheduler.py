@@ -451,7 +451,7 @@ class Scheduler(
         if self.model_config.is_multimodal and self.pp_group.is_first_rank:
             enable_vit_scheduler = os.environ.get("SGLANG_VIT_SCHEDULER_ENABLED", "0") == "1"
             if enable_vit_scheduler:
-                from sglang.srt.managers.vit_scheduler_client import VITSchedulerClient
+                from sglang.srt.managers.vit_scheduler_client import VITSchedulerClient, VITResult
 
                 vit_zmq_host = os.environ.get("SGLANG_VIT_SCHEDULER_HOST", "localhost")
                 vit_zmq_port = int(os.environ.get("SGLANG_VIT_SCHEDULER_PORT", "5555"))
@@ -1355,7 +1355,7 @@ class Scheduler(
         logger.info(f"[Scheduler]  Received {len(results)} VIT results (client_results_len_before={_res_len_before} -> after={_res_len_after})")
 
         # 更新对应请求的 precomputed_features
-        for request_id, embedding in results.items():
+        for request_id, vit_result in results.items():
             found = False
             # 在 waiting_queue 中查找请求
             for req in self.waiting_queue:
@@ -1364,13 +1364,16 @@ class Scheduler(
                     if req.multimodal_inputs is not None:
                         for mm_item in req.multimodal_inputs.mm_items:
                             if mm_item.modality == Modality.IMAGE:
-                                _emb = embedding.to(self.device)
+                                _emb = vit_result.embedding.to(self.device)
                                 mm_item.precomputed_features = _emb
 
-                                # 🔧 记录 image_hash 用于后续释放
+                                # 🔧 关键修改: 使用 VITResult 中的 image_hash（VIT Scheduler 计算的）
                                 if not hasattr(req, '_vit_image_hash'):
-                                    req._vit_image_hash = mm_item.hash
-                                    logger.info(f"[Scheduler] 📝 Recorded image_hash={mm_item.hash} for request {req.rid}")
+                                    req._vit_image_hash = vit_result.image_hash  # ✅ 使用 VIT Scheduler 的 hash
+                                    logger.info(
+                                        f"[Scheduler] 📝 Recorded image_hash={vit_result.image_hash} for request {req.rid} "
+                                        f"(from VIT Scheduler, not mm_item.hash={mm_item.hash})"
+                                    )
 
                                 try:
                                     logger.info(
