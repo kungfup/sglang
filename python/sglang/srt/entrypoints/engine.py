@@ -655,7 +655,7 @@ def _launch_subprocesses(
     )
 
     # Launch VIT Scheduler if enabled
-    vit_scheduler_proc = None
+    vit_scheduler_procs = []
     if server_args.enable_vit_scheduler and server_args.node_rank == 0:
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -674,21 +674,62 @@ def _launch_subprocesses(
                 server_args.vit_scheduler_port = server_args.port + 1000
                 logger.info(f"VIT Scheduler port auto-generated: {server_args.vit_scheduler_port} (server_port + 1000)")
 
-            logger.info(f"Launching VIT Scheduler process on port {server_args.vit_scheduler_port}...")
+            # 🔧 VIT TP: 启动多个 VIT Scheduler 进程（如果 vit_tp_size > 1）
+            vit_tp_size = server_args.vit_tp_size
+            if vit_tp_size > 1:
+                logger.info(f"Launching {vit_tp_size} VIT Scheduler processes (TP={vit_tp_size})...")
 
-            reader, writer = mp.Pipe(duplex=False)
-            vit_scheduler_proc = mp.Process(
-                target=run_vit_scheduler_process,
-                args=(server_args, writer),
-            )
-            vit_scheduler_proc.start()
+                # 启动多个 VIT Scheduler 进程
+                for tp_rank in range(vit_tp_size):
+                    # 每个 TP rank 使用相同的 ZMQ 端口（但只有 rank 0 会监听）
+                    # 其他 ranks 只参与计算
+                    reader, writer = mp.Pipe(duplex=False)
 
-            # Wait for VIT Scheduler to be ready
-            data = reader.recv()
-            if data != "ready":
-                raise RuntimeError(f"VIT Scheduler failed to start: {data}")
+                    # 设置环境变量
+                    env_vars = {
+                        "SGLANG_VIT_TP_RANK": str(tp_rank),
+                        "SGLANG_VIT_TP_SIZE": str(vit_tp_size),
+                        "SGLANG_VIT_TP_PORT": str(server_args.vit_tp_port),
+                    }
 
-            logger.info(f"VIT Scheduler is ready on port {server_args.vit_scheduler_port}")
+                    proc = mp.Process(
+                        target=run_vit_scheduler_process,
+                        args=(server_args, writer, env_vars),
+                    )
+                    proc.start()
+                    vit_scheduler_procs.append((proc, reader, tp_rank))
+
+                    logger.info(
+                        f"Started VIT Scheduler process: TP rank {tp_rank}/{vit_tp_size}, "
+                        f"PID={proc.pid}"
+                    )
+
+                # 等待所有 VIT Scheduler 进程准备好
+                for proc, reader, tp_rank in vit_scheduler_procs:
+                    data = reader.recv()
+                    if data != "ready":
+                        raise RuntimeError(f"VIT Scheduler TP rank {tp_rank} failed to start: {data}")
+                    logger.info(f"VIT Scheduler TP rank {tp_rank} is ready")
+
+                logger.info(f"All {vit_tp_size} VIT Scheduler processes are ready")
+            else:
+                # 单个 VIT Scheduler 进程（原有逻辑）
+                logger.info(f"Launching VIT Scheduler process on port {server_args.vit_scheduler_port}...")
+
+                reader, writer = mp.Pipe(duplex=False)
+                vit_scheduler_proc = mp.Process(
+                    target=run_vit_scheduler_process,
+                    args=(server_args, writer, {}),
+                )
+                vit_scheduler_proc.start()
+                vit_scheduler_procs.append((vit_scheduler_proc, reader, 0))
+
+                # Wait for VIT Scheduler to be ready
+                data = reader.recv()
+                if data != "ready":
+                    raise RuntimeError(f"VIT Scheduler failed to start: {data}")
+
+                logger.info(f"VIT Scheduler is ready on port {server_args.vit_scheduler_port}")
 
             # Set environment variables for main Scheduler
             os.environ["SGLANG_VIT_SCHEDULER_ENABLED"] = "1"
@@ -823,9 +864,20 @@ def _launch_subprocesses(
     return tokenizer_manager, scheduler_info
 
 
-def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer):
-    """Run VIT Scheduler process"""
+def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer, env_vars: dict = None):
+    """Run VIT Scheduler process
+
+    Args:
+        server_args: Server arguments
+        pipe_writer: Pipe writer for sending ready signal
+        env_vars: Environment variables to set (for TP support)
+    """
     try:
+        # 🔧 VIT TP: 设置环境变量
+        if env_vars:
+            for key, value in env_vars.items():
+                os.environ[key] = value
+
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.managers.vit_scheduler import start_vit_scheduler
 

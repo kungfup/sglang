@@ -100,6 +100,10 @@ class ServerArgs:
     vit_scheduler_batch_timeout_ms: float = 10.0
     vit_scheduler_cache_size_mb: int = 1024
 
+    # VIT TP options (for VIT Scheduler Tensor Parallelism)
+    vit_tp_size: int = 1  # VIT Tensor Parallelism size
+    vit_tp_port: int = 29500  # VIT TP communication port (for NCCL)
+
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
@@ -898,6 +902,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.vit_scheduler_cache_size_mb,
             help="The embedding cache size in MB for VIT Scheduler.",
+        )
+        parser.add_argument(
+            "--vit-tp-size",
+            type=int,
+            default=ServerArgs.vit_tp_size,
+            help="The tensor parallelism size for VIT Scheduler (e.g., 1, 2, 4).",
+        )
+        parser.add_argument(
+            "--vit-tp-port",
+            type=int,
+            default=ServerArgs.vit_tp_port,
+            help="The NCCL communication port for VIT Scheduler TP (default: 29500).",
         )
 
         # Logging

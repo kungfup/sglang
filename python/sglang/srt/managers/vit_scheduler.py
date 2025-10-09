@@ -20,6 +20,7 @@ from queue import Queue, Empty
 import threading
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
@@ -67,22 +68,29 @@ class VITResponse:
 
 
 class VITModelRunner:
-    """VIT 模型运行器"""
+    """VIT 模型运行器（支持 TP）"""
 
-    def __init__(self, model_config, device: str = "cuda:0"):
+    def __init__(self, model_config, device: str = "cuda:0", tp_size: int = 1):
         self.model_config = model_config
         self.device = device
         self.vit_model = None
+        self.tp_size = tp_size
 
         # 初始化 load_config（复用官方加载逻辑需要）
         from sglang.srt.configs.load_config import LoadConfig
         self.load_config = LoadConfig()
         
     def load_model(self):
-        """加载 ViT 模型"""
+        """加载 ViT 模型（支持 TP）
+
+        注意: 当 TP > 1 时，VIT 模型的权重会自动按 TP rank 分片。
+        这是通过 SGLang 的 ColumnParallelLinear 和 RowParallelLinear 层实现的。
+        """
         model_type = self.model_config.hf_config.model_type
 
         logger.info(f"[VIT Runner] Loading ViT model type: {model_type}")
+        if self.tp_size > 1:
+            logger.info(f"[VIT Runner] TP enabled: size={self.tp_size}")
 
         # 🔧 VIT 模型不使用量化（FP8 量化会导致 NaN）
         # 即使主模型使用了量化，VIT 模型也应该使用 float32
@@ -222,7 +230,13 @@ class VITModelRunner:
             logger.info(f"[VIT Runner] ✅ All parameters are valid (no NaN)")
     
     def compute(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
-        """计算 ViT embedding"""
+        """计算 ViT embedding（支持 TP + all-reduce）
+
+        当 TP > 1 时:
+        1. 每个 TP rank 计算部分 heads 的 embedding
+        2. 使用 NCCL all-reduce 合并结果
+        3. 只有 TP rank 0 返回完整的 embedding
+        """
         try:
             logger.info(f"[VIT Runner] 🚀 Starting compute: pixel_values.shape={pixel_values.shape}, device={pixel_values.device}")
 
@@ -253,6 +267,13 @@ class VITModelRunner:
                 # 同步 CUDA 操作，确保计算完成
                 torch.cuda.synchronize(self.device)
                 logger.info(f"[VIT Runner] ✅ ViT forward pass completed")
+
+                # 🔧 VIT TP: All-reduce（如果 TP > 1）
+                # 注意: SGLang 的 VIT 模型（Qwen2_5_VisionTransformer）使用了 RowParallelLinear
+                # RowParallelLinear 会自动执行 all-reduce，所以这里不需要额外的操作
+                # 所有 TP ranks 都会得到完整的 embedding
+                if self.tp_size > 1:
+                    logger.info(f"[VIT Runner] 🔄 TP mode: embedding already all-reduced by RowParallelLinear")
 
                 # 🔍 检查输出数据
                 if torch.isnan(embedding).any():
@@ -299,7 +320,70 @@ class VITScheduler:
             cache_size_mb: Embedding 缓存大小（MB），默认从环境变量读取
         """
         self.model_config = model_config
-        self.device = device
+
+        # 🔧 VIT TP: 初始化 TP group
+        self.tp_rank = int(os.environ.get("SGLANG_VIT_TP_RANK", "0"))
+        self.tp_size = int(os.environ.get("SGLANG_VIT_TP_SIZE", "1"))
+        self.vit_tp_port = int(os.environ.get("SGLANG_VIT_TP_PORT", "29500"))
+
+        if self.tp_size > 1:
+            # 初始化 distributed
+            if not dist.is_initialized():
+                logger.info(
+                    f"[VIT Scheduler] Initializing distributed: "
+                    f"rank={self.tp_rank}, world_size={self.tp_size}, "
+                    f"port={self.vit_tp_port}"
+                )
+                dist.init_process_group(
+                    backend="nccl",
+                    init_method=f"tcp://localhost:{self.vit_tp_port}",
+                    world_size=self.tp_size,
+                    rank=self.tp_rank,
+                )
+                logger.info(f"[VIT Scheduler] Distributed initialized")
+
+            # 设置 device（基于 TP rank）
+            self.device = torch.device(f"cuda:{self.tp_rank}")
+            torch.cuda.set_device(self.device)
+
+            # 🔧 VIT TP: 初始化 _WORLD group（必须在 initialize_model_parallel 之前）
+            from sglang.srt.distributed.parallel_state import (
+                init_world_group,
+                _WORLD,
+            )
+
+            # 检查 _WORLD 是否已初始化
+            global_parallel_state = __import__(
+                "sglang.srt.distributed.parallel_state", fromlist=["_WORLD"]
+            )
+            if global_parallel_state._WORLD is None:
+                logger.info(
+                    f"[VIT Scheduler] Initializing _WORLD group: "
+                    f"rank={self.tp_rank}, world_size={self.tp_size}"
+                )
+                ranks = list(range(self.tp_size))
+                global_parallel_state._WORLD = init_world_group(
+                    ranks=ranks,
+                    local_rank=self.tp_rank,
+                    backend="nccl",
+                )
+                logger.info(f"[VIT Scheduler] _WORLD group initialized")
+
+            # 初始化 TP group
+            from sglang.srt.distributed import initialize_model_parallel
+            initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_size,
+                pipeline_model_parallel_size=1,
+            )
+
+            logger.info(
+                f"[VIT Scheduler] ✅ Initialized TP group: rank={self.tp_rank}, "
+                f"size={self.tp_size}, device={self.device}"
+            )
+        else:
+            # 单 GPU 模式
+            self.device = device
+
         self.zmq_port = zmq_port
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0
@@ -313,21 +397,28 @@ class VITScheduler:
         # 测压模式开关（禁用缓存以准确测试性能）
         self.benchmark_mode = os.environ.get("SGLANG_VIT_BENCHMARK_MODE", "0") == "1"
 
-        # 初始化 ZMQ（使用 PAIR 模式，一对一最可靠）
-        self.context = zmq.Context()
+        # 🔧 VIT TP: 只有 TP rank 0 初始化 ZMQ（其他 ranks 只参与计算）
+        if self.tp_rank == 0:
+            # 初始化 ZMQ（使用 PAIR 模式，一对一最可靠）
+            self.context = zmq.Context()
 
-        # 使用 PAIR socket - 一对一通信，最简单最可靠
-        self.socket = self.context.socket(zmq.PAIR)
-        self.socket.bind(f"tcp://127.0.0.1:{zmq_port}")
-        self.socket.setsockopt(zmq.RCVTIMEO, 0)  # 非阻塞接收
-        self.socket.setsockopt(zmq.LINGER, 0)
+            # 使用 PAIR socket - 一对一通信，最简单最可靠
+            self.socket = self.context.socket(zmq.PAIR)
+            self.socket.bind(f"tcp://127.0.0.1:{zmq_port}")
+            self.socket.setsockopt(zmq.RCVTIMEO, 0)  # 非阻塞接收
+            self.socket.setsockopt(zmq.LINGER, 0)
 
-        logger.info(f"[VIT Scheduler] ZMQ server listening (PAIR mode - most reliable)")
-        logger.info(f"[VIT Scheduler] Port: {zmq_port} (bidirectional)")
-        logger.info(f"[VIT Scheduler] Waiting for client to connect...")
+            logger.info(f"[VIT Scheduler] ZMQ server listening (PAIR mode - most reliable)")
+            logger.info(f"[VIT Scheduler] Port: {zmq_port} (bidirectional)")
+            logger.info(f"[VIT Scheduler] Waiting for client to connect...")
+        else:
+            # TP rank > 0: 不初始化 ZMQ，只参与计算
+            self.context = None
+            self.socket = None
+            logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: no ZMQ (only rank 0 handles communication)")
 
-        # 初始化模型
-        self.model_runner = VITModelRunner(model_config, device)
+        # 初始化模型（传递 tp_size）
+        self.model_runner = VITModelRunner(model_config, self.device, tp_size=self.tp_size)
         self.model_runner.load_model()
 
         # 初始化缓存（使用 OrderedDict 实现 LRU）
@@ -691,9 +782,39 @@ class VITScheduler:
                     from_cache = True
                     self.cache_hits += 1
                     logger.info(f"[VIT Scheduler] ✅ Cache hit: hash={hash_val}")
+
+                    # 🔧 VIT TP: 即使 cache hit，也需要通知其他 ranks（发送空的 broadcast）
+                    # 这样 TP rank 1 就不会一直等待
+                    if self.tp_size > 1:
+                        from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+                        logger.info(f"[VIT Scheduler] 📡 Broadcasting cache hit signal to other TP ranks...")
+                        # 发送一个空的 tensor_dict，表示不需要计算
+                        # 注意: broadcast_tensor_dict 需要所有 ranks 都调用，所以我们发送一个特殊标记
+                        cache_hit_signal = {
+                            "cache_hit": True,
+                            "exit": False,
+                        }
+                        broadcast_tensor_dict(tensor_dict=cache_hit_signal, src=0)
+                        logger.info(f"[VIT Scheduler] ✅ Cache hit signal broadcasted")
                 else:
                     # 计算 ViT
                     logger.info(f"[VIT Scheduler] 🚀 Cache miss, computing ViT embedding...")
+
+                    # 🔧 VIT TP: 如果 TP > 1，通过 broadcast 同步请求数据给其他 ranks
+                    if self.tp_size > 1:
+                        from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+                        logger.info(f"[VIT Scheduler] 📡 Broadcasting request data to other TP ranks...")
+                        request_data = {
+                            "pixel_values": pixel_values,
+                            "image_grid_thw": image_grid_thw,
+                            "exit": False,
+                        }
+                        broadcast_tensor_dict(tensor_dict=request_data, src=0)
+                        logger.info(f"[VIT Scheduler] ✅ Request data broadcasted")
+
+                    # 所有 ranks 执行计算（RowParallelLinear 会自动 all-reduce）
                     embedding = self.model_runner.compute(pixel_values, image_grid_thw)
                     logger.info(f"[VIT Scheduler] ✅ ViT computation completed")
 
@@ -715,43 +836,53 @@ class VITScheduler:
                     self._update_cache(hash_val, embedding)
                     logger.info(f"[VIT Scheduler] ✅ Cache updated")
 
-                # 🔧 CUDA IPC: 创建 IPC handle（代替保存到 CPU 共享内存）
-                logger.info(f"[VIT Scheduler] 🔗 Creating CUDA IPC handle...")
-                try:
-                    from sglang.semi_pd.utils import get_ipc_handle
-                    ipc_handle, offset = get_ipc_handle(embedding)
+                # 🔧 VIT TP: 只有 TP rank 0 创建 CUDA IPC handle 并返回响应
+                # TP rank 1 只参与计算，不返回响应
+                if self.tp_rank == 0:
+                    # 🔧 CUDA IPC: 创建 IPC handle（代替保存到 CPU 共享内存）
+                    logger.info(f"[VIT Scheduler] 🔗 Creating CUDA IPC handle...")
+                    try:
+                        from sglang.semi_pd.utils import get_ipc_handle
+                        ipc_handle, offset = get_ipc_handle(embedding)
+                        logger.info(
+                            f"[VIT Scheduler] ✅ Created CUDA IPC handle: "
+                            f"offset={offset}, device={embedding.device}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[VIT Scheduler] ❌ Failed to create CUDA IPC handle: {e}",
+                            exc_info=True
+                        )
+                        raise RuntimeError(f"Failed to create CUDA IPC handle: {e}")
+
+                    compute_time = time.time() - start_time
+                    self.total_compute_time += compute_time
+
+                    # 🔧 CUDA IPC: 构造响应（使用 IPC handle）
+                    response = VITResponse(
+                        request_id=request.request_id,
+                        embedding_ipc_handle=(ipc_handle, offset),
+                        embedding_shape=tuple(embedding.shape),
+                        embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                        embedding_device=str(embedding.device),
+                        image_hash=hash_val,
+                        compute_time=compute_time,
+                        from_cache=from_cache,
+                    )
+
                     logger.info(
-                        f"[VIT Scheduler] ✅ Created CUDA IPC handle: "
-                        f"offset={offset}, device={embedding.device}"
+                        f"[VIT Scheduler] ✅ Request processed: {request.request_id}, "
+                        f"compute_time={compute_time*1000:.1f}ms, from_cache={from_cache}, "
+                        f"hash={hash_val}"
                     )
-                except Exception as e:
-                    logger.error(
-                        f"[VIT Scheduler] ❌ Failed to create CUDA IPC handle: {e}",
-                        exc_info=True
+                    return response
+                else:
+                    # TP rank 1: 只参与计算，不返回响应
+                    logger.info(
+                        f"[VIT Scheduler] ✅ TP rank {self.tp_rank}: computation completed, "
+                        f"no response returned (only rank 0 returns response)"
                     )
-                    raise RuntimeError(f"Failed to create CUDA IPC handle: {e}")
-
-                compute_time = time.time() - start_time
-                self.total_compute_time += compute_time
-
-                # 🔧 CUDA IPC: 构造响应（使用 IPC handle）
-                response = VITResponse(
-                    request_id=request.request_id,
-                    embedding_ipc_handle=(ipc_handle, offset),
-                    embedding_shape=tuple(embedding.shape),
-                    embedding_dtype=str(embedding.dtype).replace('torch.', ''),
-                    embedding_device=str(embedding.device),
-                    image_hash=hash_val,
-                    compute_time=compute_time,
-                    from_cache=from_cache,
-                )
-
-                logger.info(
-                    f"[VIT Scheduler] ✅ Request processed: {request.request_id}, "
-                    f"compute_time={compute_time*1000:.1f}ms, from_cache={from_cache}, "
-                    f"hash={hash_val}"
-                )
-                return response
+                    return None
 
             finally:
                 # 清理 processing 标记
@@ -939,10 +1070,22 @@ class VITScheduler:
             logger.debug(f"[VIT Scheduler] 🔄 Queued {queued_count} free signals for processing")
 
     def run(self):
-        """🔧 新优化: 主循环（单独线程处理 free 信号 + 动态批处理大小）"""
+        """🔧 新优化: 主循环（单独线程处理 free 信号 + 动态批处理大小）
+
+        🔧 VIT TP 支持:
+        - TP rank 0: 监听 ZMQ 请求，通过 broadcast 同步给其他 ranks
+        - TP rank > 0: 等待 broadcast，参与计算
+        - 所有 ranks 同时执行 forward pass (RowParallelLinear 需要 all-reduce)
+        """
         logger.info("[VIT Scheduler] Starting main loop (dynamic batch size + dedicated free signal thread)")
 
-        # 🔧 新优化: 启动单独线程处理 free 信号
+        # 🔧 VIT TP: TP rank > 0 使用 worker 模式（等待 broadcast）
+        if self.tp_rank > 0:
+            logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: entering worker mode (waiting for broadcast)")
+            self._run_tp_worker()
+            return
+
+        # 🔧 新优化: 启动单独线程处理 free 信号（只在 TP rank 0）
         self._start_free_signal_thread()
 
         try:
@@ -1030,15 +1173,97 @@ class VITScheduler:
             f"cache_size={self.cache_size_bytes/1024/1024:.1f}MB"
         )
     
+    def _run_tp_worker(self):
+        """🔧 VIT TP: TP rank > 0 的 worker 运行循环
+
+        TP rank > 0 不监听 ZMQ，而是等待 TP rank 0 的 broadcast。
+        收到 broadcast 后，参与计算（RowParallelLinear 需要 all-reduce）。
+        """
+        logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: worker mode started")
+
+        from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+        try:
+            while True:
+                # 1. 等待 TP rank 0 的 broadcast（接收请求数据）
+                # broadcast_tensor_dict 会阻塞直到收到数据
+                request_data = broadcast_tensor_dict(tensor_dict=None, src=0)
+
+                if request_data is None:
+                    # 没有请求，继续等待
+                    time.sleep(0.001)
+                    continue
+
+                # 检查是否是退出信号
+                if request_data.get("exit", False):
+                    logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: received exit signal")
+                    break
+
+                # 检查是否是 cache hit 信号
+                if request_data.get("cache_hit", False):
+                    logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: received cache hit signal, skipping computation")
+                    continue
+
+                # 2. 提取请求数据
+                pixel_values = request_data.get("pixel_values")
+                image_grid_thw = request_data.get("image_grid_thw")
+
+                if pixel_values is None or image_grid_thw is None:
+                    logger.warning(f"[VIT Scheduler] TP rank {self.tp_rank}: received invalid request data")
+                    continue
+
+                logger.info(
+                    f"[VIT Scheduler] TP rank {self.tp_rank}: received broadcast, "
+                    f"pixel_values.shape={pixel_values.shape}"
+                )
+
+                # 3. 执行计算（参与 all-reduce）
+                try:
+                    embedding = self.model_runner.compute(pixel_values, image_grid_thw)
+                    logger.info(
+                        f"[VIT Scheduler] TP rank {self.tp_rank}: computation completed, "
+                        f"embedding.shape={embedding.shape}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[VIT Scheduler] TP rank {self.tp_rank}: error in compute: {e}",
+                        exc_info=True
+                    )
+
+        except KeyboardInterrupt:
+            logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: received interrupt signal")
+        except Exception as e:
+            logger.error(f"[VIT Scheduler] TP rank {self.tp_rank}: error in worker loop: {e}", exc_info=True)
+        finally:
+            self.cleanup()
+
     def cleanup(self):
         """🔧 新优化: 清理资源（包括停止 free signal 线程）"""
         logger.info("[VIT Scheduler] Cleaning up...")
 
-        # 🔧 新优化: 停止 free signal 线程
-        self._stop_free_signal_thread_func()
+        # 🔧 VIT TP: TP rank 0 发送退出信号给其他 ranks
+        if self.tp_rank == 0 and self.tp_size > 1:
+            try:
+                from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
-        self.socket.close()
-        self.context.term()
+                logger.info("[VIT Scheduler] Sending exit signal to other TP ranks...")
+                exit_signal = {
+                    "exit": True,
+                }
+                broadcast_tensor_dict(tensor_dict=exit_signal, src=0)
+                logger.info("[VIT Scheduler] Exit signal sent")
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] Failed to send exit signal: {e}")
+
+        # 🔧 新优化: 停止 free signal 线程（只在 TP rank 0）
+        if self.tp_rank == 0:
+            self._stop_free_signal_thread_func()
+
+        # 关闭 ZMQ（只在 TP rank 0）
+        if self.tp_rank == 0 and self.socket is not None:
+            self.socket.close()
+            self.context.term()
+
         logger.info("[VIT Scheduler] Cleanup complete")
 
 
