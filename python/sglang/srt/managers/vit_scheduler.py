@@ -288,6 +288,90 @@ class VITModelRunner:
             logger.error(f"[VIT Runner] ❌ Error in compute: {e}", exc_info=True)
             raise
 
+    def compute_batch(self, pixel_values_list: List[torch.Tensor], image_grid_thw_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        """🔧 批量计算 ViT embedding（支持 TP + all-reduce）
+
+        Args:
+            pixel_values_list: 批量的 pixel_values tensors
+            image_grid_thw_list: 批量的 image_grid_thw tensors
+
+        Returns:
+            List[torch.Tensor]: 批量的 embedding tensors
+
+        Notes:
+            - 将多个请求的 pixel_values 拼接成一个大的 batch
+            - 一次性执行 VIT forward pass
+            - 然后将结果拆分回各个请求
+            - 这样可以充分利用 GPU 并行计算能力
+        """
+        try:
+            batch_size = len(pixel_values_list)
+            logger.info(f"[VIT Runner] 🚀 Starting batch compute: batch_size={batch_size}")
+
+            if batch_size == 0:
+                return []
+
+            # 如果只有一个请求，直接调用单个 compute
+            if batch_size == 1:
+                embedding = self.compute(pixel_values_list[0], image_grid_thw_list[0])
+                return [embedding]
+
+            # 确保 CUDA 操作在正确的设备上执行
+            with torch.cuda.device(self.device):
+                # 🔧 批量拼接 pixel_values
+                # pixel_values 的 shape: (num_images, num_channels, height, width)
+                # 我们需要将多个请求的 pixel_values 拼接成一个大的 batch
+                logger.info(f"[VIT Runner] 📦 Concatenating {batch_size} pixel_values...")
+
+                # 移动到 GPU 并拼接
+                pixel_values_gpu = [pv.to(self.device, non_blocking=False) for pv in pixel_values_list]
+                image_grid_thw_gpu = [igt.to(self.device, non_blocking=False) for igt in image_grid_thw_list]
+
+                # 拼接 pixel_values (在第 0 维拼接)
+                batched_pixel_values = torch.cat(pixel_values_gpu, dim=0)
+
+                # 拼接 image_grid_thw (在第 0 维拼接)
+                batched_image_grid_thw = torch.cat(image_grid_thw_gpu, dim=0)
+
+                # 同步 CUDA 操作
+                torch.cuda.synchronize(self.device)
+                logger.info(f"[VIT Runner] ✅ Batched tensors: pixel_values.shape={batched_pixel_values.shape}, image_grid_thw.shape={batched_image_grid_thw.shape}")
+
+                # 执行批量 ViT 前向传播
+                logger.info(f"[VIT Runner] 🔄 Running batched ViT forward pass...")
+                with torch.no_grad():
+                    batched_embedding = self.vit_model(batched_pixel_values, grid_thw=batched_image_grid_thw)
+
+                # 同步 CUDA 操作
+                torch.cuda.synchronize(self.device)
+                logger.info(f"[VIT Runner] ✅ Batched ViT forward pass completed: embedding.shape={batched_embedding.shape}")
+
+                # 🔧 VIT TP: All-reduce（如果 TP > 1）
+                if self.tp_size > 1:
+                    logger.info(f"[VIT Runner] 🔄 TP mode: embedding already all-reduced by RowParallelLinear")
+
+                # 🔧 拆分 embedding 回各个请求
+                # batched_embedding 的 shape: (total_num_images, seq_len, hidden_size)
+                # 我们需要根据每个请求的 num_images 拆分
+                logger.info(f"[VIT Runner] 📦 Splitting batched embedding back to {batch_size} requests...")
+
+                embeddings = []
+                start_idx = 0
+                for i, pv in enumerate(pixel_values_list):
+                    num_images = pv.shape[0]  # 第 0 维是 num_images
+                    end_idx = start_idx + num_images
+                    embedding = batched_embedding[start_idx:end_idx]
+                    embeddings.append(embedding)
+                    start_idx = end_idx
+                    logger.info(f"[VIT Runner] 📦 Request {i}: embedding.shape={embedding.shape}")
+
+                logger.info(f"[VIT Runner] ✅ Batch compute completed: {batch_size} embeddings")
+                return embeddings
+
+        except Exception as e:
+            logger.error(f"[VIT Runner] ❌ Error in batch compute: {e}", exc_info=True)
+            raise
+
 
 class VITScheduler:
     """
@@ -464,13 +548,203 @@ class VITScheduler:
         self._last_gpu_memory_check = time.time()
         self._gpu_memory_check_interval = 1.0  # GPU 显存检查间隔（秒）
 
+        # 🔧 显存预算管理 (参考 SGLang 的设计)
+        # 不使用 GPU 显存使用率，而是使用预算制
+        self._max_batch_memory_gb = 10.0  # VIT 批量计算的显存预算 (10 GB)
+        self._current_batch_memory_bytes = 0  # 当前批量计算占用的显存 (bytes)
+        self._per_request_memory_bytes = 8.0 * 1024**3  # 每个请求的显存需求 (8 GB)
+        self._oom_count = 0  # OOM 次数统计
+        self._last_oom_time = 0.0  # 上次 OOM 时间
+        self._oom_cooldown_seconds = 5.0  # OOM 冷却时间（秒）
+
+        # 初始化显存信息
+        self._init_gpu_memory_info()
+
         # 🔧 新增: 正在处理的请求集合（防止重复处理）
         self._processing_requests: Set[str] = set()  # 正在处理的 request_id
         self._processing_lock = threading.Lock()
 
         logger.info("[VIT Scheduler] Initialized successfully")
         logger.info(f"[VIT Scheduler] 🔧 Dynamic batch size enabled: min={self._min_batch_size}, max={self._max_batch_size}, initial={self._dynamic_batch_size}")
-    
+
+    def _init_memory_budget(self):
+        """初始化显存预算 (参考 SGLang 的设计)"""
+        logger.info(f"[VIT Scheduler] 💾 Memory Budget Info:")
+        logger.info(f"[VIT Scheduler]   Max batch memory: {self._max_batch_memory_gb:.2f} GB")
+        logger.info(f"[VIT Scheduler]   Per request memory: {self._per_request_memory_bytes / (1024**3):.2f} GB")
+        logger.info(f"[VIT Scheduler]   Max cache size: {self.max_cache_size_bytes / (1024**2):.2f} MB")
+
+    def _get_available_batch_memory_bytes(self) -> int:
+        """获取可用的批量计算显存 (bytes)"""
+        max_batch_memory_bytes = int(self._max_batch_memory_gb * 1024**3)
+        return max_batch_memory_bytes - self._current_batch_memory_bytes
+
+    def _get_available_cache_memory_bytes(self) -> int:
+        """获取可用的缓存显存 (bytes)"""
+        return self.max_cache_size_bytes - self.cache_size_bytes
+
+    def _estimate_batch_memory_gb(self, batch_size: int) -> float:
+        """估算批量计算需要的显存 (GB)
+
+        Args:
+            batch_size: 批量大小
+
+        Returns:
+            估算的显存需求 (GB)
+        """
+        # 🔧 更新估算值: 基于实际 OOM 日志和可用显存
+        # 22.53 GiB / 3 requests ≈ 7.51 GB per request
+        # 使用 8.0 GB 作为估算 (7.51 * 1.065 安全系数)
+        # 可用显存通常为 8.60 GB，8.0 GB 可以通过检查
+        per_request_memory_gb = 8.0
+        estimated_memory = batch_size * per_request_memory_gb
+
+        logger.debug(
+            f"[VIT Scheduler] 📊 Memory estimation: batch_size={batch_size}, "
+            f"estimated={estimated_memory:.2f} GB ({per_request_memory_gb:.1f} GB/request)"
+        )
+
+        return estimated_memory
+
+    def _can_process_batch(self, batch_size: int) -> tuple[bool, str]:
+        """检查是否可以处理指定大小的 batch
+
+        Args:
+            batch_size: 批量大小
+
+        Returns:
+            (can_process, reason): 是否可以处理, 原因
+        """
+        logger.info(f"[VIT Scheduler] 🔍 Checking if can process batch_size={batch_size}")
+
+        # 1. 检查缓存占用
+        cache_usage_ratio = self.cache_size_bytes / self.max_cache_size_bytes if self.max_cache_size_bytes > 0 else 0.0
+        logger.info(f"[VIT Scheduler]   Cache usage: {cache_usage_ratio*100:.1f}%")
+        if cache_usage_ratio > 0.9:  # 缓存占用超过 90%
+            reason = f"Cache usage too high: {cache_usage_ratio*100:.1f}%"
+            logger.warning(f"[VIT Scheduler] ❌ {reason}")
+            return False, reason
+
+        # 2. 检查 GPU 显存使用率
+        memory_usage_ratio = self._get_gpu_memory_usage_ratio()
+        logger.info(f"[VIT Scheduler]   GPU memory usage: {memory_usage_ratio*100:.1f}%")
+
+        # 3. 估算批量计算需要的显存
+        estimated_memory_gb = self._estimate_batch_memory_gb(batch_size)
+        available_memory_gb = self._get_available_gpu_memory_gb()
+        logger.info(
+            f"[VIT Scheduler]   Memory: estimated={estimated_memory_gb:.2f} GB, "
+            f"available={available_memory_gb:.2f} GB"
+        )
+
+        # 🔧 改进: 如果显存使用率略高，但估算的显存需求 < 可用显存，仍然允许处理
+        if memory_usage_ratio > self._gpu_memory_threshold:
+            # 检查估算的显存需求是否小于可用显存
+            if estimated_memory_gb < available_memory_gb:
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ GPU memory usage ({memory_usage_ratio*100:.1f}%) > threshold ({self._gpu_memory_threshold*100:.1f}%), "
+                    f"but estimated memory ({estimated_memory_gb:.2f} GB) < available ({available_memory_gb:.2f} GB). "
+                    f"Will try anyway."
+                )
+                # 继续检查其他条件
+            else:
+                reason = f"GPU memory usage too high: {memory_usage_ratio*100:.1f}%"
+                logger.warning(f"[VIT Scheduler] ❌ {reason}")
+                return False, reason
+
+        # 4. 检查估算的显存需求是否超过可用显存
+        if estimated_memory_gb > available_memory_gb:
+            gap_gb = estimated_memory_gb - available_memory_gb
+
+            # 🔧 如果差距小于 2 GB，允许尝试
+            # PyTorch 可能不会分配那么多显存，实际需求可能更小
+            if gap_gb < 2.0:
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ Memory slightly insufficient: "
+                    f"need {estimated_memory_gb:.2f} GB, available {available_memory_gb:.2f} GB, "
+                    f"gap={gap_gb:.2f} GB. Will try anyway (PyTorch may allocate less)."
+                )
+                return True, "Try anyway (small gap)"
+
+            reason = f"Insufficient memory: need {estimated_memory_gb:.2f} GB, available {available_memory_gb:.2f} GB, gap={gap_gb:.2f} GB"
+            logger.warning(f"[VIT Scheduler] ❌ {reason}")
+            return False, reason
+
+        # 4. 检查 OOM 冷却时间
+        if self._oom_count > 0:
+            time_since_oom = time.time() - self._last_oom_time
+            if time_since_oom < self._oom_cooldown_seconds:
+                reason = f"OOM cooldown: {self._oom_cooldown_seconds - time_since_oom:.1f}s remaining"
+                logger.warning(f"[VIT Scheduler] ❌ {reason}")
+                return False, reason
+
+        logger.info(f"[VIT Scheduler] ✅ Can process batch_size={batch_size}")
+        return True, "OK"
+
+    def _adjust_batch_size_for_memory(self, requested_batch_size: int) -> int:
+        """根据显存情况动态调整批量大小
+
+        Args:
+            requested_batch_size: 请求的批量大小
+
+        Returns:
+            调整后的批量大小
+        """
+        logger.info(
+            f"[VIT Scheduler] 🔧 Adjusting batch size for memory: requested={requested_batch_size}"
+        )
+
+        # 从请求的批量大小开始,逐步减小直到可以处理
+        for batch_size in range(requested_batch_size, 0, -1):
+            can_process, reason = self._can_process_batch(batch_size)
+            if can_process:
+                if batch_size < requested_batch_size:
+                    logger.warning(
+                        f"[VIT Scheduler] 📉 Reduced batch size: {requested_batch_size} -> {batch_size} "
+                        f"(reason: {reason})"
+                    )
+                else:
+                    logger.info(
+                        f"[VIT Scheduler] ✅ Batch size OK: {batch_size}"
+                    )
+                return batch_size
+
+        # 如果连 batch_size=1 都不能处理,返回 0
+        logger.warning(f"[VIT Scheduler] ⚠️ Cannot process any batch (even size=1)")
+        return 0
+
+    def _update_dynamic_batch_size(self):
+        """更新动态批量大小"""
+        # 检查是否需要更新
+        now = time.time()
+        if now - self._last_gpu_memory_check < self._gpu_memory_check_interval:
+            return
+
+        self._last_gpu_memory_check = now
+
+        # 获取 GPU 显存使用率
+        memory_usage_ratio = self._get_gpu_memory_usage_ratio()
+
+        # 根据显存使用率调整批量大小
+        if memory_usage_ratio > 0.9:  # 显存使用率 > 90%
+            # 减小批量大小
+            new_batch_size = max(self._min_batch_size, self._dynamic_batch_size - 1)
+            if new_batch_size != self._dynamic_batch_size:
+                logger.info(
+                    f"[VIT Scheduler] 📉 Reducing batch size: {self._dynamic_batch_size} -> {new_batch_size} "
+                    f"(memory usage: {memory_usage_ratio*100:.1f}%)"
+                )
+                self._dynamic_batch_size = new_batch_size
+        elif memory_usage_ratio < 0.7:  # 显存使用率 < 70%
+            # 增加批量大小
+            new_batch_size = min(self._max_batch_size, self._dynamic_batch_size + 1)
+            if new_batch_size != self._dynamic_batch_size:
+                logger.info(
+                    f"[VIT Scheduler] 📈 Increasing batch size: {self._dynamic_batch_size} -> {new_batch_size} "
+                    f"(memory usage: {memory_usage_ratio*100:.1f}%)"
+                )
+                self._dynamic_batch_size = new_batch_size
+
     def _compute_hash(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> int:
         """计算输入的 hash 值"""
         hash_input = (
@@ -616,17 +890,17 @@ class VITScheduler:
             )
 
     def _process_batch(self):
-        """🔧 新优化: 批量处理请求（动态批处理大小 + 分批处理）"""
+        """🔧 批量处理请求（真正的批量计算 + 动态批处理大小）"""
         if not self.pending_requests:
             return
 
-        # 🔧 新优化: 动态调整批处理大小
+        # 🔧 动态调整批处理大小
         self._adjust_dynamic_batch_size()
 
         batch_start_time = time.time()
         total_pending = len(self.pending_requests)
 
-        # 🔧 新优化: 使用动态批处理大小
+        # 🔧 使用动态批处理大小
         actual_batch_size = min(total_pending, self._dynamic_batch_size)
         batch_to_process = self.pending_requests[:actual_batch_size]
         remaining_requests = self.pending_requests[actual_batch_size:]
@@ -637,68 +911,133 @@ class VITScheduler:
                 f"Processing {actual_batch_size} requests, {len(remaining_requests)} remaining in queue."
             )
         else:
-            logger.info(f"[VIT Scheduler] Processing batch of {actual_batch_size} requests (dynamic_batch_size={self._dynamic_batch_size})")
+            logger.info(f"[VIT Scheduler] 📦 Processing batch of {actual_batch_size} requests (dynamic_batch_size={self._dynamic_batch_size})")
 
-        # 逐个处理（后续可以优化为真正的批量计算）
+        # 🔧 批量处理: 分离 cache hit 和 cache miss
+        cache_hits = []
+        cache_misses = []
+
         for request in batch_to_process:
             try:
-                response = self._process_single_request(request)
+                # 检查是否正在处理中
+                with self._processing_lock:
+                    if request.request_id in self._processing_requests:
+                        logger.warning(f"[VIT Scheduler] ⚠️ Request {request.request_id} is already being processed, skipping")
+                        continue
+                    self._processing_requests.add(request.request_id)
 
-                # 🔧 新增: 跳过 None 响应（重复请求或共享内存不存在）
-                if response is None:
-                    logger.warning(f"[VIT Scheduler] ⚠️ Skipping None response for {request.request_id}")
+                # 从共享内存加载输入
+                try:
+                    pixel_values = self._load_tensor_from_shm(
+                        request.pixel_values_shm_name,
+                        request.pixel_values_shape,
+                        request.pixel_values_dtype
+                    )
+                    image_grid_thw = self._load_tensor_from_shm(
+                        request.image_grid_thw_shm_name,
+                        request.image_grid_thw_shape,
+                        request.image_grid_thw_dtype
+                    )
+                except FileNotFoundError as e:
+                    logger.warning(f"[VIT Scheduler] ⚠️ Shared memory not found for {request.request_id}: {e}")
+                    with self._processing_lock:
+                        self._processing_requests.discard(request.request_id)
                     continue
 
-                # 发送响应：直接发送消息
-                message_data = pickle.dumps(asdict(response))
+                # 计算 hash
+                hash_val = self._compute_hash(pixel_values, image_grid_thw)
 
-                logger.info(
-                    f"[VIT Scheduler] 📤 Sending response: {response.request_id}, "
-                    f"message_size={len(message_data)} bytes"
+                # 查询缓存
+                cached_embedding = self._get_cached_embedding(hash_val)
+
+                if cached_embedding is not None:
+                    # Cache hit
+                    cache_hits.append((request, cached_embedding, hash_val))
+                    logger.info(f"[VIT Scheduler] 🎯 Cache hit for {request.request_id}")
+                else:
+                    # Cache miss
+                    cache_misses.append((request, pixel_values, image_grid_thw, hash_val))
+                    logger.info(f"[VIT Scheduler] 🚀 Cache miss for {request.request_id}, will compute")
+
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] ❌ Error preparing request {request.request_id}: {e}", exc_info=True)
+                with self._processing_lock:
+                    self._processing_requests.discard(request.request_id)
+
+        # 🔧 批量计算 cache misses (带显存检查)
+        if cache_misses:
+            logger.info(f"[VIT Scheduler] 🔍 Processing {len(cache_misses)} cache misses with memory check")
+
+            # 检查是否可以处理这个批量大小
+            cache_miss_batch_size = len(cache_misses)
+            adjusted_batch_size = self._adjust_batch_size_for_memory(cache_miss_batch_size)
+
+            logger.info(
+                f"[VIT Scheduler] 📊 Batch size adjustment result: "
+                f"requested={cache_miss_batch_size}, adjusted={adjusted_batch_size}"
+            )
+
+            if adjusted_batch_size == 0:
+                # 显存不足,无法处理任何请求
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ Insufficient memory to process any requests. "
+                    f"Clearing GPU cache and waiting for memory to be freed..."
                 )
 
-                # PAIR socket 发送（更可靠）
-                try:
-                    # 检查 socket 状态
-                    events_before = self.socket.getsockopt(zmq.EVENTS)
-                    logger.info(f"[VIT Scheduler] Socket events before send: {events_before} (POLLOUT={zmq.POLLOUT}, POLLIN={zmq.POLLIN})")
+                # 🔧 新增: 主动清理 GPU 缓存
+                torch.cuda.empty_cache()
+                logger.info(f"[VIT Scheduler] 🧹 GPU cache cleared")
 
-                    self.socket.send(message_data, zmq.NOBLOCK)
+                # 清理所有请求的 processing 标记
+                for request, _, _, _ in cache_misses:
+                    with self._processing_lock:
+                        self._processing_requests.discard(request.request_id)
+                # 将请求放回队列
+                self.pending_requests = [req for req, _, _, _ in cache_misses] + remaining_requests
+                return
 
-                    # 等待一小段时间确保消息被发送到网络层
-                    # 这对于 PAIR socket 很重要，避免消息丢失
-                    time.sleep(0.001)  # 1ms
+            elif adjusted_batch_size < cache_miss_batch_size:
+                # 需要减小批量大小
+                logger.info(
+                    f"[VIT Scheduler] 📉 Adjusting cache miss batch size: {cache_miss_batch_size} -> {adjusted_batch_size} "
+                    f"(memory constraint)"
+                )
+                # 只处理前 adjusted_batch_size 个请求
+                cache_misses_to_process = cache_misses[:adjusted_batch_size]
+                cache_misses_deferred = cache_misses[adjusted_batch_size:]
 
-                    # 检查发送后的状态
-                    events_after = self.socket.getsockopt(zmq.EVENTS)
-                    logger.info(
-                        f"[VIT Scheduler] ✅ Sent response: {response.request_id}, "
-                        f"from_cache={response.from_cache}, "
-                        f"compute_time={response.compute_time*1000:.1f}ms, "
-                        f"events_after={events_after}"
-                    )
+                # 将延迟的请求放回队列
+                deferred_requests = [req for req, _, _, _ in cache_misses_deferred]
+                self.pending_requests = deferred_requests + remaining_requests
 
-                    # 立即尝试接收（看看是否有 ACK 或其他消息）
-                    try:
-                        ack = self.socket.recv(zmq.NOBLOCK)
-                        logger.info(f"[VIT Scheduler] 📥 Received immediate response: {len(ack)} bytes")
-                    except zmq.Again:
-                        pass  # 没有立即响应，正常
+                # 清理延迟请求的 processing 标记
+                for request, _, _, _ in cache_misses_deferred:
+                    with self._processing_lock:
+                        self._processing_requests.discard(request.request_id)
 
-                except zmq.Again:
-                    logger.error(f"[VIT Scheduler] ❌ Send would block!")
-                    # 尝试阻塞发送
-                    self.socket.send(message_data)
-                    logger.info(f"[VIT Scheduler] ✅ Sent with blocking mode")
+                # 处理调整后的批量
+                self._process_cache_misses_batch(cache_misses_to_process)
+            else:
+                # 批量大小合适,直接处理
+                self._process_cache_misses_batch(cache_misses)
+
+        # 🔧 处理 cache hits
+        for request, cached_embedding, hash_val in cache_hits:
+            try:
+                self._send_cached_response(request, cached_embedding, hash_val)
             except Exception as e:
-                logger.error(f"[VIT Scheduler] Error processing request {request.request_id}: {e}", exc_info=True)
+                logger.error(f"[VIT Scheduler] ❌ Error sending cached response for {request.request_id}: {e}", exc_info=True)
+            finally:
+                with self._processing_lock:
+                    self._processing_requests.discard(request.request_id)
 
-        # 🔧 方案 3B: 将剩余请求放回队列
+        # 🔧 将剩余请求放回队列
         self.pending_requests = remaining_requests
 
         batch_time = time.time() - batch_start_time
         logger.info(
-            f"[VIT Scheduler] Batch processed in {batch_time*1000:.1f}ms, "
+            f"[VIT Scheduler] ✅ Batch processed in {batch_time*1000:.1f}ms, "
+            f"cache_hits={len(cache_hits)}, cache_misses={len(cache_misses)}, "
             f"remaining in queue: {len(self.pending_requests)}"
         )
 
@@ -706,13 +1045,262 @@ class VITScheduler:
         if self.total_requests % 100 == 0:
             self._log_stats()
 
+        # 🔧 新增: 如果队列不为空，立即重新触发批量处理
+        if self.pending_requests:
+            logger.info(
+                f"[VIT Scheduler] 🔄 Queue not empty ({len(self.pending_requests)} requests), "
+                f"scheduling next batch processing in 10ms"
+            )
+            # 使用 threading.Timer 异步触发，避免递归
+            # 延迟 10ms，给系统一点时间处理其他事情（例如显存释放）
+            threading.Timer(0.01, self._process_batch).start()
+        else:
+            logger.debug(f"[VIT Scheduler] ✅ Queue is empty, batch processing complete")
+
         # 定期清理显存碎片（每 10 个批次）
         if self.total_requests % 10 == 0:
             torch.cuda.empty_cache()
 
-        # 🔧 方案 4A: 定期清理超时的共享内存（每 10 个批次）
+        # 🔧 定期清理超时的共享内存（每 10 个批次）
         if self.total_requests % 10 == 0:
             self._cleanup_timeout_shm()
+
+    def _process_cache_misses_batch(self, cache_misses: List[Tuple]):
+        """🔧 批量处理 cache miss 的请求
+
+        Args:
+            cache_misses: List of (request, pixel_values, image_grid_thw, hash_val)
+        """
+        if not cache_misses:
+            return
+
+        batch_size = len(cache_misses)
+        logger.info(f"[VIT Scheduler] 📦 Processing {batch_size} cache misses in batch...")
+
+        # 只有 TP rank 0 需要处理
+        if self.tp_rank == 0:
+            # 提取数据
+            requests = [item[0] for item in cache_misses]
+            pixel_values_list = [item[1] for item in cache_misses]
+            image_grid_thw_list = [item[2] for item in cache_misses]
+            hash_vals = [item[3] for item in cache_misses]
+
+            try:
+                # 🔧 VIT TP: Broadcast 批量数据给其他 TP ranks
+                if self.tp_size > 1:
+                    from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+                    logger.info(f"[VIT Scheduler] 📡 Broadcasting batch data to other TP ranks...")
+                    batch_data = {
+                        "pixel_values_list": pixel_values_list,
+                        "image_grid_thw_list": image_grid_thw_list,
+                    }
+                    broadcast_tensor_dict(tensor_dict=batch_data, src=0)
+                    logger.info(f"[VIT Scheduler] ✅ Batch data broadcasted")
+
+                # 批量计算
+                compute_start = time.time()
+                embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_thw_list)
+                compute_time = time.time() - compute_start
+
+                logger.info(f"[VIT Scheduler] ✅ Batch compute completed in {compute_time*1000:.1f}ms, avg={compute_time/batch_size*1000:.1f}ms per request")
+
+                # 处理每个结果
+                for i, (request, embedding, hash_val) in enumerate(zip(requests, embeddings, hash_vals)):
+                    try:
+                        # 更新缓存
+                        self._update_cache(hash_val, embedding)
+
+                        # 创建 CUDA IPC handle
+                        from sglang.semi_pd.utils import get_ipc_handle
+                        ipc_handle, offset = get_ipc_handle(embedding)
+
+                        # 构造响应
+                        response = VITResponse(
+                            request_id=request.request_id,
+                            embedding_ipc_handle=(ipc_handle, offset),
+                            embedding_shape=tuple(embedding.shape),
+                            embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                            embedding_device=str(embedding.device),
+                            image_hash=hash_val,
+                            compute_time=compute_time / batch_size,  # 平均时间
+                            from_cache=False,
+                        )
+
+                        # 发送响应
+                        self._send_response(response)
+
+                        logger.info(f"[VIT Scheduler] ✅ Batch request {i+1}/{batch_size} processed: {request.request_id}")
+
+                    except Exception as e:
+                        logger.error(f"[VIT Scheduler] ❌ Error processing batch request {request.request_id}: {e}", exc_info=True)
+                    finally:
+                        with self._processing_lock:
+                            self._processing_requests.discard(request.request_id)
+
+            except RuntimeError as e:
+                # 🔧 OOM 或其他 CUDA 错误: 降级到单个请求处理
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    # 记录 OOM 统计
+                    self._oom_count += 1
+                    self._last_oom_time = time.time()
+
+                    logger.warning(
+                        f"[VIT Scheduler] ⚠️ Batch compute failed (OOM/CUDA error), falling back to single-request processing: {e}"
+                    )
+                    logger.warning(
+                        f"[VIT Scheduler] 📊 OOM Statistics: count={self._oom_count}, "
+                        f"batch_size={batch_size}, "
+                        f"memory_usage={self._get_gpu_memory_usage_ratio()*100:.1f}%"
+                    )
+
+                    # 清理 GPU 缓存
+                    torch.cuda.empty_cache()
+
+                    # 逐个处理请求
+                    for request, pixel_values, image_grid_thw, hash_val in cache_misses:
+                        try:
+                            self._process_single_request_fallback(request, pixel_values, image_grid_thw, hash_val)
+                        except Exception as single_e:
+                            logger.error(f"[VIT Scheduler] ❌ Single request fallback also failed for {request.request_id}: {single_e}", exc_info=True)
+                        finally:
+                            with self._processing_lock:
+                                self._processing_requests.discard(request.request_id)
+                else:
+                    # 其他错误: 清理所有请求
+                    logger.error(f"[VIT Scheduler] ❌ Batch compute failed with non-OOM error: {e}", exc_info=True)
+                    for request, _, _, _ in cache_misses:
+                        with self._processing_lock:
+                            self._processing_requests.discard(request.request_id)
+                    raise
+
+        else:
+            # TP rank > 0: 接收 broadcast 并参与计算
+            try:
+                from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+                # 接收 broadcast
+                batch_data = broadcast_tensor_dict(tensor_dict=None, src=0)
+
+                if batch_data is None:
+                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: Failed to receive batch data")
+                    return
+
+                pixel_values_list = batch_data.get("pixel_values_list")
+                image_grid_thw_list = batch_data.get("image_grid_thw_list")
+
+                # 批量计算（参与 all-reduce）
+                embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_thw_list)
+
+                logger.info(f"[VIT Scheduler] ✅ TP rank {self.tp_rank}: Batch computation completed")
+
+            except RuntimeError as e:
+                # OOM 或 CUDA 错误
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    logger.warning(f"[VIT Scheduler] ⚠️ TP rank {self.tp_rank}: Batch compute failed (OOM/CUDA error): {e}")
+                    # 清理 GPU 缓存 (torch 已在文件顶部导入)
+                    torch.cuda.empty_cache()
+                else:
+                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: Batch compute failed: {e}", exc_info=True)
+                    raise
+            finally:
+                # 清理 processing 标记
+                for request, _, _, _ in cache_misses:
+                    with self._processing_lock:
+                        self._processing_requests.discard(request.request_id)
+
+    def _process_single_request_fallback(self, request: VITRequest, pixel_values: torch.Tensor,
+                                          image_grid_thw: torch.Tensor, hash_val: str):
+        """🔧 单个请求处理 (OOM 降级时使用)
+
+        Args:
+            request: VIT 请求
+            pixel_values: 图像像素值
+            image_grid_thw: 图像网格尺寸
+            hash_val: 图像哈希值
+        """
+        logger.info(f"[VIT Scheduler] 🔄 Processing single request (fallback): {request.request_id}")
+
+        # 🔧 VIT TP: Broadcast 数据给其他 TP ranks
+        if self.tp_size > 1:
+            from sglang.srt.distributed.communication_op import broadcast_tensor_dict
+
+            logger.info(f"[VIT Scheduler] 📡 Broadcasting single request data to other TP ranks...")
+            single_data = {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            }
+            broadcast_tensor_dict(tensor_dict=single_data, src=0)
+
+        # 单个计算
+        compute_start = time.time()
+        embedding = self.model_runner.forward(pixel_values, image_grid_thw)
+        compute_time = time.time() - compute_start
+
+        # 更新缓存
+        self._update_cache(hash_val, embedding)
+
+        # 创建 CUDA IPC handle
+        from sglang.semi_pd.utils import get_ipc_handle
+        ipc_handle, offset = get_ipc_handle(embedding)
+
+        # 构造响应
+        response = VITResponse(
+            request_id=request.request_id,
+            embedding_ipc_handle=(ipc_handle, offset),
+            embedding_shape=tuple(embedding.shape),
+            embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+            embedding_device=str(embedding.device),
+            image_hash=hash_val,
+            compute_time=compute_time,
+            from_cache=False,
+        )
+
+        # 发送响应
+        self._send_response(response)
+
+        logger.info(f"[VIT Scheduler] ✅ Single request (fallback) processed: {request.request_id}, compute_time={compute_time*1000:.1f}ms")
+
+    def _send_cached_response(self, request: VITRequest, cached_embedding: torch.Tensor, hash_val: int):
+        """发送缓存的响应"""
+        # 创建 CUDA IPC handle
+        from sglang.semi_pd.utils import get_ipc_handle
+        ipc_handle, offset = get_ipc_handle(cached_embedding)
+
+        # 构造响应
+        response = VITResponse(
+            request_id=request.request_id,
+            embedding_ipc_handle=(ipc_handle, offset),
+            embedding_shape=tuple(cached_embedding.shape),
+            embedding_dtype=str(cached_embedding.dtype).replace('torch.', ''),
+            embedding_device=str(cached_embedding.device),
+            image_hash=hash_val,
+            compute_time=0.0,
+            from_cache=True,
+        )
+
+        # 发送响应
+        self._send_response(response)
+
+        logger.info(f"[VIT Scheduler] ✅ Cached response sent: {request.request_id}")
+
+    def _send_response(self, response: VITResponse):
+        """发送响应到 ZMQ socket"""
+        message_data = pickle.dumps(asdict(response))
+
+        logger.info(
+            f"[VIT Scheduler] 📤 Sending response: {response.request_id}, "
+            f"message_size={len(message_data)} bytes, from_cache={response.from_cache}"
+        )
+
+        try:
+            self.socket.send(message_data, zmq.NOBLOCK)
+            time.sleep(0.001)  # 1ms
+            logger.info(f"[VIT Scheduler] ✅ Response sent: {response.request_id}")
+        except zmq.Again:
+            logger.error(f"[VIT Scheduler] ❌ Send would block!")
+            self.socket.send(message_data)
+            logger.info(f"[VIT Scheduler] ✅ Sent with blocking mode")
 
     def _process_single_request(self, request: VITRequest) -> VITResponse:
         """🔧 CUDA IPC: 处理单个请求（使用 CUDA IPC 代替 CPU 共享内存）
@@ -789,11 +1377,9 @@ class VITScheduler:
                         from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
                         logger.info(f"[VIT Scheduler] 📡 Broadcasting cache hit signal to other TP ranks...")
-                        # 发送一个空的 tensor_dict，表示不需要计算
-                        # 注意: broadcast_tensor_dict 需要所有 ranks 都调用，所以我们发送一个特殊标记
+                        # 只发送 cache_hit 标记，不需要其他数据
                         cache_hit_signal = {
                             "cache_hit": True,
-                            "exit": False,
                         }
                         broadcast_tensor_dict(tensor_dict=cache_hit_signal, src=0)
                         logger.info(f"[VIT Scheduler] ✅ Cache hit signal broadcasted")
@@ -806,10 +1392,10 @@ class VITScheduler:
                         from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
                         logger.info(f"[VIT Scheduler] 📡 Broadcasting request data to other TP ranks...")
+                        # 只发送 VIT 计算必需的数据: pixel_values 和 image_grid_thw
                         request_data = {
                             "pixel_values": pixel_values,
                             "image_grid_thw": image_grid_thw,
-                            "exit": False,
                         }
                         broadcast_tensor_dict(tensor_dict=request_data, src=0)
                         logger.info(f"[VIT Scheduler] ✅ Request data broadcasted")
@@ -1174,12 +1760,12 @@ class VITScheduler:
         )
     
     def _run_tp_worker(self):
-        """🔧 VIT TP: TP rank > 0 的 worker 运行循环
+        """🔧 VIT TP: TP rank > 0 的 worker 运行循环（支持批量 broadcast）
 
         TP rank > 0 不监听 ZMQ，而是等待 TP rank 0 的 broadcast。
         收到 broadcast 后，参与计算（RowParallelLinear 需要 all-reduce）。
         """
-        logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: worker mode started")
+        logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: worker mode started (batch support)")
 
         from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
@@ -1204,31 +1790,55 @@ class VITScheduler:
                     logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: received cache hit signal, skipping computation")
                     continue
 
-                # 2. 提取请求数据
-                pixel_values = request_data.get("pixel_values")
-                image_grid_thw = request_data.get("image_grid_thw")
+                # 2. 检查是否是批量数据
+                pixel_values_list = request_data.get("pixel_values_list")
+                image_grid_thw_list = request_data.get("image_grid_thw_list")
 
-                if pixel_values is None or image_grid_thw is None:
-                    logger.warning(f"[VIT Scheduler] TP rank {self.tp_rank}: received invalid request data")
-                    continue
-
-                logger.info(
-                    f"[VIT Scheduler] TP rank {self.tp_rank}: received broadcast, "
-                    f"pixel_values.shape={pixel_values.shape}"
-                )
-
-                # 3. 执行计算（参与 all-reduce）
-                try:
-                    embedding = self.model_runner.compute(pixel_values, image_grid_thw)
+                if pixel_values_list is not None and image_grid_thw_list is not None:
+                    # 批量计算
+                    batch_size = len(pixel_values_list)
                     logger.info(
-                        f"[VIT Scheduler] TP rank {self.tp_rank}: computation completed, "
-                        f"embedding.shape={embedding.shape}"
+                        f"[VIT Scheduler] TP rank {self.tp_rank}: received batch broadcast, "
+                        f"batch_size={batch_size}"
                     )
-                except Exception as e:
-                    logger.error(
-                        f"[VIT Scheduler] TP rank {self.tp_rank}: error in compute: {e}",
-                        exc_info=True
+
+                    try:
+                        embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_thw_list)
+                        logger.info(
+                            f"[VIT Scheduler] TP rank {self.tp_rank}: batch computation completed, "
+                            f"batch_size={batch_size}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[VIT Scheduler] TP rank {self.tp_rank}: error in batch compute: {e}",
+                            exc_info=True
+                        )
+                else:
+                    # 单个请求计算（向后兼容）
+                    pixel_values = request_data.get("pixel_values")
+                    image_grid_thw = request_data.get("image_grid_thw")
+
+                    if pixel_values is None or image_grid_thw is None:
+                        logger.warning(f"[VIT Scheduler] TP rank {self.tp_rank}: received invalid request data")
+                        continue
+
+                    logger.info(
+                        f"[VIT Scheduler] TP rank {self.tp_rank}: received single broadcast, "
+                        f"pixel_values.shape={pixel_values.shape}"
                     )
+
+                    # 3. 执行计算（参与 all-reduce）
+                    try:
+                        embedding = self.model_runner.compute(pixel_values, image_grid_thw)
+                        logger.info(
+                            f"[VIT Scheduler] TP rank {self.tp_rank}: computation completed, "
+                            f"embedding.shape={embedding.shape}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[VIT Scheduler] TP rank {self.tp_rank}: error in compute: {e}",
+                            exc_info=True
+                        )
 
         except KeyboardInterrupt:
             logger.info(f"[VIT Scheduler] TP rank {self.tp_rank}: received interrupt signal")
