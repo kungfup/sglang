@@ -231,6 +231,15 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         except Exception:
             pass
 
+        # 🔧 FIX V17: Send INIT_DONE signal to DECODE to ensure proper initialization order
+        # This prevents DECODE from starting event loop before PREFILL is fully initialized
+        if self.attn_tp_rank == 0:
+            try:
+                self.send_to_d_instance.send_pyobj({"type": "INIT_DONE", "pp": self.pp_rank})
+                logger.info(f"[PREFILL-PP{pp_rank}] Sent INIT_DONE signal to DECODE")
+            except Exception as e:
+                logger.warning(f"[PREFILL-PP{pp_rank}] Failed to send INIT_DONE signal: {e}")
+
     def _drain_with_poller_pp0(self, max_iters: int = 32, timeout_ms: int = 5):
         """Drain p_scheduler_input for PP0 using a simple non-blocking loop.
 

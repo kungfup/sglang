@@ -1067,12 +1067,22 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         self.process_batch_result_prefill(batch, result)
         batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-        # Instead of merging into running_batch (which gets overwritten by event_loop_pp's slot),
-        # enqueue this batch so get_next_batch_to_run can surface it for the current microbatch.
+
+        # 🔧 FIX V14: Check if running_batch is empty or has no model_config before merging
+        # In PP mode, directly update running_batch instead of using queue
+        # The queue-based approach (_ready_decode_batches) was designed for TP mode
+        # In PP mode, we should directly merge the batch into running_batch
         if not batch.is_empty():
-            self._ready_decode_batches.append(batch)
-            # Minimal signal to confirm queueing
-            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] queued decode batch")
+            # Check if running_batch is empty or has no model_config
+            # If so, directly assign the new batch instead of merging
+            if self.running_batch.is_empty() or self.running_batch.model_config is None:
+                # running_batch is empty or not properly initialized, directly assign
+                self.running_batch = batch
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] assigned decode batch to running_batch (was empty), running_batch.reqs={len(self.running_batch.reqs)}")
+            else:
+                # running_batch has existing requests, merge the new batch
+                self.running_batch.merge_batch(batch)
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] merged decode batch into running_batch, running_batch.reqs={len(self.running_batch.reqs)}")
 
         # Semi-PD: 在最后一个PP段，记录token，交由event_loop_pp的“最后段发送”统一回传给PP0。
         if (
@@ -1150,17 +1160,23 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # We just need to keep the requests in waiting_queue for tracking
         # The actual batch creation and processing is handled by the native PP event loop
 
-        # If we have a ready decode batch queued from PREFILL result, adopt it (PP0 only)
-        if getattr(self, "_ready_decode_batches", None) and self.running_batch.is_empty():
-            if len(self._ready_decode_batches) > 0:
-                self.running_batch = self._ready_decode_batches.popleft()
+        # 🔧 FIX V12: Remove _ready_decode_batches queue logic for PP mode
+        # In PP mode, batches should be managed directly through running_batch
+        # The queue-based approach was designed for TP mode and doesn't work with PP's microbatch management
 
         # Update/return decode batch only
         ret = None
         if not self.running_batch.is_empty():
+            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch not empty, reqs={len(self.running_batch.reqs)}")
             self.running_batch = self.update_running_batch(self.running_batch)
+            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: after update_running_batch, reqs={len(self.running_batch.reqs)}")
             if not self.running_batch.is_empty():
                 ret = self.running_batch
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: returning running_batch, reqs={len(ret.reqs)}")
+            else:
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch became empty after update")
+        else:
+            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch is empty")
 
         # 🔧 CRITICAL: In Semi-PD+PP, ALL DECODE stages need to receive hidden states from previous stage
         # even when they have no running_batch. Return an IDLE batch to trigger NCCL recv.

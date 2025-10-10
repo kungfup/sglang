@@ -993,6 +993,37 @@ class Scheduler(
                     sys.stdout.flush()
                     sys.stderr.flush()
 
+                    # 🔧 FIX V17: Wait for PREFILL INIT_DONE signal to ensure proper initialization order
+                    # This prevents DECODE from starting event loop before PREFILL is fully initialized
+                    # which could cause CUDA MPS / NCCL resource conflicts
+                    if hasattr(self, 'recv_from_prefill'):
+                        import time
+                        import zmq
+                        logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Waiting for PREFILL INIT_DONE signal...")
+                        deadline = time.time() + float(os.environ.get("SGLANG_SEMIPD_INIT_WAIT_S", "10.0"))
+                        init_done_received = False
+
+                        while time.time() < deadline:
+                            try:
+                                msg = self.recv_from_prefill.recv_pyobj(zmq.NOBLOCK)
+                                if isinstance(msg, dict) and msg.get("type") == "INIT_DONE":
+                                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Received INIT_DONE signal from PREFILL-PP{msg.get('pp', '?')}")
+                                    init_done_received = True
+                                    break
+                            except zmq.Again:
+                                time.sleep(0.1)
+                            except Exception as e:
+                                logger.warning(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Error while waiting for INIT_DONE: {e}")
+                                break
+
+                        if not init_done_received:
+                            logger.warning(f"[DECODE-PP{getattr(self,'pp_rank','?')}] INIT_DONE signal not received within timeout, proceeding anyway")
+                        else:
+                            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] PREFILL initialization confirmed, starting event loop")
+
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+
             # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
 
             # 🔧 DEBUG: Log before initializing running_mbs
@@ -1072,6 +1103,27 @@ class Scheduler(
                     )
                     is_idle_batch = getattr(self.cur_batch, 'forward_mode', None) and self.cur_batch.forward_mode.is_idle()
 
+                    # 🔧 DEBUG: Log batch info before run_batch (throttled for IDLE batches)
+                    # Initialize counters if not exists
+                    if not hasattr(self, '_idle_batch_log_counter'):
+                        self._idle_batch_log_counter = 0
+                    if not hasattr(self, '_non_idle_batch_log_counter'):
+                        self._non_idle_batch_log_counter = 0
+
+                    # Throttle IDLE batch logs: only log every 10000 times
+                    should_log = False
+                    if is_idle_batch:
+                        self._idle_batch_log_counter += 1
+                        if self._idle_batch_log_counter % 10000 == 1:
+                            should_log = True
+                    else:
+                        # Always log non-IDLE batches
+                        self._non_idle_batch_log_counter += 1
+                        should_log = True
+
+                    if should_log:
+                        logger.info(f"[{getattr(self,'instance_role',None)}-PP{getattr(self,'pp_rank','?')}] About to run_batch: mb_id={mb_id}, reqs={len(self.cur_batch.reqs)}, is_idle_batch={is_idle_batch}, forward_mode={getattr(self.cur_batch, 'forward_mode', None)} (idle_count={self._idle_batch_log_counter}, non_idle_count={self._non_idle_batch_log_counter})")
+
                     # 🔧 CRITICAL FIX: PREFILL should skip run_batch() for IDLE batches
                     # This prevents deadlock in PP mode:
                     # - PREFILL-PP0 skips run_batch() → doesn't send hidden states
@@ -1079,8 +1131,14 @@ class Scheduler(
                     # Otherwise PREFILL-PP1 will block in tp_worker.recv_tensor_dict()
                     if is_semi_pd_prefill and is_idle_batch:
                         result = None  # Skip any model forward for idle placeholder batches
+                        if should_log:
+                            logger.info(f"[PREFILL-PP{getattr(self,'pp_rank','?')}] Skipped run_batch for IDLE batch")
                     else:
+                        if should_log:
+                            logger.info(f"[{getattr(self,'instance_role',None)}-PP{getattr(self,'pp_rank','?')}] Calling run_batch...")
                         result = self.run_batch(self.cur_batch)
+                        if should_log:
+                            logger.info(f"[{getattr(self,'instance_role',None)}-PP{getattr(self,'pp_rank','?')}] run_batch completed")
                         # For Semi-PD PREFILL, immediately process batch result to drive same-stage handoff.
                         if is_semi_pd_prefill:
                             try:
