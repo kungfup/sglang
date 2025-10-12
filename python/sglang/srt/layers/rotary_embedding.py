@@ -159,14 +159,17 @@ class RotaryEmbedding(CustomOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        # 🔧 [FIX] Ensure query is contiguous before view() to avoid RuntimeError
+        # in batch mode where query may be non-contiguous after qkv.split()
+        query = query.contiguous().view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
+        # 🔧 [FIX] Ensure key is contiguous before view() to avoid RuntimeError
+        key = key.contiguous().view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
@@ -985,14 +988,17 @@ class MRotaryEmbedding(RotaryEmbedding):
             )
 
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        # 🔧 [FIX] Ensure query is contiguous before view() to avoid RuntimeError
+        # in batch mode where query may be non-contiguous after qkv.split()
+        query = query.contiguous().view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
+        # 🔧 [FIX] Ensure key is contiguous before view() to avoid RuntimeError
+        key = key.contiguous().view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)

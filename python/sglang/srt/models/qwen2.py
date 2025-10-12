@@ -171,9 +171,32 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # 🔧 [DEBUG] Log hidden_states shape
+        if not forward_batch.forward_mode.is_decode():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"[ATTN_DEBUG] hidden_states.shape={hidden_states.shape}, "
+                f"positions.shape={positions.shape}, batch_size={forward_batch.batch_size}"
+            )
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # 🔧 [DEBUG] Log k shape before rotary_emb
+        if not forward_batch.forward_mode.is_decode():
+            logger.info(
+                f"[ATTN_DEBUG] k.shape before rotary={k.shape}"
+            )
+
         q, k = self.rotary_emb(positions, q, k)
+
+        # 🔧 [DEBUG] Log k shape after rotary_emb
+        if not forward_batch.forward_mode.is_decode():
+            logger.info(
+                f"[ATTN_DEBUG] k.shape after rotary={k.shape}"
+            )
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output

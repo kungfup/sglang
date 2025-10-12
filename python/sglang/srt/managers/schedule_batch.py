@@ -1154,6 +1154,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(
         self, pre_allocated_req_pool_indices: Optional[List[int]] = None
     ):
+        # 🔧 [DEBUG] Log extend_lens state before prepare_for_extend
+        logger.info(
+            f"[PREPARE_FOR_EXTEND_DEBUG] Before prepare: "
+            f"batch_size={len(self.reqs)}, "
+            f"extend_lens={'None' if self.extend_lens is None else f'{len(self.extend_lens)} elements: {self.extend_lens[:10] if len(self.extend_lens) <= 10 else self.extend_lens[:10]}'}, "
+            f"multimodal_inputs={'None' if self.multimodal_inputs is None else len(self.multimodal_inputs)}"
+        )
+
+        # 🔧 [CRITICAL FIX] Reset extend_lens to prevent stale data from previous batches
+        # This is necessary because ScheduleBatch objects may be reused by the scheduler,
+        # and extend_lens can accumulate values from merge_batch operations.
+        # We must ensure extend_lens is recalculated from scratch based on current reqs.
+        self.extend_lens = None
+        self.prefix_lens = None
+        self.extend_logprob_start_lens = None
+        self.multimodal_inputs = None
+
+        logger.info(
+            f"[PREPARE_FOR_EXTEND_FIX] Reset extend_lens and related fields to None before recalculation"
+        )
+
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
@@ -1416,6 +1437,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
+        # 🔧 [DEBUG] Log mix_with_running details
+        logger.info(
+            f"[MIX_WITH_RUNNING_DEBUG] Before merge: "
+            f"self.batch_size={len(self.reqs)}, "
+            f"self.extend_lens={len(self.extend_lens) if hasattr(self, 'extend_lens') and self.extend_lens else 'None'}, "
+            f"self.multimodal_inputs={len(self.multimodal_inputs) if self.multimodal_inputs else 'None'}, "
+            f"running_bs={running_bs}"
+        )
+
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
@@ -1423,7 +1453,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
-        self.merge_batch(running_batch)
+        # 🔧 [FIX] Pass skip_extend_lens=True to avoid double-merging
+        # mix_with_running handles extend_lens/prefix_lens manually below
+        self.merge_batch(running_batch, skip_extend_lens=True)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
@@ -1441,6 +1473,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
+
+        # 🔧 [DEBUG] Log mix_with_running details after merge
+        logger.info(
+            f"[MIX_WITH_RUNNING_DEBUG] After merge: "
+            f"self.batch_size={len(self.reqs)}, "
+            f"self.extend_lens={len(self.extend_lens) if hasattr(self, 'extend_lens') and self.extend_lens else 'None'}, "
+            f"self.multimodal_inputs={len(self.multimodal_inputs) if self.multimodal_inputs else 'None'}"
+        )
 
     def new_page_count_next_decode(self):
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -1703,6 +1743,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+
+        # 🔧 [FIX] Filter extend_lens, prefix_lens, and related lists to match filtered batch
+        # These lists must have the same length as reqs (batch_size)
+        if hasattr(self, 'extend_lens') and self.extend_lens is not None:
+            self.extend_lens = [self.extend_lens[i] for i in keep_indices]
+            logger.info(
+                f"[FILTER_BATCH_FIX] Filtered extend_lens: "
+                f"old_len={len(keep_indices)}, new_len={len(self.extend_lens)}"
+            )
+
+        if hasattr(self, 'prefix_lens') and self.prefix_lens is not None:
+            self.prefix_lens = [self.prefix_lens[i] for i in keep_indices]
+
+        if hasattr(self, 'extend_logprob_start_lens') and self.extend_logprob_start_lens is not None:
+            self.extend_logprob_start_lens = [self.extend_logprob_start_lens[i] for i in keep_indices]
+
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -1725,13 +1781,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(keep_indices_device)
 
-    def merge_batch(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: "ScheduleBatch", skip_extend_lens: bool = False):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
         # Semi-PD: Add null check for sampling_info
         if self.sampling_info is not None:
             self.sampling_info.merge_batch(other.sampling_info)
+
+        # 🔧 [DEBUG] Log merge_batch details
+        logger.info(
+            f"[MERGE_BATCH_DEBUG] Before merge (skip_extend_lens={skip_extend_lens}): "
+            f"self.batch_size={len(self.reqs)}, "
+            f"self.extend_lens={len(self.extend_lens) if hasattr(self, 'extend_lens') and self.extend_lens else 'None'}, "
+            f"self.multimodal_inputs={len(self.multimodal_inputs) if self.multimodal_inputs else 'None'}, "
+            f"other.batch_size={len(other.reqs)}, "
+            f"other.extend_lens={len(other.extend_lens) if hasattr(other, 'extend_lens') and other.extend_lens else 'None'}, "
+            f"other.multimodal_inputs={len(other.multimodal_inputs) if other.multimodal_inputs else 'None'}"
+        )
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
@@ -1743,6 +1810,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
+
+        # 🔧 [FIX] Merge extend_lens, prefix_lens, and related lists to match seq_lens length
+        # These lists must have the same length as seq_lens (batch_size)
+        # skip_extend_lens=True when called from mix_with_running, which handles these manually
+        if not skip_extend_lens:
+            if hasattr(self, 'extend_lens') and hasattr(other, 'extend_lens'):
+                if self.extend_lens is not None and other.extend_lens is not None:
+                    logger.info(
+                        f"[MERGE_BATCH_FIX] Before extend: "
+                        f"self.extend_lens={len(self.extend_lens)}, other.extend_lens={len(other.extend_lens)}"
+                    )
+                    self.extend_lens.extend(other.extend_lens)
+                    logger.info(
+                        f"[MERGE_BATCH_FIX] After extend: self.extend_lens={len(self.extend_lens)}"
+                    )
+
+            if hasattr(self, 'prefix_lens') and hasattr(other, 'prefix_lens'):
+                if self.prefix_lens is not None and other.prefix_lens is not None:
+                    self.prefix_lens.extend(other.prefix_lens)
+
+            if hasattr(self, 'extend_logprob_start_lens') and hasattr(other, 'extend_logprob_start_lens'):
+                if self.extend_logprob_start_lens is not None and other.extend_logprob_start_lens is not None:
+                    self.extend_logprob_start_lens.extend(other.extend_logprob_start_lens)
+
+            # Merge extend_num_tokens
+            if hasattr(self, 'extend_num_tokens') and hasattr(other, 'extend_num_tokens'):
+                if self.extend_num_tokens is not None and other.extend_num_tokens is not None:
+                    self.extend_num_tokens += other.extend_num_tokens
+
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
@@ -1758,6 +1854,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
+        # 🔧 [DEBUG] Log merge_batch details after merge
+        logger.info(
+            f"[MERGE_BATCH_DEBUG] After merge: "
+            f"self.batch_size={len(self.reqs)}, "
+            f"self.extend_lens={len(self.extend_lens) if hasattr(self, 'extend_lens') and self.extend_lens else 'None'}, "
+            f"self.multimodal_inputs={len(self.multimodal_inputs) if self.multimodal_inputs else 'None'}"
+        )
+
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
@@ -1769,12 +1873,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
+        # 🔧 [CRITICAL DEBUG] Log batch state BEFORE checking forward_mode
+        logger.info(
+            f"[GET_MODEL_WORKER_BATCH_ENTRY] "
+            f"forward_mode={self.forward_mode}, "
+            f"batch_size={len(self.reqs)}, "
+            f"seq_lens.shape={self.seq_lens.shape}, "
+            f"self.extend_lens={'None' if self.extend_lens is None else f'{len(self.extend_lens)} elements'}, "
+            f"self.prefix_lens={'None' if self.prefix_lens is None else f'{len(self.prefix_lens)} elements'}, "
+            f"self.multimodal_inputs={'None' if self.multimodal_inputs is None else len(self.multimodal_inputs)}"
+        )
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            multimodal_inputs_copy = None
         else:
-            extend_seq_lens = self.extend_lens
-            extend_prefix_lens = self.prefix_lens
-            extend_logprob_start_lens = self.extend_logprob_start_lens
+            # 🔧 [CRITICAL FIX] Create COPIES of list fields to prevent sharing mutable objects
+            # across multiple ModelWorkerBatch instances. Without this, all ModelWorkerBatch
+            # instances created from the same ScheduleBatch will share the same list objects,
+            # and modifications to self.extend_lens (e.g., via merge_batch) will affect all
+            # previously created ModelWorkerBatch instances.
+            extend_seq_lens = list(self.extend_lens) if self.extend_lens else None
+            extend_prefix_lens = list(self.prefix_lens) if self.prefix_lens else None
+            extend_logprob_start_lens = list(self.extend_logprob_start_lens) if self.extend_logprob_start_lens else None
+            # 🔧 [CRITICAL FIX] Also create a copy of multimodal_inputs to prevent sharing
+            multimodal_inputs_copy = list(self.multimodal_inputs) if self.multimodal_inputs else None
+
+            # 🔧 [DEBUG] Log batch state before creating ModelWorkerBatch
+            logger.info(
+                f"[GET_MODEL_WORKER_BATCH_DEBUG] "
+                f"batch_size={len(self.reqs)}, "
+                f"seq_lens.shape={self.seq_lens.shape}, "
+                f"extend_lens={len(extend_seq_lens) if extend_seq_lens else 'None'}, "
+                f"multimodal_inputs={len(multimodal_inputs_copy) if multimodal_inputs_copy else 'None'}"
+            )
 
         # Create seq_lens_cpu when needed
         if (
@@ -1824,7 +1956,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            multimodal_inputs=self.multimodal_inputs,
+            multimodal_inputs=multimodal_inputs_copy if not self.forward_mode.is_decode_or_idle() else self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,

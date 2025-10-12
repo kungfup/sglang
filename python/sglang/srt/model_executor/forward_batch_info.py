@@ -275,6 +275,21 @@ class ForwardBatch:
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
+        # 🔧 [DEBUG] Log ForwardBatch creation details
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"[FORWARD_BATCH_INIT] Creating ForwardBatch: "
+            f"forward_mode={batch.forward_mode}, "
+            f"batch.seq_lens.shape={batch.seq_lens.shape}, "
+            f"batch.seq_lens={batch.seq_lens.tolist() if len(batch.seq_lens) <= 10 else f'[{len(batch.seq_lens)} elements]'}, "
+            f"batch_size_computed={len(batch.seq_lens)}, "
+            f"extend_seq_lens={batch.extend_seq_lens if batch.extend_seq_lens and len(batch.extend_seq_lens) <= 10 else f'[{len(batch.extend_seq_lens) if batch.extend_seq_lens else 0} elements]'}, "
+            f"extend_prefix_lens={batch.extend_prefix_lens if batch.extend_prefix_lens and len(batch.extend_prefix_lens) <= 10 else f'[{len(batch.extend_prefix_lens) if batch.extend_prefix_lens else 0} elements]'}, "
+            f"multimodal_inputs_len={len(batch.multimodal_inputs) if batch.multimodal_inputs else 0}, "
+            f"bid={batch.bid}"
+        )
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -306,6 +321,14 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
+
+        logger.info(
+            f"[FORWARD_BATCH_INIT] ForwardBatch created: "
+            f"ret.batch_size={ret.batch_size}, "
+            f"ret.seq_lens.shape={ret.seq_lens.shape}, "
+            f"ret.mm_inputs_len={len(ret.mm_inputs) if ret.mm_inputs else 0}"
+        )
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
@@ -460,6 +483,27 @@ class ForwardBatch:
     ):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens.shape[0]
+
+        # 🔧 [DEBUG] 添加调试信息
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"[MROPE_DEBUG] forward_mode={self.forward_mode}, "
+            f"batch_size={batch_size}, "
+            f"extend_seq_lens={batch.extend_seq_lens}, "
+            f"extend_prefix_lens={batch.extend_prefix_lens}, "
+            f"multimodal_inputs_len={len(batch.multimodal_inputs) if batch.multimodal_inputs else 0}"
+        )
+
+        # 🔧 [REMOVED] The "MROPE_CRITICAL_FIX" that truncated extend_seq_lens, extend_prefix_lens,
+        # and multimodal_inputs was incorrect. The real issue was that multimodal_inputs was not
+        # being copied in get_model_worker_batch(), causing all ModelWorkerBatch instances to share
+        # the same list. When merge_batch() extended the list, it affected all previously created
+        # batches. The fix is to create a copy of multimodal_inputs in get_model_worker_batch().
+        #
+        # If there's a genuine length mismatch here, it indicates a bug elsewhere that should be
+        # fixed at the source, not by silently truncating data.
+
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
@@ -481,14 +525,43 @@ class ForwardBatch:
                         )
                     ]
                 # 3 * N
-                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+                mrope_positions = torch.cat(next_input_positions, dim=1)
+                logger.info(
+                    f"[MROPE_DEBUG] batch_idx={batch_idx}, mode=DECODE, "
+                    f"mrope_positions.shape={mrope_positions.shape}"
+                )
+                mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
+                # 🔧 [FIX] 检查 extend_seq_lens 是否有效且长度匹配
+                if (
+                    batch.extend_seq_lens is None
+                    or batch.extend_prefix_lens is None
+                    or batch_idx >= len(batch.extend_seq_lens)
+                    or batch_idx >= len(batch.extend_prefix_lens)
+                ):
+                    # 如果 extend_seq_lens 不可用，使用默认值
+                    # 这种情况可能发生在 PP 模式或 MIXED 模式下
+                    logger.warning(
+                        f"[MROPE_FIX] batch_idx={batch_idx} out of range, "
+                        f"using default mrope positions (seq_len={int(self.seq_lens[batch_idx])})"
+                    )
+                    # 🔧 [FIX] 使用正确的维度：[3, seq_len]，与其他分支保持一致
+                    seq_len = int(self.seq_lens[batch_idx])
+                    mrope_positions = torch.tensor(
+                        [[pos for pos in range(seq_len)]] * 3
+                    )
+                    logger.info(
+                        f"[MROPE_DEBUG] batch_idx={batch_idx}, mode=EXTEND_FALLBACK, "
+                        f"mrope_positions.shape={mrope_positions.shape}"
+                    )
+                    mrope_positions_list[batch_idx] = mrope_positions
+                    continue
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
                 if mm_input is None:
-                    # text only
+                    # text only - 形状: [3, extend_seq_len]
                     mrope_positions = torch.tensor(
                         [
                             [
@@ -501,17 +574,35 @@ class ForwardBatch:
                         ]
                         * 3
                     )
+                    logger.info(
+                        f"[MROPE_DEBUG] batch_idx={batch_idx}, mode=EXTEND_TEXT, "
+                        f"mrope_positions.shape={mrope_positions.shape}"
+                    )
                 else:
+                    # multimodal - 形状: [3, extend_seq_len]
                     mrope_positions = mm_input.mrope_positions[
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+                    logger.info(
+                        f"[MROPE_DEBUG] batch_idx={batch_idx}, mode=EXTEND_MM, "
+                        f"mrope_positions.shape={mrope_positions.shape}"
+                    )
                 mrope_positions_list[batch_idx] = mrope_positions
+
+        # 🔧 [DEBUG] 在 cat 之前检查所有张量的形状
+        logger.info(
+            f"[MROPE_DEBUG] Before cat: shapes={[pos.shape for pos in mrope_positions_list]}"
+        )
 
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device)
+
+        logger.info(
+            f"[MROPE_DEBUG] Final mrope_positions.shape={self.mrope_positions.shape}"
+        )
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk

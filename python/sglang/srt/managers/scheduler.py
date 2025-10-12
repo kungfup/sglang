@@ -3019,22 +3019,9 @@ def run_scheduler_process(
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         logger.info(f"[SCHEDULER_PROC] 分离模式: {disaggregation_mode}")
 
-        # Semi-PD Pipeline Parallel: 优先使用Pipeline并行
-        if server_args.pp_size > 1:
-            if server_args.enable_semi_pd:
-                logger.info(f"[SCHEDULER_PROC] [{scheduler.instance_role.name}-PP{pp_rank}] 启动Semi-PD Pipeline Parallel模式")
-                scheduler.event_loop_pp()
-            else:
-                logger.info(f"[SCHEDULER_PROC] [PP{pp_rank}] 启动标准Pipeline Parallel模式")
-                scheduler.event_loop_pp()
-        elif disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_overlap:
-                logger.info(f"[SCHEDULER_PROC] 启动重叠调度模式")
-                scheduler.event_loop_overlap()
-            else:
-                logger.info(f"[SCHEDULER_PROC] 启动标准调度模式")
-                scheduler.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
+        # 🔧 [FIX] Semi-PD + PP: 优先检查 disaggregation_mode，然后再检查 pp_size
+        # 这样可以确保 DECODE 进程使用正确的事件循环
+        if disaggregation_mode == DisaggregationMode.PREFILL:
             if scheduler.enable_overlap:
                 logger.info(f"[SCHEDULER_PROC] 启动重叠调度分离预填充模式")
                 scheduler.event_loop_overlap_disagg_prefill()
@@ -3048,6 +3035,16 @@ def run_scheduler_process(
             else:
                 logger.info(f"[SCHEDULER_PROC] 启动标准调度分离解码模式")
                 scheduler.event_loop_normal_disagg_decode()
+        elif server_args.pp_size > 1:
+            # 只有在非 Semi-PD 模式下才使用 event_loop_pp
+            logger.info(f"[SCHEDULER_PROC] [PP{pp_rank}] 启动Pipeline Parallel模式")
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap:
+            logger.info(f"[SCHEDULER_PROC] 启动重叠调度模式")
+            scheduler.event_loop_overlap()
+        else:
+            logger.info(f"[SCHEDULER_PROC] 启动标准调度模式")
+            scheduler.event_loop_normal()
 
     except Exception:
         traceback = get_exception_traceback()

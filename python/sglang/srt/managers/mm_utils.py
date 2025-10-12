@@ -770,10 +770,14 @@ def general_mm_embed_routine(
     except Exception:
         pass
 
+    embed_tokens = language_model.get_input_embeddings()
+
     if skip_embedding:
-        inputs_embeds = None
+        # 🔧 [FIX] In DECODE mode or non-first PP rank, we still need to embed input_ids
+        # Don't set inputs_embeds to None, otherwise language_model will try to call
+        # embed_tokens(None) which causes RuntimeError
+        inputs_embeds = embed_tokens(input_ids)
     else:
-        embed_tokens = language_model.get_input_embeddings()
         if (
             not forward_batch.forward_mode.is_decode()
             and forward_batch.contains_mm_inputs()
@@ -807,6 +811,14 @@ def general_mm_embed_routine(
         else:
             inputs_embeds = embed_tokens(input_ids)
 
+    # 🔧 [DEBUG] Log inputs_embeds shape
+    if not forward_batch.forward_mode.is_decode():
+        logger.info(
+            f"[MM_EMBED_DEBUG] inputs_embeds.shape={inputs_embeds.shape}, "
+            f"batch_size={forward_batch.batch_size}, "
+            f"input_ids.shape={input_ids.shape if input_ids is not None else 'None'}"
+        )
+
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
@@ -814,6 +826,13 @@ def general_mm_embed_routine(
         pp_proxy_tensors=pp_proxy_tensors,
         **kwargs,
     )
+
+    # 🔧 [DEBUG] Log hidden_states shape
+    if not forward_batch.forward_mode.is_decode():
+        logger.info(
+            f"[MM_EMBED_DEBUG] hidden_states.shape={hidden_states.shape}"
+        )
+
     return hidden_states
 
 

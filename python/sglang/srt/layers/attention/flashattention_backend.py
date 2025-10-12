@@ -661,6 +661,16 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+
+                # 🔧 [DEBUG] Log cache_loc and k shape
+                if not forward_batch.forward_mode.is_decode():
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        f"[CACHE_LOC_DEBUG] cache_loc={'None' if cache_loc is None else cache_loc.shape}, "
+                        f"k.shape={k.shape}, batch_size={forward_batch.batch_size}"
+                    )
+
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale

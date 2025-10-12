@@ -657,6 +657,25 @@ def run_scheduler_process(
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: CPU亲和性设置完成")
 
     # Create a scheduler and run the event loop
+        # Ensure correct disaggregation mode is set before Scheduler init
+        # This is critical: it controls which queues/buffers are initialized inside Scheduler.__init__
+        try:
+            if instance_role == InstanceRole.DECODE:
+                # Decode engine: allocate only decode-side constructs; force chunk cache
+                server_args.disaggregation_mode = "decode"
+            elif instance_role == InstanceRole.PREFILL:
+                # Prefill engine: allocate prefill-side constructs
+                server_args.disaggregation_mode = "prefill"
+            else:
+                server_args.disaggregation_mode = "null"
+        except Exception:
+            # Be robust even if ServerArgs does not expose the attribute (older builds)
+            import traceback as _tb
+            logger.warning(f"[SEMI-PD] failed to set disaggregation_mode on server_args: {_tb.format_exc()}")
+        logger.info(
+            f"[SEMI-PD] Using disaggregation_mode={getattr(server_args,'disaggregation_mode',None)} for instance_role={instance_role.name}"
+        )
+
     try:
         if instance_role == InstanceRole.DECODE:
             from sglang.srt.managers.semi_pd_decode_scheduler import (
@@ -825,16 +844,27 @@ def run_scheduler_process(
         logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: Instance role: {instance_role}")
         logger.info(f"📊 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: PP_SIZE: {server_args.pp_size}")
 
-        # 🔧 CRITICAL FIX: Semi-PD在PP模式下必须使用event_loop_pp()
+        # Select the correct Semi-PD event loop
         if server_args.pp_size > 1:
-            logger.info(f"🚀 [SEMI_PD_PP] PP{pp_rank} TP{tp_rank}: 启动Semi-PD Pipeline Parallel事件循环")
+            logger.info(f"🚀 [SEMI_PD_PP] PP{pp_rank} TP{tp_rank}: 启动Semi-PD Pipeline Parallel事件循环 (event_loop_pp)")
             scheduler.event_loop_pp()
-        elif scheduler.enable_overlap and instance_role == InstanceRole.DECODE:
-            logger.debug("Scheduler running in overlap mode")
-            scheduler.event_loop_overlap()
         else:
-            logger.debug("Scheduler running in normal mode")
-            scheduler.event_loop_normal()
+            if instance_role == InstanceRole.DECODE:
+                if scheduler.enable_overlap:
+                    logger.info(f"🚀 [SEMI_PD_DECODE] PP{pp_rank} TP{tp_rank}: 启动分离解码事件循环 (overlap)")
+                    scheduler.event_loop_overlap_disagg_decode()
+                else:
+                    logger.info(f"🚀 [SEMI_PD_DECODE] PP{pp_rank} TP{tp_rank}: 启动分离解码事件循环 (normal)")
+                    scheduler.event_loop_normal_disagg_decode()
+            elif instance_role == InstanceRole.PREFILL:
+                if scheduler.enable_overlap:
+                    logger.info(f"🚀 [SEMI_PD_PREFILL] PP{pp_rank} TP{tp_rank}: 启动分离预填充事件循环 (overlap)")
+                    scheduler.event_loop_overlap_disagg_prefill()
+                else:
+                    logger.info(f"🚀 [SEMI_PD_PREFILL] PP{pp_rank} TP{tp_rank}: 启动分离预填充事件循环 (normal)")
+                    scheduler.event_loop_normal_disagg_prefill()
+            else:
+                raise ValueError(f"Invalid instance role for Semi-PD event loop: {instance_role}")
 
     except Exception:
         traceback = get_exception_traceback()

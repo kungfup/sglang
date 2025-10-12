@@ -805,64 +805,41 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ):
-        """Run forward pass for Qwen2_5-VL with PP-aware multimodal embedding.
-        首段：准备 input_embeds 并传入 self.model；后段：仅接收 hidden_states。
-        末段：计算 logits/pooling。
+        """Run forward pass for Qwen2_5-VL.
+
+        Args:
+            input_ids: Flattened (concatenated) input_ids corresponding to a
+                batch.
+            positions: Flattened (concatenated) position ids corresponding to a
+                batch.
+                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
+                opensource models), the shape will be `(3, seq_len)`,
+                otherwise it will be `(seq_len,).
+                (Use input_metadata.mrope_positions to replace it)
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        # 仅首段构建多模态嵌入，后段不再触发任何多模态嵌入逻辑
-        input_embeds = None
-        if self.pp_group.is_first_rank:
-            input_embeds = self._prepare_initial_embeddings(
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-            )
-
-        # 在首段，确保 RoPE positions 与输入长度一致，避免 view 形状不匹配
-        try:
-            if positions is not None:
-                # 目标 token 数：优先使用首段已构建的 input_embeds 长度，否则用 input_ids 长度
-                tgt_tokens = (
-                    int(input_embeds.shape[0]) if input_embeds is not None else int(input_ids.shape[0])
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
+        ):
+            if self.is_mrope_enabled:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}"
                 )
-                if positions.ndim == 2:
-                    cur = int(positions.shape[-1])
-                    if cur != tgt_tokens:
-                        if cur > tgt_tokens:
-                            # 过长：取末尾对齐（与多模态 tail-trim 策略一致）
-                            positions = positions[:, -tgt_tokens:]
-                        else:
-                            # 过短：重复最后一列以补齐，保证形状匹配（仅作防御；正常应不触发）
-                            pad = positions[:, -1:].expand(positions.shape[0], tgt_tokens - cur)
-                            positions = torch.cat([positions, pad], dim=1)
-                        logger.warning(
-                            "[POS_FIX] Adjusted MRoPE positions length from %d to %d", cur, tgt_tokens
-                        )
-                elif positions.ndim == 1:
-                    cur = int(positions.shape[0])
-                    if cur != tgt_tokens:
-                        if cur > tgt_tokens:
-                            positions = positions[-tgt_tokens:]
-                        else:
-                            pad = positions.new_full((tgt_tokens - cur,), int(positions[-1].item()))
-                            positions = torch.cat([positions, pad], dim=0)
-                        logger.warning(
-                            "[POS_FIX] Adjusted RoPE positions length from %d to %d", cur, tgt_tokens
-                        )
-        except Exception as e:
-            try:
-                logger.error(f"[POS_FIX] Failed to align positions: {e}")
-            except Exception:
-                pass
 
-        # 模型前向：传入 positions/forward_batch/input_embeds/pp_proxy_tensors
-        hidden_states = self.model(
+        # 🔧 [FIX] Use general_mm_embed_routine instead of _prepare_initial_embeddings
+        # to match the working semipd_nopp implementation. The _prepare_initial_embeddings
+        # method had a bug where it filtered extend_seq_lens based on mm_inputs presence,
+        # causing incorrect input_embeds size in batch mode.
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.model,
+            image_data_embedding_func=self.get_image_feature,
+            positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )
         try:
