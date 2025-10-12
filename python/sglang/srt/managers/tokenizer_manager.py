@@ -509,16 +509,25 @@ class TokenizerManager:
                 input_ids = encoded["input_ids"][0]
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
+        # 🔍 DEBUG: 检查多模态处理
+        logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} has_mm_processor={self.mm_processor is not None} contains_mm={obj.contains_mm_input()}")
+        if hasattr(obj, 'image_data'):
+            logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} image_data type={type(obj.image_data)} is_none={obj.image_data is None}")
+
         if self.mm_processor and obj.contains_mm_input():
+            logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} Processing multimodal data...")
             image_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
+            logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} image_inputs type={type(image_inputs)} is_none={image_inputs is None}")
             if image_inputs and "input_ids" in image_inputs:
                 input_ids = image_inputs["input_ids"]
+                logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} Updated input_ids length={len(input_ids)}")
         else:
+            logger.info(f"[MM_DEBUG_TOK] rid={obj.rid} No multimodal processing (mm_processor={self.mm_processor is not None}, contains_mm={obj.contains_mm_input()})")
             image_inputs: Optional[Dict] = None
 
         self._validate_token_len(obj, input_ids)

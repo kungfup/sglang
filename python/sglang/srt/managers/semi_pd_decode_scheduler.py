@@ -337,7 +337,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         重要：D-Scheduler拥有最终决策权
         """
-        logger.debug(f"[DECODE] D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler")
+        logger.info(f"[DECODE] 📥 D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler: {recv_req.rids}")
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)

@@ -20,7 +20,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, get_bool_env_var
+import logging
+
+logger = logging.getLogger(__name__)
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -96,6 +99,16 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Log before/after to detect accidental re-processing/transpose
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                logger.info(
+                    "[FP8_DEBUG][process W8A8 before] prefix=%s W.shape=%s dtype=%s dev=%s has_w_scale=%s",
+                    getattr(layer, "prefix", None), tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device), hasattr(layer, "weight_scale"),
+                )
+        except Exception:
+            pass
+
         weight = layer.weight
 
         if self.quantization_config.is_checkpoint_fp8_serialized:
@@ -126,6 +139,18 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
+
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                logger.info(
+                    "[FP8_DEBUG][process W8A8 after] prefix=%s W.shape=%s dtype=%s dev=%s W_scale.shape=%s numel=%s",
+                    getattr(layer, "prefix", None), tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device),
+                    tuple(getattr(layer, "weight_scale", torch.tensor([])).shape) if hasattr(layer, "weight_scale") else None,
+                    int(getattr(layer, "weight_scale", torch.tensor([])).numel()) if hasattr(layer, "weight_scale") else 0,
+                )
+                setattr(layer, "_fp8_weight_processed", True)
+        except Exception:
+            pass
 
     def create_weights(
         self,
@@ -174,6 +199,19 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
+        # Verbose FP8 layer-context diagnostics (opt-in, once per layer)
+        try:
+            if (get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG")) and not getattr(layer, "_fp8_debug_logged", False):
+                layer._fp8_debug_logged = True
+                logger.info(
+                    "[FP8_DEBUG][layer W8A8] prefix=%s tp_rank=%s cutlass=%s x.shape=%s x.dtype=%s W.shape=%s W.dtype=%s W.dev=%s W_scale.shape=%s numel=%s",
+                    getattr(layer, "prefix", None), getattr(layer, "tp_rank", None), self.cutlass_fp8_supported,
+                    tuple(x.shape), str(x.dtype), tuple(layer.weight.shape), str(layer.weight.dtype), str(layer.weight.device),
+                    tuple(getattr(layer, "weight_scale", torch.tensor([])).shape) if hasattr(layer, "weight_scale") else None,
+                    int(getattr(layer, "weight_scale", torch.tensor([])).numel()) if hasattr(layer, "weight_scale") else 0,
+                )
+        except Exception:
+            pass
         return apply_fp8_linear(
             x,
             layer.weight,

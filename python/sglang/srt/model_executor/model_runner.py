@@ -587,6 +587,7 @@ class ModelRunner:
                 param_tensor.shape,
                 param_tensor.dtype,
                 param_tensor.device,
+                tuple(param_tensor.stride()),
             )
 
         # Get Non-Parameter Buffers, eg. cos_sin_cache
@@ -622,6 +623,7 @@ class ModelRunner:
                 buffer_tensor.shape,
                 buffer_tensor.dtype,
                 buffer_tensor.device,
+                tuple(buffer_tensor.stride()),
             )
 
         # Get KV Cache Handles
@@ -668,6 +670,57 @@ class ModelRunner:
             "req_to_token_device": req_to_token_tensor.device,
         }
 
+        # Collect extra attribute tensors for FP8 metadata or workspaces that are not
+        # registered as parameters/buffers (e.g., workspace for marlin/MoE).
+        extra_attr_handles = {}
+        extra_attr_info = {}
+        try:
+            import torch
+            CANDIDATE_ATTRS = {
+                # Only the minimal FP8 metadata needed for standard Linear/Attention
+                "weight_scale",
+                "weight_scale_inv",
+                "input_scale",
+            }
+            # Build a quick set for fast skip of those already in params/buffers
+            known_param_names = set(weight_handles.keys())
+            known_buffer_names = set(register_buffer_handles.keys())
+
+            for mod_name, mod in self.model.named_modules():
+                # Only consider modules that likely need FP8 metadata
+                try:
+                    w = getattr(mod, "weight", None)
+                    w_dtype = str(getattr(w, "dtype", ""))
+                    likely_fp8 = (w is not None) and ("float8" in w_dtype)
+                except Exception:
+                    likely_fp8 = False
+                if not likely_fp8:
+                    # Also consider if module explicitly has any candidate attrs
+                    if not any(hasattr(mod, a) for a in CANDIDATE_ATTRS):
+                        continue
+                for attr in CANDIDATE_ATTRS:
+                    if not hasattr(mod, attr):
+                        continue
+                    t = getattr(mod, attr)
+                    if not isinstance(t, torch.Tensor):
+                        continue
+                    if t.numel() == 0:
+                        continue
+                    full_name = f"{mod_name}.{attr}" if mod_name else attr
+                    if (full_name in known_param_names) or (full_name in known_buffer_names):
+                        # already captured via named_parameters/buffers
+                        continue
+                    try:
+                        handle = get_ipc_handle(t)
+                        # Add to weight_handles so it's treated as a parameter
+                        weight_handles[full_name] = handle
+                        tensor_info[full_name] = (tuple(t.shape), t.dtype, t.device, tuple(t.stride()))
+                    except Exception:
+                        # Best-effort; skip non-shareable tensors
+                        continue
+        except Exception:
+            pass
+
         return IPCInfo(
             params_info=tensor_info,
             weight_handles=weight_handles,
@@ -682,6 +735,7 @@ class ModelRunner:
         # Reconstruct parameters from IPC handles
         logger.info("🔍 [ORIGINAL SEMI-PD] Starting parameter sharing from IPC...")
 
+        # 1) Map all parameters that exist locally
         for name, _ in self.model.named_parameters():
             # Get the path to the parameter
             path = name.split(".")
@@ -698,7 +752,12 @@ class ModelRunner:
             param_name = path[-1]
 
             share_param_handle = ipc_info.weight_handles.get(name, None)
-            shape, dtype, device = ipc_info.params_info[name]
+            info = ipc_info.params_info[name]
+            if len(info) == 4:
+                shape, dtype, device, stride = info
+            else:
+                shape, dtype, device = info
+                stride = None
             size = reduce(lambda x, y: x * y, shape)
 
             assert (
@@ -709,16 +768,68 @@ class ModelRunner:
                 if shape == torch.Size([0]):
                     share_param_tensor = torch.empty(0, dtype=dtype, device=device)
                 else:
-                    share_param_tensor = convert_ipc_handle_to_tensor(
+                    base_tensor = convert_ipc_handle_to_tensor(
                         share_param_handle, size, dtype, device
-                    ).view(shape)
-            except Exception as e:
-                raise NotImplementedError(f"Parameter {name, size, dtype, device} is not supported in Semi-PD")
+                    )
+                    share_param_tensor = (
+                        base_tensor.as_strided(size=shape, stride=stride)
+                        if stride is not None
+                        else base_tensor.view(shape)
+                    )
+            except Exception:
+                raise NotImplementedError(f"Parameter {(name, size, dtype, device)} is not supported in Semi-PD")
 
             new_param = nn.Parameter(share_param_tensor, requires_grad=False)
             setattr(module, param_name, new_param)
 
-        # Reconstruct registered buffers from IPC handles
+        # 2) Map extra parameters that exist in DECODE but not defined locally (e.g., FP8 weight_scale)
+        try:
+            local_param_names = set(n for n, _ in self.model.named_parameters())
+            extra_param_names = [n for n in ipc_info.weight_handles.keys() if n not in local_param_names]
+            if extra_param_names:
+                logger.info("[SEMI-PD][IPC] Adding %d extra params from DECODE (e.g., FP8 metadata)", len(extra_param_names))
+            for name in extra_param_names:
+                path = name.split(".")
+                module = self.model
+                for p in path[:-1]:
+                    module = module[int(p)] if p.isdigit() else getattr(module, p)
+                param_name = path[-1]
+
+                share_param_handle = ipc_info.weight_handles.get(name, None)
+                info = ipc_info.params_info[name]
+                if info is None:
+                    continue
+                if len(info) == 4:
+                    shape, dtype, device, stride = info
+                else:
+                    shape, dtype, device = info
+                    stride = None
+                if shape is None:
+                    # Should not happen for params, but guard anyway
+                    continue
+                size = reduce(lambda x, y: x * y, shape)
+                if shape == torch.Size([0]):
+                    share_param_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    base_tensor = convert_ipc_handle_to_tensor(
+                        share_param_handle, size, dtype, device
+                    )
+                    share_param_tensor = (
+                        base_tensor.as_strided(size=shape, stride=stride)
+                        if stride is not None
+                        else base_tensor.view(shape)
+                    )
+                new_param = nn.Parameter(share_param_tensor, requires_grad=False)
+                setattr(module, param_name, new_param)
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1","true"):
+                    try:
+                        logger.info("[SEMI-PD][IPC][EXTRA] param=%s shape=%s dtype=%s dev=%s", name, tuple(shape), str(dtype), str(device))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("[SEMI-PD][IPC] Failed to add extra params from DECODE")
+
+        # Reconstruct registered buffers from IPC handles (existing locally)
         for name, _ in self.model.named_buffers():
             # Get the path to the parameter
             path = name.split(".")
@@ -735,7 +846,12 @@ class ModelRunner:
             buffer_name = path[-1]
 
             share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
-            shape, dtype, device = ipc_info.params_info[name]
+            info = ipc_info.params_info[name]
+            if len(info) == 4:
+                shape, dtype, device, stride = info
+            else:
+                shape, dtype, device = info
+                stride = None
 
             if shape is None:
                 continue
@@ -747,11 +863,54 @@ class ModelRunner:
             if shape == torch.Size([0]):
                 share_buffer_tensor = torch.empty(0, dtype=dtype, device=device)
             else:
-                share_buffer_tensor = convert_ipc_handle_to_tensor(
+                base_tensor = convert_ipc_handle_to_tensor(
                     share_buffer_handle, size, dtype, device
-                ).view(shape)
+                )
+                share_buffer_tensor = (
+                    base_tensor.as_strided(size=shape, stride=stride)
+                    if stride is not None
+                    else base_tensor.view(shape)
+                )
 
             module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+
+        # 2b) Map extra buffers present only in DECODE (e.g., weight_scale_inv/workspace if registered as buffers)
+        try:
+            local_buffer_names = set(n for n, _ in self.model.named_buffers())
+            extra_buffer_names = [n for n in ipc_info.register_buffer_handles.keys() if n not in local_buffer_names]
+            for name in extra_buffer_names:
+                path = name.split(".")
+                module = self.model
+                for p in path[:-1]:
+                    module = module[int(p)] if p.isdigit() else getattr(module, p)
+                buffer_name = path[-1]
+
+                share_buffer_handle = ipc_info.register_buffer_handles.get(name, None)
+                info = ipc_info.params_info[name]
+                if info is None:
+                    continue
+                if len(info) == 4:
+                    shape, dtype, device, stride = info
+                else:
+                    shape, dtype, device = info
+                    stride = None
+                if shape is None:
+                    continue
+                size = reduce(lambda x, y: x * y, shape)
+                if shape == torch.Size([0]):
+                    share_buffer_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    base_tensor = convert_ipc_handle_to_tensor(
+                        share_buffer_handle, size, dtype, device
+                    )
+                    share_buffer_tensor = (
+                        base_tensor.as_strided(size=shape, stride=stride)
+                        if stride is not None
+                        else base_tensor.view(shape)
+                    )
+                module.register_buffer(buffer_name, share_buffer_tensor, persistent=False)
+        except Exception:
+            logger.exception("[SEMI-PD][IPC] Failed to add extra buffers from DECODE")
 
         # Reconstruct KV Cache from IPC handles
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool

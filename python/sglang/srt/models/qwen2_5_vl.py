@@ -299,8 +299,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w
             )
-            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            # ensure non-negative padding when dimensions are divisible
+            pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size) % vit_merger_window_size
+            pad_w = (vit_merger_window_size - llm_grid_w % vit_merger_window_size) % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
@@ -326,7 +327,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
             )
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
-        window_index = torch.cat(window_index, dim=0)
+        # downstream expects long indices
+        window_index = torch.cat(window_index, dim=0).to(torch.long)
         return window_index, cu_window_seqlens
 
     @property

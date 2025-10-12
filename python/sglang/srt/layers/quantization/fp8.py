@@ -318,6 +318,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                logger.info(
+                    "[FP8_DEBUG][process FP8 before] prefix=%s block_quant=%s W.shape=%s dtype=%s dev=%s has_w_scale=%s",
+                    getattr(layer, "prefix", None), self.block_quant, tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device), hasattr(layer, "weight_scale") or hasattr(layer, "weight_scale_inv"),
+                )
+        except Exception:
+            pass
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -336,6 +344,16 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv = torch.nn.Parameter(
                 weight_scale, requires_grad=False
             )
+            try:
+                if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                    logger.info(
+                        "[FP8_DEBUG][process FP8 after] prefix=%s block_quant=%s W.shape=%s dtype=%s dev=%s W_scale_inv.shape=%s numel=%s",
+                        getattr(layer, "prefix", None), self.block_quant, tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device),
+                        tuple(getattr(layer, "weight_scale_inv").shape), int(getattr(layer, "weight_scale_inv").numel()),
+                    )
+                    setattr(layer, "_fp8_weight_processed", True)
+            except Exception:
+                pass
             return
 
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
@@ -402,6 +420,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale.max(), requires_grad=False
                 )
 
+        try:
+            if get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG"):
+                ws = getattr(layer, "weight_scale", None)
+                ws_shape = tuple(ws.shape) if ws is not None else None
+                ws_numel = int(ws.numel()) if ws is not None else 0
+                logger.info(
+                    "[FP8_DEBUG][process FP8 after] prefix=%s block_quant=%s W.shape=%s dtype=%s dev=%s W_scale.shape=%s numel=%s has_input_scale=%s",
+                    getattr(layer, "prefix", None), self.block_quant, tuple(getattr(layer, "weight").shape), str(getattr(layer, "weight").dtype), str(getattr(layer, "weight").device), ws_shape, ws_numel,
+                    hasattr(layer, "input_scale") and (getattr(layer, "input_scale") is not None),
+                )
+                setattr(layer, "_fp8_weight_processed", True)
+        except Exception:
+            pass
+
         if self.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
             # Activations not quantized for marlin.
@@ -413,6 +445,23 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Verbose FP8 layer-context diagnostics (opt-in, once per layer)
+        try:
+            if (get_bool_env_var("SGLANG_FP8_DEBUG") or get_bool_env_var("SEMI_PD_FP8_DEBUG")) and not getattr(layer, "_fp8_debug_logged", False):
+                layer._fp8_debug_logged = True
+                logger.info(
+                    "[FP8_DEBUG][layer] prefix=%s tp_rank=%s block_quant=%s use_marlin=%s cutlass=%s "
+                    "x.shape=%s x.dtype=%s x.dev=%s W.shape=%s W.dtype=%s W.dev=%s "
+                    "W_scale.shape=%s W_scale.numel=%s has_input_scale=%s logical_widths=%s out_part=%s in_part=%s",
+                    getattr(layer, "prefix", None), getattr(layer, "tp_rank", None), self.block_quant, self.use_marlin, self.cutlass_fp8_supported,
+                    tuple(x.shape), str(x.dtype), str(x.device), tuple(layer.weight.shape), str(layer.weight.dtype), str(layer.weight.device),
+                    tuple(getattr(layer, "weight_scale", torch.tensor([])).shape) if hasattr(layer, "weight_scale") else None,
+                    int(getattr(layer, "weight_scale", torch.tensor([])).numel()) if hasattr(layer, "weight_scale") else 0,
+                    hasattr(layer, "input_scale") and (getattr(layer, "input_scale") is not None),
+                    getattr(layer, "logical_widths", None), getattr(layer, "output_size_per_partition", None), getattr(layer, "input_size_per_partition", None),
+                )
+        except Exception:
+            pass
 
         if self.use_marlin:
             return apply_fp8_marlin_linear(
@@ -439,7 +488,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
+            input_scale=getattr(layer, "input_scale", None),
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,

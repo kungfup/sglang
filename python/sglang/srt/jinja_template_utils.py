@@ -126,31 +126,52 @@ def process_content_for_template_format(
     Returns:
         Processed message dictionary
     """
+    # 🔍 DEBUG: Log function call
+    logger.info(f"[MM_DEBUG_TEMPLATE] process_content_for_template_format called, content_format={content_format}, content_type={type(msg_dict.get('content'))}")
+
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
+        logger.info(f"[MM_DEBUG_TEMPLATE] Content is not a list, returning as-is")
         return {k: v for k, v in msg_dict.items() if v is not None}
+
+    # 🔧 MULTIMODAL FIX: If content_format is None, auto-detect based on content structure
+    # This handles cases where template detection failed or template wasn't loaded
+    if content_format is None:
+        # If content is a list with dicts containing 'type' field, assume OpenAI format
+        if any(isinstance(item, dict) and 'type' in item for item in msg_dict.get("content", [])):
+            content_format = "openai"
+            logger.info(f"[MM_DEBUG_TEMPLATE] Auto-detected content_format=openai based on content structure")
+        else:
+            content_format = "string"
+            logger.info(f"[MM_DEBUG_TEMPLATE] Auto-detected content_format=string (fallback)")
 
     if content_format == "openai":
         # OpenAI format: preserve structured content list, normalize types
+        logger.info(f"[MM_DEBUG_TEMPLATE] Processing OpenAI format, num_chunks={len(msg_dict['content'])}")
         processed_content_parts = []
-        for chunk in msg_dict["content"]:
+        for i, chunk in enumerate(msg_dict["content"]):
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
+                logger.info(f"[MM_DEBUG_TEMPLATE] Chunk {i}: type={chunk_type}")
 
                 if chunk_type == "image_url":
-                    image_data.append(chunk["image_url"]["url"])
+                    image_url = chunk["image_url"]["url"]
+                    image_data.append(image_url)
+                    logger.info(f"[MM_DEBUG_TEMPLATE] Added image_url to image_data, url_prefix={image_url[:50]}...")
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
+                    logger.info(f"[MM_DEBUG_TEMPLATE] Added audio_url to audio_data")
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
                 else:
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)
 
+        logger.info(f"[MM_DEBUG_TEMPLATE] Finished processing, image_data_len={len(image_data)}, audio_data_len={len(audio_data)}")
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
         }

@@ -4,6 +4,7 @@ Multi-modality utils
 
 import dataclasses
 import logging
+import os
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
@@ -280,6 +281,7 @@ def _get_chunked_prefill_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    rid_list: Optional[List] = None,
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
@@ -292,14 +294,60 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
+        # 🔧 MULTIMODAL FIX: Check if embedding_cache is initialized before using it
+        embedding_per_req = embedding_cache.get(embedding_items_hash) if embedding_cache is not None else None
         if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
-                )
+            # Try to assemble from request-local per-item features first (no ViT recompute)
+            _per_item_feats = []
+            for it in embedding_items_per_req:
+                _feat = getattr(it, "precomputed_features", None)
+                if _feat is None:
+                    _feat = getattr(it, "_req_local_mm_feat", None)
+                _per_item_feats.append(_feat)
+            if all(f is not None for f in _per_item_feats) and len(_per_item_feats) > 0:
+                try:
+                    embedding_per_req = torch.concat(_per_item_feats, dim=0)
+                except Exception:
+                    embedding_per_req = None
+            if embedding_per_req is None:
+                try:
+                    _rid = None
+                    try:
+                        if rid_list is not None:
+                            _rid = rid_list[i] if i < len(rid_list) else None
+                    except Exception:
+                        _rid = None
+                    logger.info(
+                        "[MM_EMBED_CALL] rid=%s pid=%d req_idx=%d num_items=%d hash=%d prefix_len=%d extend_len=%d",
+                        str(_rid), os.getpid(), i, len(embedding_items_per_req), embedding_items_hash,
+                        int(prefix_length[i]) if isinstance(prefix_length[i], (int,)) else prefix_length[i],
+                        int(extend_length[i]) if isinstance(extend_length[i], (int,)) else extend_length[i],
+                    )
+                    try:
+                        _pre_n = sum(1 for _it in embedding_items_per_req if getattr(_it, "precomputed_features", None) is not None)
+                        logger.info("[MM_EMBED_DO_VIT] rid=%s precomputed_items=%d/%d", str(_rid), int(_pre_n), int(len(embedding_items_per_req)))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                embedding_per_req = data_embedding_func(embedding_items_per_req)
+                # Store request-local per-item features (flattened) for later chunks
+                try:
+                    _embed2d = embedding_per_req.reshape(-1, embedding_per_req.shape[-1])
+                    _item_lengths = [(oe - os + 1) for (os, oe) in items_offset]
+                    _pos = 0
+                    for _it, _L in zip(embedding_items_per_req, _item_lengths):
+                        _it.precomputed_features = _embed2d[_pos : _pos + _L]
+                        _pos += _L
+                except Exception:
+                    pass
+                # 🔧 MULTIMODAL FIX: Check if embedding_cache is initialized before using it
+                if embedding_cache is not None:
+                    if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+                        print_warning_once(
+                            "Multimodal embedding cache is full. Consider increasing the "
+                            "`SGLANG_VLM_CACHE_SIZE_MB` environment variable."
+                        )
 
         embedding_per_req_chunk, _, end_index = get_embedding_chunk(
             embedding=embedding_per_req,
@@ -314,7 +362,17 @@ def _get_chunked_prefill_embedding(
             else embedding_per_req.shape[0] * embedding_per_req.shape[1]
         )
         if end_index == embedding_per_req_length:
-            embedding_cache.free(embedding_items_hash)
+            # Free embedding from process-level cache
+            # 🔧 MULTIMODAL FIX: Check if embedding_cache is initialized before using it
+            if embedding_cache is not None:
+                embedding_cache.free(embedding_items_hash)
+            # Free per-request precomputed features once all mm tokens are consumed
+            try:
+                for _it in embedding_items_per_req:
+                    if hasattr(_it, "precomputed_features"):
+                        _it.precomputed_features = None
+            except Exception:
+                pass
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None

@@ -12,7 +12,8 @@ import setproctitle
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, MultimodalInputs
 
 # Compatibility layer for ImageInputs (v0.4.8 uses MultimodalInputs)
 try:
@@ -147,6 +148,12 @@ class SemiPDScheduler(Scheduler):
         """
         logger.info(f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}")
 
+        # 🔍 DEBUG: 检查多模态输入
+        if recv_req.mm_inputs is not None:
+            logger.info(f"[MM_DEBUG] Request {recv_req.rid} has mm_inputs: {type(recv_req.mm_inputs)}, keys: {recv_req.mm_inputs.keys() if isinstance(recv_req.mm_inputs, dict) else 'N/A'}")
+        else:
+            logger.info(f"[MM_DEBUG] Request {recv_req.rid} has NO mm_inputs (mm_inputs is None)")
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -211,15 +218,25 @@ class SemiPDScheduler(Scheduler):
         # Handle multimodal inputs
         # 🔧 v0.4.8 COMPATIBILITY: image_inputs -> mm_inputs
         if recv_req.mm_inputs is not None:
-            # 🔧 v0.4.8: For now, skip complex multimodal processing in Semi-PD
-            # This maintains compatibility while avoiding complex multimodal logic
-            logger.warning("Multimodal inputs detected but skipped in Semi-PD mode for v0.4.8 compatibility")
+            logger.info(f"[MM_DEBUG] Processing mm_inputs for request {recv_req.rid}")
+            logger.info(f"[MM_DEBUG] origin_input_ids length before padding: {len(req.origin_input_ids)}")
 
-            # Basic validation to prevent oversized inputs
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            logger.info(f"[MM_DEBUG] MultimodalInputs created: {type(image_inputs)}")
+
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings
+            req.origin_input_ids = self.pad_input_ids_func(
+                req.origin_input_ids, image_inputs
+            )
+            logger.info(f"[MM_DEBUG] origin_input_ids length after padding: {len(req.origin_input_ids)}")
+
+            req.extend_image_inputs(image_inputs)
+            logger.info(f"[MM_DEBUG] Image inputs extended to request")
+
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 error_msg = (
-                    "Multimodal prompt is too long. "
-                    f"Input length {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
@@ -523,6 +540,17 @@ def run_scheduler_process(
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:
             scheduler.init_cuda_graphs()
+
+        # 🔧 MULTIMODAL FIX: Initialize embedding cache for multimodal models
+        # This cache stores precomputed ViT embeddings to avoid recomputation in chunked prefill
+        if hasattr(scheduler, 'model_config') and scheduler.model_config.is_multimodal:
+            try:
+                # Get cache size from environment variable or use default (100 MB)
+                embedding_cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+                init_embedding_cache(embedding_cache_size_mb * 1024 * 1024)
+                logger.info(f"✅ Initialized embedding cache for multimodal model: {embedding_cache_size_mb} MB")
+            except Exception as e:
+                logger.warning(f"Failed to initialize embedding cache: {e}")
 
         pipe_writer.send(
             {

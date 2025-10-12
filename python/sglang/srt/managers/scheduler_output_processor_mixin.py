@@ -567,17 +567,35 @@ class SchedulerOutputProcessorMixin:
                 except Exception:
                     pass
 
-                # 恢复原逻辑：多模态发送完整，文本发送增量
-                if self.server_args.enable_semi_pd:
-                    # Semi-PD: always send full decode_ids to keep detokenizer offsets consistent
-                    decode_ids_list.append(decode_ids)
-                elif self.model_config.is_multimodal_gen:
-                    decode_ids_list.append(decode_ids)
+                # 🔧 MULTIMODAL FIX: Proper detokenizer protocol for multimodal requests
+                # Migrated from semipd_tp_pp to fix repeated output bug
+                # SGLANG_MM_DETOKENIZER_MODE: off(default)/incremental/full
+                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
+                if self.model_config.is_multimodal_gen:
+                    if mm_mode in ("off", "0", "false"):
+                        # Skip detokenizer for multimodal (original behavior)
+                        rids.pop(); finished_reasons.pop(); decoded_texts.pop()
+                        continue
+                    elif mm_mode == "full":
+                        # Full mode: send all tokens with absolute offset
+                        full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
+                        prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
+                        decode_ids_list.append(full_decode_ids)
+                        read_offset_to_send = prev_full_len
+                        req.last_full_decode_len = len(full_decode_ids)
+                    else:
+                        # Incremental mode (default): send only new tokens
+                        decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                        read_offset_to_send = read_offset
                 else:
+                    # Text-only: always use incremental protocol
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                    read_offset_to_send = read_offset
 
+                # Update baselines for next round
                 req.send_decode_id_offset = len(decode_ids)
-                read_offsets.append(read_offset)
+                req.last_full_decode_len = len(req.origin_input_ids_unpadded + req.output_ids)
+                read_offsets.append(read_offset_to_send)
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)

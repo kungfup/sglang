@@ -147,6 +147,8 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.debug("[PREFILL] No waiting requests, entering Idle mode")
             return None
 
+        logger.info(f"[PREFILL] 🚀 get_next_batch_to_run called, waiting_queue_size={len(self.waiting_queue)}, attn_tp_rank={self.attn_tp_rank}")
+
         resp = None
         if self.waiting_queue and self.attn_tp_rank == 0:
             # 🔧 MIGRATION: 原版Semi-PD的候选请求选择逻辑
@@ -159,10 +161,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 candidates.append(r.rid)
 
             req = GetNextPrefillBatchInput(rids=candidates)
-            logger.debug(f"Send request to D worker: {req}")
+            logger.info(f"[PREFILL] 📤 Send request to D worker: {req}")
             self.send_to_d_instance.send_pyobj(req)
+            logger.info(f"[PREFILL] ⏳ Waiting for response from D worker...")
             resp = self.bridge_socket.recv_pyobj()
-            logger.debug(f"Recv response from D worker: {resp}")
+            logger.info(f"[PREFILL] ✅ Recv response from D worker: {resp}")
             assert isinstance(
                 resp, GetNextPrefillBatchOutput
             ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
