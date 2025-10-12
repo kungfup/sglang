@@ -52,6 +52,8 @@ class VITResponse:
         image_hash: 图片的 hash 值（用于 cache 管理）
         compute_time: 计算耗时（秒）
         from_cache: 是否从 cache 中获取
+        vit_compute_start_time: VIT 计算开始时间（用于并行性分析）
+        vit_compute_end_time: VIT 计算结束时间（用于并行性分析）
     """
     request_id: str
     # 🔧 CUDA IPC: 使用 IPC handle 代替 CPU 共享内存
@@ -63,6 +65,9 @@ class VITResponse:
     # 保留原有字段
     compute_time: float
     from_cache: bool
+    # 🔧 新增: 时间戳（用于并行性分析和缓存生命周期跟踪）
+    vit_compute_start_time: float = 0.0
+    vit_compute_end_time: float = 0.0
 
 
 @dataclass
@@ -166,9 +171,11 @@ class VITSchedulerClient:
         self.completed_count = 0
         self.timeout_count = 0
 
-        # 发送/超时 watchdog 配置
+        # ✅✅✅ 核心修复: 增加超时时间（从 10 秒增加到 30 秒）
+        # 根据日志分析，处理 8 个请求需要 11.6 秒，10 秒超时太短
+        # 增加到 30 秒留有余量
         self._send_timeout_s = 1.0   # 未成功发出后重发阈值
-        self._drop_timeout_s = 10.0  # 连续未发出/未应答的丢弃阈值
+        self._drop_timeout_s = 30.0  # 连续未发出/未应答的丢弃阈值（从 10.0 增加到 30.0）
         self._max_retries = 5        # 最多重发次数
         self._last_free_ts: Dict[int, float] = {}  # free 信号去重节流
 
@@ -454,7 +461,8 @@ class VITSchedulerClient:
 
                 # 情况 2：已发送但长期无响应（sent=True but no response）
                 # 这种情况可能是消息在 ZMQ 缓冲区中丢失，或 VIT Scheduler 未收到
-                if sent and (now - submit_time) > self._send_timeout_s * 3:
+                # ✅ 优化: 从 3秒 增加到 15秒，避免在 VIT 计算过程中重试（VIT 计算约 9.4秒）
+                if sent and (now - submit_time) > self._send_timeout_s * 15:  # 从 * 3 改为 * 15
                     payload = info.get('payload')
                     if payload is not None:
                         with self._tx_queue_lock:

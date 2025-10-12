@@ -96,13 +96,30 @@ DTYPE_TO_ATEN = {
 
 def get_ipc_handle(tensor: torch.Tensor):
     # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
+
+    # ✅ 修复: 确保 tensor 是连续的，不是 view
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+
+    # ✅ 修复: 检查 tensor 是否为空
+    if tensor.numel() == 0:
+        raise ValueError(f"Cannot create IPC handle for empty tensor: shape={tensor.shape}")
+
     (
         device,
         handle,
         storage_size_bytes,  # size(in bytes) of the storage
         storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
     ) = tensor.untyped_storage()._share_cuda_()[:4]
-    assert storage_size_bytes == tensor.numel() * tensor.element_size()
+
+    # ✅ 修复: 对于 view，storage_size_bytes 可能大于 tensor 的实际大小
+    # 只要 storage 足够大即可
+    expected_size = tensor.numel() * tensor.element_size()
+    if storage_size_bytes < expected_size:
+        raise ValueError(
+            f"Storage size ({storage_size_bytes}) is smaller than tensor size ({expected_size}). "
+            f"tensor.shape={tensor.shape}, tensor.dtype={tensor.dtype}"
+        )
 
     return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes
 

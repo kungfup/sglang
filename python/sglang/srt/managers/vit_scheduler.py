@@ -54,6 +54,8 @@ class VITResponse:
         image_hash: 图片的 hash 值（用于 cache 管理）
         compute_time: 计算耗时（秒）
         from_cache: 是否从 cache 中获取
+        vit_compute_start_time: VIT 计算开始时间（用于并行性分析）
+        vit_compute_end_time: VIT 计算结束时间（用于并行性分析）
     """
     request_id: str
     # 🔧 CUDA IPC: 使用 IPC handle 代替 CPU 共享内存
@@ -65,6 +67,9 @@ class VITResponse:
     # 保留原有字段
     compute_time: float
     from_cache: bool
+    # 🔧 新增: 时间戳（用于并行性分析和缓存生命周期跟踪）
+    vit_compute_start_time: float = 0.0
+    vit_compute_end_time: float = 0.0
 
 
 class VITModelRunner:
@@ -373,6 +378,136 @@ class VITModelRunner:
             raise
 
 
+class EmbeddingPagePool:
+    """VIT Embedding 页面池 - 参考 SGLang 的 TokenToKVPoolAllocator 设计
+
+    核心功能:
+    1. 管理 embedding 显存页面的分配和释放
+    2. 支持成组释放（free_group_begin/end）避免频繁操作
+    3. 提供可用页面查询接口
+    4. 在初始化时预分配固定大小的显存池
+
+    设计参考:
+    - sglang/python/sglang/srt/mem_cache/memory_pool.py::TokenToKVPoolAllocator
+    - sglang/docs/vit_scheduler_decoupling_plan.md 第 6.2 节
+    """
+
+    def __init__(self, pool_size_gb: float, page_size_mb: float, device: str):
+        """初始化 embedding 页面池
+
+        Args:
+            pool_size_gb: 显存池总大小（GB）
+            page_size_mb: 每个页面大小（MB），通常为单张图片 embedding 的大小
+            device: CUDA 设备
+        """
+        self.pool_size_bytes = int(pool_size_gb * 1024**3)
+        self.page_size_bytes = int(page_size_mb * 1024**2)
+        self.device = device
+
+        # 计算总页面数
+        self.total_pages = self.pool_size_bytes // self.page_size_bytes
+
+        # 维护空闲页面列表（参考 TokenToKVPoolAllocator）
+        self.free_pages = list(range(self.total_pages))
+
+        # 成组释放支持（参考 TokenToKVPoolAllocator.free_group_begin/end）
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+        # ✅ 核心: 预分配显存池（使用 torch.empty 占用显存）
+        logger.info(f"[Embedding Page Pool] 🔧 Pre-allocating {pool_size_gb:.2f} GB memory pool on {device}...")
+        logger.info(f"[Embedding Page Pool]   - Page size: {page_size_mb:.2f} MB")
+        logger.info(f"[Embedding Page Pool]   - Total pages: {self.total_pages}")
+        try:
+            # 使用 float32 预分配显存（4 bytes per element）
+            num_elements = self.pool_size_bytes // 4
+            self._pool_tensor = torch.empty(
+                num_elements, dtype=torch.float32, device=device
+            )
+            logger.info(f"[Embedding Page Pool] ✅ Memory pool pre-allocated: {pool_size_gb:.2f} GB")
+
+            # 验证显存确实被占用
+            allocated_gb = torch.cuda.memory_allocated(device) / 1024**3
+            reserved_gb = torch.cuda.memory_reserved(device) / 1024**3
+            logger.info(f"[Embedding Page Pool] 📊 GPU memory status:")
+            logger.info(f"[Embedding Page Pool]   - Allocated: {allocated_gb:.2f} GB")
+            logger.info(f"[Embedding Page Pool]   - Reserved: {reserved_gb:.2f} GB")
+            logger.info(f"[Embedding Page Pool]   - Pool size: {pool_size_gb:.2f} GB")
+        except Exception as e:
+            logger.error(f"[Embedding Page Pool] ❌ Failed to pre-allocate memory pool: {e}")
+            raise
+
+    def available_size(self) -> int:
+        """返回可用页面数（参考 TokenToKVPoolAllocator.available_size）"""
+        return len(self.free_pages)
+
+    def available_bytes(self) -> int:
+        """返回可用显存大小（bytes）"""
+        return len(self.free_pages) * self.page_size_bytes
+
+    def alloc(self, need_pages: int) -> Optional[List[int]]:
+        """分配页面（参考 TokenToKVPoolAllocator.alloc）
+
+        Args:
+            need_pages: 需要分配的页面数
+
+        Returns:
+            分配的页面索引列表，失败返回 None
+        """
+        if need_pages > len(self.free_pages):
+            return None
+
+        # 从空闲列表中取出前 need_pages 个
+        select_pages = self.free_pages[:need_pages]
+        self.free_pages = self.free_pages[need_pages:]
+
+        return select_pages
+
+    def free(self, page_indices: List[int]):
+        """释放页面（参考 TokenToKVPoolAllocator.free）
+
+        Args:
+            page_indices: 要释放的页面索引列表
+        """
+        if self.is_not_in_free_group:
+            # 直接释放
+            self.free_pages.extend(page_indices)
+        else:
+            # 成组释放：先收集，等待 free_group_end
+            self.free_group.extend(page_indices)
+
+    def free_group_begin(self):
+        """开始成组释放（参考 TokenToKVPoolAllocator.free_group_begin）"""
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        """结束成组释放（参考 TokenToKVPoolAllocator.free_group_end）"""
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free_pages.extend(self.free_group)
+            self.free_group = []
+
+    def usage_ratio(self) -> float:
+        """返回显存使用率（0.0 - 1.0）"""
+        used_pages = self.total_pages - len(self.free_pages)
+        return used_pages / self.total_pages if self.total_pages > 0 else 0.0
+
+    def get_stats(self) -> dict:
+        """返回显存池统计信息"""
+        used_pages = self.total_pages - len(self.free_pages)
+        return {
+            "pool_size_gb": self.pool_size_bytes / 1024**3,
+            "page_size_mb": self.page_size_bytes / 1024**2,
+            "total_pages": self.total_pages,
+            "used_pages": used_pages,
+            "free_pages": len(self.free_pages),
+            "used_gb": (used_pages * self.page_size_bytes) / 1024**3,
+            "available_gb": self.available_bytes() / 1024**3,
+            "usage_ratio": self.usage_ratio(),
+        }
+
+
 class VITScheduler:
     """
     VIT Scheduler - 独立的 ViT 计算调度器
@@ -406,6 +541,7 @@ class VITScheduler:
         self.model_config = model_config
 
         # 🔧 VIT TP: 初始化 TP group
+        import os
         self.tp_rank = int(os.environ.get("SGLANG_VIT_TP_RANK", "0"))
         self.tp_size = int(os.environ.get("SGLANG_VIT_TP_SIZE", "1"))
         self.vit_tp_port = int(os.environ.get("SGLANG_VIT_TP_PORT", "29500"))
@@ -548,17 +684,42 @@ class VITScheduler:
         self._last_gpu_memory_check = time.time()
         self._gpu_memory_check_interval = 1.0  # GPU 显存检查间隔（秒）
 
-        # 🔧 显存预算管理 (参考 SGLang 的设计)
-        # 不使用 GPU 显存使用率，而是使用预算制
-        self._max_batch_memory_gb = 10.0  # VIT 批量计算的显存预算 (10 GB)
-        self._current_batch_memory_bytes = 0  # 当前批量计算占用的显存 (bytes)
-        self._per_request_memory_bytes = 8.0 * 1024**3  # 每个请求的显存需求 (8 GB)
+        # ✅✅✅ 核心重新设计: 使用 EmbeddingPagePool（参考 SGLang 的 TokenToKVPoolAllocator）
+        # 参考文档: sglang/docs/vit_scheduler_decoupling_plan.md 第 6.2 节
+
+        # 从环境变量读取显存池大小，默认 10.0 GB
+        vit_memory_pool_gb = float(os.environ.get("SGLANG_VIT_MEMORY_POOL_GB", "10.0"))
+
+        # 从环境变量读取页面大小，默认 100 MB（约为单张图片 embedding 的大小）
+        # 页面大小 = seq_len * hidden_dim * dtype_size
+        # 例如: Qwen2.5-VL 的 embedding 约为 (25920, 3584) * 2 bytes ≈ 186 MB
+        # 保守估计使用 100 MB
+        vit_page_size_mb = float(os.environ.get("SGLANG_VIT_PAGE_SIZE_MB", "100.0"))
+
+        logger.info(f"[VIT Scheduler] 🔧 Initializing Embedding Page Pool:")
+        logger.info(f"[VIT Scheduler]   - Pool size: {vit_memory_pool_gb:.2f} GB")
+        logger.info(f"[VIT Scheduler]   - Page size: {vit_page_size_mb:.2f} MB")
+
+        self.embedding_page_pool = EmbeddingPagePool(
+            pool_size_gb=vit_memory_pool_gb,
+            page_size_mb=vit_page_size_mb,
+            device=self.device
+        )
+
+        # ✅✅✅ 核心重新设计: 每个请求需要的页面数（参考 PrefillAdder 的 token 预算）
+        # 从环境变量读取，默认 2 页/请求（2 * 100 MB = 200 MB）
+        self._pages_per_request = int(os.environ.get("SGLANG_VIT_PAGES_PER_REQUEST", "2"))
+        logger.info(f"[VIT Scheduler] 🔧 Pages per request: {self._pages_per_request}")
+
+        # 🔧 OOM 统计与回退策略（参考 vit_scheduler_decoupling_plan.md 第 6.3 节）
         self._oom_count = 0  # OOM 次数统计
         self._last_oom_time = 0.0  # 上次 OOM 时间
         self._oom_cooldown_seconds = 5.0  # OOM 冷却时间（秒）
+        self._consecutive_oom_count = 0  # 连续 OOM 次数
+        self._max_consecutive_oom = 3  # 最大连续 OOM 次数，超过则降级到单请求模式
 
-        # 初始化显存信息
-        self._init_gpu_memory_info()
+        # ✅ 初始化显存预算（不查询 GPU 显存）
+        self._init_memory_budget()
 
         # 🔧 新增: 正在处理的请求集合（防止重复处理）
         self._processing_requests: Set[str] = set()  # 正在处理的 request_id
@@ -568,46 +729,53 @@ class VITScheduler:
         logger.info(f"[VIT Scheduler] 🔧 Dynamic batch size enabled: min={self._min_batch_size}, max={self._max_batch_size}, initial={self._dynamic_batch_size}")
 
     def _init_memory_budget(self):
-        """初始化显存预算 (参考 SGLang 的设计)"""
-        logger.info(f"[VIT Scheduler] 💾 Memory Budget Info:")
-        logger.info(f"[VIT Scheduler]   Max batch memory: {self._max_batch_memory_gb:.2f} GB")
-        logger.info(f"[VIT Scheduler]   Per request memory: {self._per_request_memory_bytes / (1024**3):.2f} GB")
-        logger.info(f"[VIT Scheduler]   Max cache size: {self.max_cache_size_bytes / (1024**2):.2f} MB")
+        """初始化显存预算（不查询 GPU 显存）
 
-    def _get_available_batch_memory_bytes(self) -> int:
-        """获取可用的批量计算显存 (bytes)"""
-        max_batch_memory_bytes = int(self._max_batch_memory_gb * 1024**3)
-        return max_batch_memory_bytes - self._current_batch_memory_bytes
+        ✅✅✅ 核心重新设计: 基于 EmbeddingPagePool 的预算管理
+        参考: sglang/docs/batch_scheduler_memory.md 第 3 节
+        """
+        # 使用 embedding 页面池统计信息
+        pool_stats = self.embedding_page_pool.get_stats()
+        logger.info(f"[VIT Scheduler] 📊 Embedding Page Pool 初始化完成:")
+        logger.info(f"[VIT Scheduler]   - 池大小: {pool_stats['pool_size_gb']:.2f} GB")
+        logger.info(f"[VIT Scheduler]   - 页面大小: {pool_stats['page_size_mb']:.2f} MB")
+        logger.info(f"[VIT Scheduler]   - 总页面数: {pool_stats['total_pages']}")
+        logger.info(f"[VIT Scheduler]   - 可用页面数: {pool_stats['free_pages']}")
+        logger.info(f"[VIT Scheduler]   - 每请求页面数: {self._pages_per_request}")
+        logger.info(f"[VIT Scheduler]   - 最大缓存大小: {self.max_cache_size_bytes / (1024**2):.2f} MB")
 
-    def _get_available_cache_memory_bytes(self) -> int:
-        """获取可用的缓存显存 (bytes)"""
-        return self.max_cache_size_bytes - self.cache_size_bytes
+        # 估算最大 batch size（参考 PrefillAdder 的 token 预算）
+        max_batch_size = pool_stats['free_pages'] // self._pages_per_request
+        logger.info(f"[VIT Scheduler]   - 估算最大 batch size: {max_batch_size}")
 
-    def _estimate_batch_memory_gb(self, batch_size: int) -> float:
-        """估算批量计算需要的显存 (GB)
+    def _estimate_batch_pages(self, batch_size: int) -> int:
+        """估算批量计算需要的页面数
+
+        ✅✅✅ 核心重新设计: 基于 EmbeddingPagePool 的页面估算
+        参考: sglang/docs/batch_scheduler_memory.md 第 3 节 (PrefillAdder 的 token 预算)
 
         Args:
             batch_size: 批量大小
 
         Returns:
-            估算的显存需求 (GB)
+            估算的页面数
         """
-        # 🔧 更新估算值: 基于实际 OOM 日志和可用显存
-        # 22.53 GiB / 3 requests ≈ 7.51 GB per request
-        # 使用 8.0 GB 作为估算 (7.51 * 1.065 安全系数)
-        # 可用显存通常为 8.60 GB，8.0 GB 可以通过检查
-        per_request_memory_gb = 8.0
-        estimated_memory = batch_size * per_request_memory_gb
+        # ✅ 核心重新设计: 使用页面数估算（每个请求需要 _pages_per_request 页）
+        estimated_pages = batch_size * self._pages_per_request
 
         logger.debug(
-            f"[VIT Scheduler] 📊 Memory estimation: batch_size={batch_size}, "
-            f"estimated={estimated_memory:.2f} GB ({per_request_memory_gb:.1f} GB/request)"
+            f"[VIT Scheduler] 📊 页面估算: batch_size={batch_size}, "
+            f"estimated_pages={estimated_pages} "
+            f"({self._pages_per_request} pages/request)"
         )
 
-        return estimated_memory
+        return estimated_pages
 
     def _can_process_batch(self, batch_size: int) -> tuple[bool, str]:
         """检查是否可以处理指定大小的 batch
+
+        ✅✅✅ 核心重新设计: 使用 EmbeddingPagePool 检查，不再查询 GPU 显存
+        参考: sglang/docs/batch_scheduler_memory.md 第 3 节 (PrefillAdder.budget_state)
 
         Args:
             batch_size: 批量大小
@@ -615,70 +783,78 @@ class VITScheduler:
         Returns:
             (can_process, reason): 是否可以处理, 原因
         """
-        logger.info(f"[VIT Scheduler] 🔍 Checking if can process batch_size={batch_size}")
+        logger.info(f"[VIT Scheduler] 🔍 检查是否可以处理 batch_size={batch_size}")
 
-        # 1. 检查缓存占用
-        cache_usage_ratio = self.cache_size_bytes / self.max_cache_size_bytes if self.max_cache_size_bytes > 0 else 0.0
-        logger.info(f"[VIT Scheduler]   Cache usage: {cache_usage_ratio*100:.1f}%")
-        if cache_usage_ratio > 0.9:  # 缓存占用超过 90%
-            reason = f"Cache usage too high: {cache_usage_ratio*100:.1f}%"
-            logger.warning(f"[VIT Scheduler] ❌ {reason}")
-            return False, reason
+        # 1. 估算批量计算需要的页面数
+        estimated_pages = self._estimate_batch_pages(batch_size)
 
-        # 2. 检查 GPU 显存使用率
-        memory_usage_ratio = self._get_gpu_memory_usage_ratio()
-        logger.info(f"[VIT Scheduler]   GPU memory usage: {memory_usage_ratio*100:.1f}%")
+        # 2. ✅✅✅ 核心重新设计: 检查 embedding 页面池是否有足够页面
+        pool_stats = self.embedding_page_pool.get_stats()
+        available_pages = self.embedding_page_pool.available_size()
 
-        # 3. 估算批量计算需要的显存
-        estimated_memory_gb = self._estimate_batch_memory_gb(batch_size)
-        available_memory_gb = self._get_available_gpu_memory_gb()
         logger.info(
-            f"[VIT Scheduler]   Memory: estimated={estimated_memory_gb:.2f} GB, "
-            f"available={available_memory_gb:.2f} GB"
+            f"[VIT Scheduler]   Embedding Page Pool 状态: "
+            f"需求={estimated_pages} pages, "
+            f"可用={available_pages} pages, "
+            f"已用={pool_stats['used_pages']} pages, "
+            f"总计={pool_stats['total_pages']} pages, "
+            f"使用率={pool_stats['usage_ratio']*100:.1f}%"
         )
 
-        # 🔧 改进: 如果显存使用率略高，但估算的显存需求 < 可用显存，仍然允许处理
-        if memory_usage_ratio > self._gpu_memory_threshold:
-            # 检查估算的显存需求是否小于可用显存
-            if estimated_memory_gb < available_memory_gb:
-                logger.warning(
-                    f"[VIT Scheduler] ⚠️ GPU memory usage ({memory_usage_ratio*100:.1f}%) > threshold ({self._gpu_memory_threshold*100:.1f}%), "
-                    f"but estimated memory ({estimated_memory_gb:.2f} GB) < available ({available_memory_gb:.2f} GB). "
-                    f"Will try anyway."
-                )
-                # 继续检查其他条件
-            else:
-                reason = f"GPU memory usage too high: {memory_usage_ratio*100:.1f}%"
-                logger.warning(f"[VIT Scheduler] ❌ {reason}")
-                return False, reason
-
-        # 4. 检查估算的显存需求是否超过可用显存
-        if estimated_memory_gb > available_memory_gb:
-            gap_gb = estimated_memory_gb - available_memory_gb
-
-            # 🔧 如果差距小于 2 GB，允许尝试
-            # PyTorch 可能不会分配那么多显存，实际需求可能更小
-            if gap_gb < 2.0:
-                logger.warning(
-                    f"[VIT Scheduler] ⚠️ Memory slightly insufficient: "
-                    f"need {estimated_memory_gb:.2f} GB, available {available_memory_gb:.2f} GB, "
-                    f"gap={gap_gb:.2f} GB. Will try anyway (PyTorch may allocate less)."
-                )
-                return True, "Try anyway (small gap)"
-
-            reason = f"Insufficient memory: need {estimated_memory_gb:.2f} GB, available {available_memory_gb:.2f} GB, gap={gap_gb:.2f} GB"
+        # 3. 检查页面池是否有足够页面（参考 PrefillAdder.budget_state）
+        if estimated_pages > available_pages:
+            reason = (
+                f"Embedding 页面池空间不足: "
+                f"需求 {estimated_pages} pages, "
+                f"可用 {available_pages} pages"
+            )
             logger.warning(f"[VIT Scheduler] ❌ {reason}")
             return False, reason
 
+        # 4. 检查缓存占用（如果缓存太满，可能需要驱逐）
+        cache_usage_ratio = self.cache_size_bytes / self.max_cache_size_bytes if self.max_cache_size_bytes > 0 else 0.0
+        logger.info(
+            f"[VIT Scheduler]   缓存占用: {cache_usage_ratio*100:.1f}% "
+            f"({self.cache_size_bytes / (1024**2):.1f} MB / {self.max_cache_size_bytes / (1024**2):.1f} MB)"
+        )
+
+        # 注意: 不阻止处理，只是警告
+        # 如果缓存满了，会在添加新缓存时自动驱逐
+        if cache_usage_ratio > 0.9:
+            logger.warning(
+                f"[VIT Scheduler] ⚠️ 缓存占用较高: {cache_usage_ratio*100:.1f}%, "
+                f"可能会触发 LRU 驱逐"
+            )
+
         # 4. 检查 OOM 冷却时间
+        # ✅ 修复: 在显存充足时（可用显存 > 10 GiB）跳过 OOM 冷却检查
         if self._oom_count > 0:
             time_since_oom = time.time() - self._last_oom_time
             if time_since_oom < self._oom_cooldown_seconds:
-                reason = f"OOM cooldown: {self._oom_cooldown_seconds - time_since_oom:.1f}s remaining"
-                logger.warning(f"[VIT Scheduler] ❌ {reason}")
-                return False, reason
+                # 检查实际可用显存，如果充足则跳过冷却
+                try:
+                    free_memory, _ = torch.cuda.mem_get_info(self.device)
+                    free_memory_gb = free_memory / (1024**3)
 
-        logger.info(f"[VIT Scheduler] ✅ Can process batch_size={batch_size}")
+                    if free_memory_gb > 10.0:
+                        # 显存充足，跳过 OOM 冷却
+                        logger.info(
+                            f"[VIT Scheduler] ✅ 显存充足 ({free_memory_gb:.2f} GiB > 10 GiB), "
+                            f"跳过 OOM 冷却检查 (剩余 {self._oom_cooldown_seconds - time_since_oom:.1f}s)"
+                        )
+                    else:
+                        # 显存不足，继续冷却
+                        reason = f"OOM 冷却中: 剩余 {self._oom_cooldown_seconds - time_since_oom:.1f}s, 可用显存 {free_memory_gb:.2f} GiB"
+                        logger.warning(f"[VIT Scheduler] ❌ {reason}")
+                        return False, reason
+                except Exception as e:
+                    logger.warning(f"[VIT Scheduler] ⚠️ 无法获取 GPU 显存信息: {e}")
+                    # 无法获取显存信息，继续冷却
+                    reason = f"OOM 冷却中: 剩余 {self._oom_cooldown_seconds - time_since_oom:.1f}s"
+                    logger.warning(f"[VIT Scheduler] ❌ {reason}")
+                    return False, reason
+
+        logger.info(f"[VIT Scheduler] ✅ 可以处理 batch_size={batch_size}")
         return True, "OK"
 
     def _adjust_batch_size_for_memory(self, requested_batch_size: int) -> int:
@@ -714,7 +890,10 @@ class VITScheduler:
         return 0
 
     def _update_dynamic_batch_size(self):
-        """更新动态批量大小"""
+        """更新动态批量大小
+
+        ✅ 参考 SGLang 设计: 基于预算和 OOM 历史，不查询 GPU 显存
+        """
         # 检查是否需要更新
         now = time.time()
         if now - self._last_gpu_memory_check < self._gpu_memory_check_interval:
@@ -722,26 +901,27 @@ class VITScheduler:
 
         self._last_gpu_memory_check = now
 
-        # 获取 GPU 显存使用率
-        memory_usage_ratio = self._get_gpu_memory_usage_ratio()
+        # ✅ 基于预算使用率调整批量大小
+        max_batch_memory_bytes = int(self._max_batch_memory_gb * 1024**3)
+        memory_usage_ratio = self._current_batch_memory_bytes / max_batch_memory_bytes if max_batch_memory_bytes > 0 else 0.0
 
-        # 根据显存使用率调整批量大小
-        if memory_usage_ratio > 0.9:  # 显存使用率 > 90%
+        # 根据预算使用率调整批量大小
+        if memory_usage_ratio > 0.9:  # 预算使用率 > 90%
             # 减小批量大小
             new_batch_size = max(self._min_batch_size, self._dynamic_batch_size - 1)
             if new_batch_size != self._dynamic_batch_size:
                 logger.info(
-                    f"[VIT Scheduler] 📉 Reducing batch size: {self._dynamic_batch_size} -> {new_batch_size} "
-                    f"(memory usage: {memory_usage_ratio*100:.1f}%)"
+                    f"[VIT Scheduler] 📉 减小批量大小: {self._dynamic_batch_size} -> {new_batch_size} "
+                    f"(预算使用率: {memory_usage_ratio*100:.1f}%)"
                 )
                 self._dynamic_batch_size = new_batch_size
-        elif memory_usage_ratio < 0.7:  # 显存使用率 < 70%
-            # 增加批量大小
+        elif memory_usage_ratio < 0.7 and self._oom_count == 0:  # 预算使用率 < 70% 且无 OOM
+            # 增加批量大小（只在没有 OOM 时）
             new_batch_size = min(self._max_batch_size, self._dynamic_batch_size + 1)
             if new_batch_size != self._dynamic_batch_size:
                 logger.info(
-                    f"[VIT Scheduler] 📈 Increasing batch size: {self._dynamic_batch_size} -> {new_batch_size} "
-                    f"(memory usage: {memory_usage_ratio*100:.1f}%)"
+                    f"[VIT Scheduler] 📈 增加批量大小: {self._dynamic_batch_size} -> {new_batch_size} "
+                    f"(预算使用率: {memory_usage_ratio*100:.1f}%)"
                 )
                 self._dynamic_batch_size = new_batch_size
 
@@ -835,24 +1015,12 @@ class VITScheduler:
                 self._shm_registry.pop(shm_name)
                 logger.debug(f"[VIT Scheduler] ✅ Unregistered SHM: {shm_name}")
 
-    def _get_gpu_memory_usage(self) -> float:
-        """🔧 新优化: 获取 GPU 显存使用率"""
-        try:
-            # 获取当前设备
-            device_id = int(self.device.split(':')[1]) if ':' in self.device else 0
-
-            # 获取显存信息
-            total_memory = torch.cuda.get_device_properties(device_id).total_memory
-            allocated_memory = torch.cuda.memory_allocated(device_id)
-
-            usage_ratio = allocated_memory / total_memory
-            return usage_ratio
-        except Exception as e:
-            logger.error(f"[VIT Scheduler] ❌ Failed to get GPU memory usage: {e}")
-            return 0.5  # 默认返回 50%
-
     def _adjust_dynamic_batch_size(self):
-        """🔧 新优化: 根据 GPU 显存使用情况动态调整批处理大小"""
+        """动态调整批处理大小
+
+        ✅✅✅ 核心重新设计: 基于 EmbeddingPagePool 使用率调整批量大小
+        参考: sglang/docs/batch_scheduler_memory.md 第 5 节 (update_running_batch 的 new_token_ratio 调整)
+        """
         now = time.time()
 
         # 检查是否需要更新（避免频繁检查）
@@ -861,32 +1029,34 @@ class VITScheduler:
 
         self._last_gpu_memory_check = now
 
-        # 获取 GPU 显存使用率
-        memory_usage = self._get_gpu_memory_usage()
+        # ✅✅✅ 核心重新设计: 使用 embedding 页面池使用率
+        pool_stats = self.embedding_page_pool.get_stats()
+        memory_usage = pool_stats['usage_ratio']  # 0.0 - 1.0
 
         old_batch_size = self._dynamic_batch_size
 
-        # 根据显存使用率调整批处理大小
+        # 根据页面池使用率调整批处理大小（参考 new_token_ratio 的调整逻辑）
         if memory_usage > 0.85:
-            # 显存使用率 > 85%，减小批处理大小
+            # 页面池使用率 > 85%，减小批处理大小
             self._dynamic_batch_size = max(self._min_batch_size, self._dynamic_batch_size - 1)
             logger.warning(
-                f"[VIT Scheduler] 🔧 GPU memory high ({memory_usage:.1%}), "
-                f"reducing batch size: {old_batch_size} -> {self._dynamic_batch_size}"
+                f"[VIT Scheduler] 🔧 Embedding 页面池使用率高 ({memory_usage:.1%}), "
+                f"减小批量大小: {old_batch_size} -> {self._dynamic_batch_size}"
             )
-        elif memory_usage < 0.60:
-            # 显存使用率 < 60%，增加批处理大小
+        elif memory_usage < 0.60 and self._consecutive_oom_count == 0:
+            # 页面池使用率 < 60% 且无连续 OOM，增加批处理大小
             self._dynamic_batch_size = min(self._max_batch_size, self._dynamic_batch_size + 1)
             logger.info(
-                f"[VIT Scheduler] 🔧 GPU memory low ({memory_usage:.1%}), "
-                f"increasing batch size: {old_batch_size} -> {self._dynamic_batch_size}"
+                f"[VIT Scheduler] 🔧 Embedding 页面池使用率低 ({memory_usage:.1%}), "
+                f"增加批量大小: {old_batch_size} -> {self._dynamic_batch_size}"
             )
 
         # 如果批处理大小发生变化，记录日志
         if self._dynamic_batch_size != old_batch_size:
             logger.info(
-                f"[VIT Scheduler] 📊 Dynamic batch size adjusted: {old_batch_size} -> {self._dynamic_batch_size} "
-                f"(memory usage: {memory_usage:.1%})"
+                f"[VIT Scheduler] 📊 动态批量大小已调整: {old_batch_size} -> {self._dynamic_batch_size} "
+                f"(页面池使用率: {memory_usage:.1%}, 已用: {pool_stats['used_pages']} pages, "
+                f"可用: {pool_stats['free_pages']} pages)"
             )
 
     def _process_batch(self):
@@ -968,6 +1138,10 @@ class VITScheduler:
         if cache_misses:
             logger.info(f"[VIT Scheduler] 🔍 Processing {len(cache_misses)} cache misses with memory check")
 
+            # ✅ 修复: 批量处理前强制清理 PyTorch 显存碎片
+            torch.cuda.empty_cache()
+            logger.info(f"[VIT Scheduler] 🧹 Cleared CUDA cache before batch processing")
+
             # 检查是否可以处理这个批量大小
             cache_miss_batch_size = len(cache_misses)
             adjusted_batch_size = self._adjust_batch_size_for_memory(cache_miss_batch_size)
@@ -980,13 +1154,11 @@ class VITScheduler:
             if adjusted_batch_size == 0:
                 # 显存不足,无法处理任何请求
                 logger.warning(
-                    f"[VIT Scheduler] ⚠️ Insufficient memory to process any requests. "
-                    f"Clearing GPU cache and waiting for memory to be freed..."
+                    f"[VIT Scheduler] ⚠️ 显存不足，无法处理任何请求。"
+                    f"等待显存释放..."
                 )
 
-                # 🔧 新增: 主动清理 GPU 缓存
-                torch.cuda.empty_cache()
-                logger.info(f"[VIT Scheduler] 🧹 GPU cache cleared")
+                # ✅ 不调用 torch.cuda.empty_cache()，让 Python GC 自动处理
 
                 # 清理所有请求的 processing 标记
                 for request, _, _, _ in cache_misses:
@@ -998,7 +1170,7 @@ class VITScheduler:
 
             elif adjusted_batch_size < cache_miss_batch_size:
                 # 需要减小批量大小
-                logger.info(
+                logger.warning(
                     f"[VIT Scheduler] 📉 Adjusting cache miss batch size: {cache_miss_batch_size} -> {adjusted_batch_size} "
                     f"(memory constraint)"
                 )
@@ -1009,6 +1181,12 @@ class VITScheduler:
                 # 将延迟的请求放回队列
                 deferred_requests = [req for req, _, _, _ in cache_misses_deferred]
                 self.pending_requests = deferred_requests + remaining_requests
+
+                # ✅ 修复: 添加详细日志，显示剩余请求重新入队
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ 剩余 {len(deferred_requests)} 个请求重新入队 "
+                    f"(request_ids: {[req.request_id for req in deferred_requests[:3]]}{'...' if len(deferred_requests) > 3 else ''})"
+                )
 
                 # 清理延迟请求的 processing 标记
                 for request, _, _, _ in cache_misses_deferred:
@@ -1055,18 +1233,18 @@ class VITScheduler:
             # 延迟 10ms，给系统一点时间处理其他事情（例如显存释放）
             threading.Timer(0.01, self._process_batch).start()
         else:
-            logger.debug(f"[VIT Scheduler] ✅ Queue is empty, batch processing complete")
+            logger.debug(f"[VIT Scheduler] ✅ 队列为空，批量处理完成")
 
-        # 定期清理显存碎片（每 10 个批次）
-        if self.total_requests % 10 == 0:
-            torch.cuda.empty_cache()
+        # ✅ 不调用 torch.cuda.empty_cache()，让 Python GC 自动处理
 
         # 🔧 定期清理超时的共享内存（每 10 个批次）
         if self.total_requests % 10 == 0:
             self._cleanup_timeout_shm()
 
     def _process_cache_misses_batch(self, cache_misses: List[Tuple]):
-        """🔧 批量处理 cache miss 的请求
+        """批量处理 cache miss 的请求
+
+        ✅ 参考 SGLang 设计: 批量计算前分配显存预算，计算后释放预算
 
         Args:
             cache_misses: List of (request, pixel_values, image_grid_thw, hash_val)
@@ -1075,7 +1253,29 @@ class VITScheduler:
             return
 
         batch_size = len(cache_misses)
-        logger.info(f"[VIT Scheduler] 📦 Processing {batch_size} cache misses in batch...")
+        logger.info(f"[VIT Scheduler] 📦 批量处理 {batch_size} 个 cache miss...")
+
+        # ✅✅✅ 核心重新设计: 从 embedding 页面池分配页面
+        # 参考: sglang/docs/batch_scheduler_memory.md 第 4 节 (prepare_for_extend 的页面分配)
+        estimated_pages = self._estimate_batch_pages(batch_size)
+        allocated_pages = self.embedding_page_pool.alloc(estimated_pages)
+
+        if allocated_pages is None:
+            pool_stats = self.embedding_page_pool.get_stats()
+            logger.error(
+                f"[VIT Scheduler] ❌ Embedding 页面池分配失败: "
+                f"需求 {estimated_pages} pages, "
+                f"可用 {pool_stats['free_pages']} pages"
+            )
+            return
+
+        pool_stats = self.embedding_page_pool.get_stats()
+        logger.info(
+            f"[VIT Scheduler] 💾 Embedding 页面池分配成功: "
+            f"{len(allocated_pages)} pages (需求 {estimated_pages}), "
+            f"已用: {pool_stats['used_pages']} pages, "
+            f"使用率: {pool_stats['usage_ratio']*100:.1f}%"
+        )
 
         # 只有 TP rank 0 需要处理
         if self.tp_rank == 0:
@@ -1090,26 +1290,47 @@ class VITScheduler:
                 if self.tp_size > 1:
                     from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
-                    logger.info(f"[VIT Scheduler] 📡 Broadcasting batch data to other TP ranks...")
+                    logger.info(f"[VIT Scheduler] 📡 广播批量数据到其他 TP ranks...")
                     batch_data = {
                         "pixel_values_list": pixel_values_list,
                         "image_grid_thw_list": image_grid_thw_list,
                     }
                     broadcast_tensor_dict(tensor_dict=batch_data, src=0)
-                    logger.info(f"[VIT Scheduler] ✅ Batch data broadcasted")
+                    logger.info(f"[VIT Scheduler] ✅ 批量数据已广播")
 
                 # 批量计算
                 compute_start = time.time()
                 embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_thw_list)
-                compute_time = time.time() - compute_start
+                compute_end = time.time()
+                compute_time = compute_end - compute_start
 
-                logger.info(f"[VIT Scheduler] ✅ Batch compute completed in {compute_time*1000:.1f}ms, avg={compute_time/batch_size*1000:.1f}ms per request")
+                logger.info(
+                    f"[VIT Scheduler] ✅ 批量计算完成: "
+                    f"耗时 {compute_time*1000:.1f}ms, "
+                    f"平均 {compute_time/batch_size*1000:.1f}ms/请求"
+                )
+
+                # 🔧 并行性分析: 记录批量计算的时间范围
+                logger.info(
+                    f"[VIT Scheduler] 📊 并行性分析: "
+                    f"VIT 批量计算时间范围: [{compute_start:.6f}, {compute_end:.6f}], "
+                    f"持续时间: {compute_time:.6f}s"
+                )
 
                 # 处理每个结果
                 for i, (request, embedding, hash_val) in enumerate(zip(requests, embeddings, hash_vals)):
                     try:
                         # 更新缓存
+                        cache_add_time = time.time()
                         self._update_cache(hash_val, embedding)
+
+                        # 🔧 缓存生命周期跟踪: 记录缓存添加时间
+                        logger.info(
+                            f"[VIT Scheduler] 🕐 缓存生命周期 - 添加: "
+                            f"request_id={request.request_id}, "
+                            f"hash={hash_val}, "
+                            f"添加时间={cache_add_time:.6f}"
+                        )
 
                         # 创建 CUDA IPC handle
                         from sglang.semi_pd.utils import get_ipc_handle
@@ -1125,12 +1346,23 @@ class VITScheduler:
                             image_hash=hash_val,
                             compute_time=compute_time / batch_size,  # 平均时间
                             from_cache=False,
+                            vit_compute_start_time=compute_start,
+                            vit_compute_end_time=compute_end,
                         )
 
                         # 发送响应
+                        response_send_time = time.time()
                         self._send_response(response)
 
-                        logger.info(f"[VIT Scheduler] ✅ Batch request {i+1}/{batch_size} processed: {request.request_id}")
+                        # 🔧 并行性分析: 记录响应发送时间
+                        logger.info(
+                            f"[VIT Scheduler] 📊 并行性分析 - 响应发送: "
+                            f"request_id={request.request_id}, "
+                            f"发送时间={response_send_time:.6f}, "
+                            f"VIT 计算结束到发送延迟={(response_send_time - compute_end)*1000:.2f}ms"
+                        )
+
+                        logger.info(f"[VIT Scheduler] ✅ 批量请求 {i+1}/{batch_size} 已处理: {request.request_id}")
 
                     except Exception as e:
                         logger.error(f"[VIT Scheduler] ❌ Error processing batch request {request.request_id}: {e}", exc_info=True)
@@ -1144,35 +1376,67 @@ class VITScheduler:
                     # 记录 OOM 统计
                     self._oom_count += 1
                     self._last_oom_time = time.time()
+                    self._last_oom_batch_size = batch_size
+                    self._consecutive_oom_count += 1
 
                     logger.warning(
-                        f"[VIT Scheduler] ⚠️ Batch compute failed (OOM/CUDA error), falling back to single-request processing: {e}"
+                        f"[VIT Scheduler] ⚠️ 批量计算失败 (OOM/CUDA 错误), 降级到单请求处理: {e}"
                     )
                     logger.warning(
-                        f"[VIT Scheduler] 📊 OOM Statistics: count={self._oom_count}, "
+                        f"[VIT Scheduler] 📊 OOM 统计: count={self._oom_count}, "
                         f"batch_size={batch_size}, "
-                        f"memory_usage={self._get_gpu_memory_usage_ratio()*100:.1f}%"
+                        f"当前预算占用={self._current_batch_memory_bytes / (1024**3):.2f} GB, "
+                        f"连续 OOM 次数={self._consecutive_oom_count}"
                     )
 
-                    # 清理 GPU 缓存
-                    torch.cuda.empty_cache()
+                    # ✅ 新增: OOM 自适应调整 - 增加单请求显存预算估算
+                    if self._consecutive_oom_count >= 2:
+                        # 连续 2 次 OOM，显存需求估算严重偏低
+                        old_multiplier = self._per_request_memory_multiplier
+                        self._per_request_memory_multiplier *= 1.5  # 增加 50%
+                        logger.warning(
+                            f"[VIT Scheduler] 🔧 OOM 自适应调整: 连续 {self._consecutive_oom_count} 次 OOM, "
+                            f"增加显存需求倍数: {old_multiplier:.2f} -> {self._per_request_memory_multiplier:.2f}"
+                        )
+                        logger.warning(
+                            f"[VIT Scheduler] 📊 新的单请求显存预算: "
+                            f"{self._per_request_memory_bytes * self._per_request_memory_multiplier / (1024**3):.2f} GB"
+                        )
+
+                    # ❌ 不调用 torch.cuda.empty_cache()
+                    # 让 Python GC 自动处理
 
                     # 逐个处理请求
                     for request, pixel_values, image_grid_thw, hash_val in cache_misses:
                         try:
                             self._process_single_request_fallback(request, pixel_values, image_grid_thw, hash_val)
                         except Exception as single_e:
-                            logger.error(f"[VIT Scheduler] ❌ Single request fallback also failed for {request.request_id}: {single_e}", exc_info=True)
+                            logger.error(f"[VIT Scheduler] ❌ 单请求降级也失败: {request.request_id}: {single_e}", exc_info=True)
                         finally:
                             with self._processing_lock:
                                 self._processing_requests.discard(request.request_id)
                 else:
                     # 其他错误: 清理所有请求
-                    logger.error(f"[VIT Scheduler] ❌ Batch compute failed with non-OOM error: {e}", exc_info=True)
+                    logger.error(f"[VIT Scheduler] ❌ 批量计算失败 (非 OOM 错误): {e}", exc_info=True)
                     for request, _, _, _ in cache_misses:
                         with self._processing_lock:
                             self._processing_requests.discard(request.request_id)
                     raise
+            finally:
+                # ✅✅✅ 核心重新设计: 释放 embedding 页面池
+                # 参考: sglang/docs/batch_scheduler_memory.md 第 7 节 (free_group_end 的成组释放)
+                self.embedding_page_pool.free(allocated_pages)
+                pool_stats = self.embedding_page_pool.get_stats()
+                logger.info(
+                    f"[VIT Scheduler] 💾 Embedding 页面池释放成功: "
+                    f"{len(allocated_pages)} pages, "
+                    f"已用: {pool_stats['used_pages']} pages, "
+                    f"使用率: {pool_stats['usage_ratio']*100:.1f}%"
+                )
+
+                # ✅ 修复: 批量处理后强制清理 PyTorch 显存碎片
+                torch.cuda.empty_cache()
+                logger.info(f"[VIT Scheduler] 🧹 Cleared CUDA cache after batch processing")
 
         else:
             # TP rank > 0: 接收 broadcast 并参与计算
@@ -1183,7 +1447,7 @@ class VITScheduler:
                 batch_data = broadcast_tensor_dict(tensor_dict=None, src=0)
 
                 if batch_data is None:
-                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: Failed to receive batch data")
+                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: 接收批量数据失败")
                     return
 
                 pixel_values_list = batch_data.get("pixel_values_list")
@@ -1192,22 +1456,28 @@ class VITScheduler:
                 # 批量计算（参与 all-reduce）
                 embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_thw_list)
 
-                logger.info(f"[VIT Scheduler] ✅ TP rank {self.tp_rank}: Batch computation completed")
+                logger.info(f"[VIT Scheduler] ✅ TP rank {self.tp_rank}: 批量计算完成")
 
             except RuntimeError as e:
                 # OOM 或 CUDA 错误
                 if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                    logger.warning(f"[VIT Scheduler] ⚠️ TP rank {self.tp_rank}: Batch compute failed (OOM/CUDA error): {e}")
-                    # 清理 GPU 缓存 (torch 已在文件顶部导入)
-                    torch.cuda.empty_cache()
+                    logger.warning(f"[VIT Scheduler] ⚠️ TP rank {self.tp_rank}: 批量计算失败 (OOM/CUDA 错误): {e}")
+                    # ❌ 不调用 torch.cuda.empty_cache()
                 else:
-                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: Batch compute failed: {e}", exc_info=True)
+                    logger.error(f"[VIT Scheduler] ❌ TP rank {self.tp_rank}: 批量计算失败: {e}", exc_info=True)
                     raise
             finally:
                 # 清理 processing 标记
                 for request, _, _, _ in cache_misses:
                     with self._processing_lock:
                         self._processing_requests.discard(request.request_id)
+
+                # ✅✅✅ 核心重新设计: 释放 embedding 页面池 (TP rank > 0)
+                self.embedding_page_pool.free(allocated_pages)
+                logger.info(
+                    f"[VIT Scheduler] 💾 Embedding 页面池释放成功 (TP rank {self.tp_rank}): "
+                    f"{len(allocated_pages)} pages"
+                )
 
     def _process_single_request_fallback(self, request: VITRequest, pixel_values: torch.Tensor,
                                           image_grid_thw: torch.Tensor, hash_val: str):
@@ -1234,7 +1504,9 @@ class VITScheduler:
 
         # 单个计算
         compute_start = time.time()
-        embedding = self.model_runner.forward(pixel_values, image_grid_thw)
+        # ✅ 修复: VITModelRunner 没有 forward 方法，应该使用 compute_batch
+        embeddings = self.model_runner.compute_batch([pixel_values], [image_grid_thw])
+        embedding = embeddings[0]
         compute_time = time.time() - compute_start
 
         # 更新缓存
@@ -1267,6 +1539,9 @@ class VITScheduler:
         from sglang.semi_pd.utils import get_ipc_handle
         ipc_handle, offset = get_ipc_handle(cached_embedding)
 
+        # 🔧 缓存命中: 记录时间
+        cache_hit_time = time.time()
+
         # 构造响应
         response = VITResponse(
             request_id=request.request_id,
@@ -1277,12 +1552,22 @@ class VITScheduler:
             image_hash=hash_val,
             compute_time=0.0,
             from_cache=True,
+            vit_compute_start_time=cache_hit_time,  # 缓存命中时间
+            vit_compute_end_time=cache_hit_time,
         )
 
         # 发送响应
         self._send_response(response)
 
-        logger.info(f"[VIT Scheduler] ✅ Cached response sent: {request.request_id}")
+        # 🔧 缓存生命周期跟踪: 记录缓存命中
+        logger.info(
+            f"[VIT Scheduler] 🕐 缓存生命周期 - 命中: "
+            f"request_id={request.request_id}, "
+            f"hash={hash_val}, "
+            f"命中时间={cache_hit_time:.6f}"
+        )
+
+        logger.info(f"[VIT Scheduler] ✅ 缓存响应已发送: {request.request_id}")
 
     def _send_response(self, response: VITResponse):
         """发送响应到 ZMQ socket"""
@@ -1484,9 +1769,62 @@ class VITScheduler:
             with self._processing_lock:
                 self._processing_requests.discard(request.request_id)
             raise
-    
+
+    def _evict_cache(self, required_bytes: int) -> bool:
+        """LRU 缓存驱逐
+
+        ✅ 参考 SGLang 设计: 只驱逐缓存，不调用 torch.cuda.empty_cache()
+
+        Args:
+            required_bytes: 需要的显存大小 (bytes)
+
+        Returns:
+            是否成功驱逐足够的空间
+        """
+        logger.info(
+            f"[VIT Scheduler] 🗑️ 开始 LRU 驱逐: "
+            f"需求={required_bytes / (1024**2):.1f} MB, "
+            f"当前缓存={self.cache_size_bytes / (1024**2):.1f} MB, "
+            f"最大缓存={self.max_cache_size_bytes / (1024**2):.1f} MB"
+        )
+
+        evicted_count = 0
+        evicted_bytes = 0
+
+        # LRU 驱逐：移除最久未使用的条目
+        while self.cache_size_bytes + required_bytes > self.max_cache_size_bytes:
+            if len(self.embedding_cache) == 0:
+                logger.warning(
+                    f"[VIT Scheduler] ⚠️ 缓存已空，但仍需 "
+                    f"{(required_bytes - (self.max_cache_size_bytes - self.cache_size_bytes)) / (1024**2):.1f} MB"
+                )
+                return False
+
+            # 驱逐最久未使用的条目
+            oldest_hash, oldest_emb = self.embedding_cache.popitem(last=False)
+            evicted_size = oldest_emb.element_size() * oldest_emb.nelement()
+            self.cache_size_bytes -= evicted_size
+            evicted_count += 1
+            evicted_bytes += evicted_size
+
+            logger.info(
+                f"[VIT Scheduler] 🗑️ 驱逐 embedding (LRU): hash={oldest_hash}, "
+                f"size={evicted_size / (1024**2):.1f} MB"
+            )
+            # ✅ 不调用 torch.cuda.empty_cache()，让 Python GC 自动处理
+
+        logger.info(
+            f"[VIT Scheduler] ✅ LRU 驱逐完成: "
+            f"驱逐了 {evicted_count} 个条目, "
+            f"释放了 {evicted_bytes / (1024**2):.1f} MB, "
+            f"剩余缓存 {self.cache_size_bytes / (1024**2):.1f} MB"
+        )
+        return True
+
     def _update_cache(self, hash_val: int, embedding: torch.Tensor):
-        """🔧 CUDA IPC: 更新缓存（LRU 策略，线程安全，保持 embedding 在 GPU 上）
+        """更新缓存（LRU 策略，线程安全，保持 embedding 在 GPU 上）
+
+        ✅ 参考 SGLang 设计: 使用 LRU 驱逐，不调用 torch.cuda.empty_cache()
 
         Args:
             hash_val: 图片的 hash 值
@@ -1505,7 +1843,7 @@ class VITScheduler:
             # 如果已在缓存中，更新访问时间
             if hash_val in self.embedding_cache:
                 self.embedding_cache.move_to_end(hash_val)
-                logger.debug(f"[VIT Scheduler] 🔄 Cache hit (LRU update): hash={hash_val}")
+                logger.debug(f"[VIT Scheduler] 🔄 缓存命中 (LRU 更新): hash={hash_val}")
                 return
 
             embedding_size = embedding.element_size() * embedding.nelement()
@@ -1513,32 +1851,27 @@ class VITScheduler:
             # 🔧 CUDA IPC: 确保 embedding 在 GPU 上
             if not embedding.is_cuda:
                 logger.warning(
-                    f"[VIT Scheduler] ⚠️ Embedding is not on GPU (device={embedding.device}), "
-                    "moving to GPU for CUDA IPC sharing"
+                    f"[VIT Scheduler] ⚠️ Embedding 不在 GPU 上 (device={embedding.device}), "
+                    "移动到 GPU 以支持 CUDA IPC 共享"
                 )
                 embedding = embedding.to(self.device)
 
-            # LRU 驱逐：移除最久未使用的条目
-            while self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
-                if len(self.embedding_cache) == 0:
-                    break
-                oldest_hash, oldest_emb = self.embedding_cache.popitem(last=False)
-                evicted_size = oldest_emb.element_size() * oldest_emb.nelement()
-                self.cache_size_bytes -= evicted_size
-                logger.info(
-                    f"[VIT Scheduler] 🗑️ Evicted embedding (LRU): hash={oldest_hash}, "
-                    f"size={evicted_size/1024/1024:.1f}MB"
-                )
-                # 🔧 CUDA IPC: 不需要手动释放，Python GC 会自动处理
+            # 检查是否需要驱逐
+            if self.cache_size_bytes + embedding_size > self.max_cache_size_bytes:
+                if not self._evict_cache(embedding_size):
+                    logger.warning(
+                        f"[VIT Scheduler] ⚠️ 无法驱逐足够的缓存空间，跳过缓存此 embedding"
+                    )
+                    return
 
             # 添加到缓存（保持在 GPU 上）
             self.embedding_cache[hash_val] = embedding
             self.cache_size_bytes += embedding_size
 
             logger.info(
-                f"[VIT Scheduler] 💾 Added to cache: hash={hash_val}, "
-                f"size={embedding_size/1024/1024:.1f}MB, "
-                f"total_cache_size={self.cache_size_bytes/1024/1024:.1f}MB"
+                f"[VIT Scheduler] 💾 添加到缓存: hash={hash_val}, "
+                f"size={embedding_size / (1024**2):.1f} MB, "
+                f"总缓存大小={self.cache_size_bytes / (1024**2):.1f} MB"
             )
 
     def _get_cached_embedding(self, hash_val: int) -> Optional[torch.Tensor]:
@@ -1555,13 +1888,27 @@ class VITScheduler:
             return None
 
     def _free_cache(self, hash_val: int):
-        """🔧 方案 2B: 释放缓存（事件驱动，线程安全）"""
+        """释放缓存（事件驱动，线程安全）"""
+        free_time = time.time()
         with self._cache_lock:
             if hash_val in self.embedding_cache:
                 embedding = self.embedding_cache.pop(hash_val)
                 freed_size = embedding.element_size() * embedding.nelement()
                 self.cache_size_bytes -= freed_size
-                logger.info(f"[VIT Scheduler] 🗑️ Freed embedding (event-driven): hash={hash_val}, size={freed_size/1024/1024:.2f} MB")
+
+                # 🔧 缓存生命周期跟踪: 记录缓存释放
+                logger.info(
+                    f"[VIT Scheduler] 🕐 缓存生命周期 - 释放: "
+                    f"hash={hash_val}, "
+                    f"size={freed_size / (1024**2):.2f} MB, "
+                    f"释放时间={free_time:.6f}"
+                )
+
+                logger.info(
+                    f"[VIT Scheduler] 🗑️ 释放 embedding (事件驱动): "
+                    f"hash={hash_val}, "
+                    f"size={freed_size / (1024**2):.2f} MB"
+                )
 
     def _start_free_signal_thread(self):
         """🔧 新优化: 启动单独线程处理 free 信号"""
@@ -1640,9 +1987,28 @@ class VITScheduler:
                     else:
                         # 这是一个 VIT 计算请求，添加到待处理队列
                         request = VITRequest(**request_dict)
+                        request_id = request.request_id
+
+                        # ✅ 优化: 请求去重，避免处理重复请求
+                        # 检查是否已在队列中
+                        if any(r.request_id == request_id for r in self.pending_requests):
+                            logger.warning(
+                                f"[VIT Scheduler] ⚠️ 忽略重复请求: {request_id} "
+                                f"(已在队列中，pending={len(self.pending_requests)})"
+                            )
+                            continue
+
+                        # 检查是否正在处理
+                        if hasattr(self, '_processing_requests') and request_id in self._processing_requests:
+                            logger.warning(
+                                f"[VIT Scheduler] ⚠️ 忽略重复请求: {request_id} "
+                                f"(正在处理中)"
+                            )
+                            continue
+
                         self.pending_requests.append(request)
                         self.total_requests += 1
-                        logger.info(f"[VIT Scheduler] Received request (via drain): {request.request_id}")
+                        logger.info(f"[VIT Scheduler] Received request (via drain): {request_id}")
                     # 🔧 修复：继续处理后续消息，而不是 break
                     # 这样可以确保所有待处理的消息都被接收
             except zmq.Again:
@@ -1704,11 +2070,29 @@ class VITScheduler:
                             continue
 
                         request = VITRequest(**request_dict)
+                        request_id = request.request_id
+
+                        # ✅ 优化: 请求去重，避免处理重复请求
+                        # 检查是否已在队列中
+                        if any(r.request_id == request_id for r in self.pending_requests):
+                            logger.warning(
+                                f"[VIT Scheduler] ⚠️ 忽略重复请求: {request_id} "
+                                f"(已在队列中，pending={len(self.pending_requests)})"
+                            )
+                            continue
+
+                        # 检查是否正在处理
+                        if hasattr(self, '_processing_requests') and request_id in self._processing_requests:
+                            logger.warning(
+                                f"[VIT Scheduler] ⚠️ 忽略重复请求: {request_id} "
+                                f"(正在处理中)"
+                            )
+                            continue
 
                         self.pending_requests.append(request)
                         self.total_requests += 1
 
-                        logger.info(f"[VIT Scheduler] Received request: {request.request_id}")
+                        logger.info(f"[VIT Scheduler] Received request: {request_id}")
                     except zmq.Again:
                         # 没有更多请求了
                         break

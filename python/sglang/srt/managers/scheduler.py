@@ -780,7 +780,7 @@ class Scheduler(
 
             for mb_id in range(self.pp_size):
                 if should_log:
-                    logger.info(f"[PP{self.pp_rank}] 🔄 Loop iteration: mb_id={mb_id}/{self.pp_size} (counter={loop_counter})")
+                    logger.debug(f"[PP{self.pp_rank}] 🔄 Loop iteration: mb_id={mb_id}/{self.pp_size} (counter={loop_counter})")
 
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
@@ -792,8 +792,10 @@ class Scheduler(
                 if self.pp_group.is_first_rank:
                     # PP0: 接收来自 Tokenizer Manager 的请求
                     recv_reqs = self.recv_requests()
-                    if recv_reqs or should_log:
-                        logger.info(f"[PP{self.pp_rank}] 📨 recv_requests returned {len(recv_reqs) if recv_reqs else 0} requests")
+                    if recv_reqs:
+                        logger.info(f"[PP{self.pp_rank}] 📨 recv_requests returned {len(recv_reqs)} requests")
+                    elif should_log:
+                        logger.debug(f"[PP{self.pp_rank}] 📨 recv_requests returned 0 requests")
                     self.process_input_requests(recv_reqs)
                     # 保存 recv_reqs 以便后续转发给 PP1
                     self._last_recv_reqs = recv_reqs
@@ -828,22 +830,24 @@ class Scheduler(
 
                             self.process_input_requests(prev_reqs)
                         elif should_log:
-                            logger.info(f"[PP{self.pp_rank}] 📥 Received 0 requests from PP{self.pp_rank-1}")
+                            logger.debug(f"[PP{self.pp_rank}] 📥 Received 0 requests from PP{self.pp_rank-1}")
 
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
-                if mbs[mb_id] or should_log:
-                    logger.info(f"[PP{self.pp_rank}] 📦 get_next_batch_to_run: batch={'None' if mbs[mb_id] is None else f'#reqs={len(mbs[mb_id].reqs)}'}")
+                if mbs[mb_id]:
+                    logger.info(f"[PP{self.pp_rank}] 📦 get_next_batch_to_run: batch=#reqs={len(mbs[mb_id].reqs)}")
+                elif should_log:
+                    logger.debug(f"[PP{self.pp_rank}] 📦 get_next_batch_to_run: batch=None")
 
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    logger.info(f"[PP{self.pp_rank}] 🚀 Running batch: mb_id={mb_id}, forward_mode={self.cur_batch.forward_mode}")
+                    logger.debug(f"[PP{self.pp_rank}] 🚀 Running batch: mb_id={mb_id}, forward_mode={self.cur_batch.forward_mode}")
                     result = self.run_batch(self.cur_batch)
-                    logger.info(f"[PP{self.pp_rank}] ✅ Batch completed: mb_id={mb_id}")
+                    logger.debug(f"[PP{self.pp_rank}] ✅ Batch completed: mb_id={mb_id}")
                 else:
                     if should_log:
-                        logger.info(f"[PP{self.pp_rank}] ⏭️ No batch to run for mb_id={mb_id}")
+                        logger.debug(f"[PP{self.pp_rank}] ⏭️ No batch to run for mb_id={mb_id}")
                     result = None
 
                 # (last rank) send the outputs to the next step
@@ -858,28 +862,28 @@ class Scheduler(
                                 "next_token_ids": next_token_ids,
                             }
                         )
-                        logger.info(f"[PP{self.pp_rank}] 📤 Sending output tokens to PP{self.pp_rank-1}: mb_id={mb_id}")
+                        logger.debug(f"[PP{self.pp_rank}] 📤 Sending output tokens to PP{self.pp_rank-1}: mb_id={mb_id}")
                         # send the output from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-                        logger.info(f"[PP{self.pp_rank}] ✅ Output tokens sent: mb_id={mb_id}")
+                        logger.debug(f"[PP{self.pp_rank}] ✅ Output tokens sent: mb_id={mb_id}")
                     else:
                         if should_log:
-                            logger.info(f"[PP{self.pp_rank}] ⏭️ No output to send (cur_batch is None): mb_id={mb_id}")
+                            logger.debug(f"[PP{self.pp_rank}] ⏭️ No output to send (cur_batch is None): mb_id={mb_id}")
 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
-                    logger.info(f"[PP{self.pp_rank}] 📥 Receiving output from PP{self.pp_rank+1}: next_mb_id={next_mb_id}")
+                    logger.debug(f"[PP{self.pp_rank}] 📥 Receiving output from PP{self.pp_rank+1}: next_mb_id={next_mb_id}")
                     next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
-                    logger.info(f"[PP{self.pp_rank}] ✅ Received output: next_mb_id={next_mb_id}")
+                    logger.debug(f"[PP{self.pp_rank}] ✅ Received output: next_mb_id={next_mb_id}")
                     mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                     output_result = GenerationBatchResult(
                         logits_output=None,
@@ -890,13 +894,13 @@ class Scheduler(
                         bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph if result else False,
                     )
-                    logger.info(f"[PP{self.pp_rank}] 🔄 Processing batch result: next_mb_id={next_mb_id}")
+                    logger.debug(f"[PP{self.pp_rank}] 🔄 Processing batch result: next_mb_id={next_mb_id}")
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
-                    logger.info(f"[PP{self.pp_rank}] ✅ Batch result processed: next_mb_id={next_mb_id}")
+                    logger.debug(f"[PP{self.pp_rank}] ✅ Batch result processed: next_mb_id={next_mb_id}")
                 else:
                     if should_log:
-                        logger.info(f"[PP{self.pp_rank}] ⏭️ No output to receive (mbs[{next_mb_id}] is None)")
+                        logger.debug(f"[PP{self.pp_rank}] ⏭️ No output to receive (mbs[{next_mb_id}] is None)")
 
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
@@ -952,8 +956,10 @@ class Scheduler(
                             # 清空已转发的 VIT 请求
                             self._vit_ready_reqs = []
 
-                        if reqs_to_forward or should_log:
+                        if reqs_to_forward:
                             logger.info(f"[PP{self.pp_rank}] 📤 Forwarding {len(reqs_to_forward)} TokenizedGenerateReqInput to PP{self.pp_rank+1}")
+                        elif should_log:
+                            logger.debug(f"[PP{self.pp_rank}] 📤 Forwarding 0 TokenizedGenerateReqInput to PP{self.pp_rank+1}")
 
                         # 转发请求给 PP1（即使为空也发送 size=0，保证握手）
                         point_to_point_pyobj(
@@ -963,20 +969,22 @@ class Scheduler(
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
-                        if reqs_to_forward or should_log:
+                        if reqs_to_forward:
                             logger.info(f"[PP{self.pp_rank}] ✅ Request metadata forwarded")
+                        elif should_log:
+                            logger.debug(f"[PP{self.pp_rank}] ✅ Request metadata forwarded (0 requests)")
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
-                        logger.info(f"[PP{self.pp_rank}] 📤 Sending hidden_states to PP{self.pp_rank+1}: mb_id={mb_id}")
+                        logger.debug(f"[PP{self.pp_rank}] 📤 Sending hidden_states to PP{self.pp_rank+1}: mb_id={mb_id}")
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-                        logger.info(f"[PP{self.pp_rank}] ✅ Hidden_states sent: mb_id={mb_id}")
+                        logger.debug(f"[PP{self.pp_rank}] ✅ Hidden_states sent: mb_id={mb_id}")
                     else:
                         if should_log:
-                            logger.info(f"[PP{self.pp_rank}] ⏭️ No hidden_states to send (cur_batch is None): mb_id={mb_id}")
+                            logger.debug(f"[PP{self.pp_rank}] ⏭️ No hidden_states to send (cur_batch is None): mb_id={mb_id}")
 
                 pp_outputs = next_pp_outputs
 
