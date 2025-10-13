@@ -1003,6 +1003,8 @@ def _wait_and_warmup(
                         "ignore_eos": True,
                     },
                 }
+                # 🔍 DEBUG: Log warmup request parameters
+                logger.info(f"[Warmup] Sending warmup request with sampling_params={json_data['sampling_params']}")
             else:
                 json_data = {
                     "sampling_params": {

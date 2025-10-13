@@ -342,6 +342,10 @@ class SemiPDScheduler(Scheduler):
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
+        # 🔍 DEBUG: Log received max_new_tokens before clamping
+        original_max_new_tokens = req.sampling_params.max_new_tokens
+        logger.info(f"[{self.instance_role}] Request {recv_req.rid}: original max_new_tokens={original_max_new_tokens}, input_len={len(req.origin_input_ids)}, max_req_len={self.max_req_len}")
+
         req.sampling_params.max_new_tokens = min(
             (
                 req.sampling_params.max_new_tokens
@@ -350,6 +354,9 @@ class SemiPDScheduler(Scheduler):
             ),
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
+
+        # 🔍 DEBUG: Log clamped max_new_tokens
+        logger.info(f"[{self.instance_role}] Request {recv_req.rid}: clamped max_new_tokens={req.sampling_params.max_new_tokens}")
 
         # 🔧 MIGRATION: 原版Semi-PD禁用grammar功能以避免复杂性
         # 注释掉grammar相关逻辑，直接添加到等待队列

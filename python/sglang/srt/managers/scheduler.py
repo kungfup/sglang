@@ -1160,7 +1160,16 @@ class Scheduler(
                 ):
                     # 🔍 DEBUG: Log token sending decision
                     if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
-                        logger.info(f"[PP{self.pp_rank}] 🔍 Token send check: cur_batch={self.cur_batch is not None}, result={result is not None}, result.next_token_ids={getattr(result, 'next_token_ids', None) if result else None}")
+                        if not hasattr(self, "_token_send_check_log_counter"):
+                            self._token_send_check_log_counter = 0
+                        self._token_send_check_log_counter += 1
+                        if self._token_send_check_log_counter % 10000 == 1:
+                            logger.info(
+                                f"[PP{self.pp_rank}] 🔍 Token send check: "
+                                f"cur_batch={self.cur_batch is not None}, "
+                                f"result={result is not None}, "
+                                f"result.next_token_ids={getattr(result, 'next_token_ids', None) if result else None}"
+                            )
 
                     if self.cur_batch and result is not None:
                         next_token_ids, bids[mb_id] = (
