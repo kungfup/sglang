@@ -1073,16 +1073,11 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         # The queue-based approach (_ready_decode_batches) was designed for TP mode
         # In PP mode, we should directly merge the batch into running_batch
         if not batch.is_empty():
-            # Check if running_batch is empty or has no model_config
-            # If so, directly assign the new batch instead of merging
-            if self.running_batch.is_empty() or self.running_batch.model_config is None:
-                # running_batch is empty or not properly initialized, directly assign
-                self.running_batch = batch
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] assigned decode batch to running_batch (was empty), running_batch.reqs={len(self.running_batch.reqs)}")
-            else:
-                # running_batch has existing requests, merge the new batch
-                self.running_batch.merge_batch(batch)
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] merged decode batch into running_batch, running_batch.reqs={len(self.running_batch.reqs)}")
+            # 🔧 FIX V19B: CRITICAL - Set last_batch instead of directly modifying running_batch
+            # This allows get_next_batch_to_run() to properly merge the batch using the standard flow
+            # The base class pattern is: process_xxx() sets last_batch → get_next_batch_to_run() merges it
+            self.last_batch = batch
+            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Set last_batch from PREFILL result, reqs={len(self.last_batch.reqs)}, forward_mode={self.last_batch.forward_mode}")
 
         # Semi-PD: 在最后一个PP段，记录token，交由event_loop_pp的“最后段发送”统一回传给PP0。
         if (
@@ -1113,7 +1108,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 import numpy as np
                 import torch
 
-                next_token_ids = self._pending_token_ids.popleft()
+                next_token_ids_list = self._pending_token_ids.popleft()
                 next_token_logits = self._pending_token_logits.popleft()
 
                 logits_processor_output = None
@@ -1125,15 +1120,20 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                         hidden_states=None,
                     )
 
-                if next_token_ids:
-                    batch.output_ids = torch.tensor(
-                        next_token_ids, device=self.device, dtype=torch.int64
-                    )
+                # 🔧 FIX V21: Convert Python list to torch.Tensor
+                next_token_ids_tensor = torch.tensor(
+                    next_token_ids_list, device=self.device, dtype=torch.int64
+                ) if next_token_ids_list else torch.tensor([], device=self.device, dtype=torch.int64)
+
+                if next_token_ids_list:
+                    batch.output_ids = next_token_ids_tensor
+
+                logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Using pending token fastpath, next_token_ids_list={next_token_ids_list}, next_token_ids_tensor.shape={next_token_ids_tensor.shape}")
 
                 return GenerationBatchResult(
                     logits_output=logits_processor_output,
                     pp_hidden_states_proxy_tensors=None,
-                    next_token_ids=next_token_ids,
+                    next_token_ids=next_token_ids_tensor,
                     extend_input_len_per_req=None,
                     extend_logprob_start_len_per_req=None,
                     bid=-1,
@@ -1141,8 +1141,12 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 )
         except Exception:
             logger.exception("[PP_DECODE] pending-token fastpath failed; fallback to default run")
+
         # fallback to the default run
-        return super().run_batch(batch)
+        logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Fallback to normal GPU forward, batch.forward_mode={batch.forward_mode}, pending_tokens={len(self._pending_token_ids)}")
+        result = super().run_batch(batch)
+        logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Normal GPU forward completed, result={result is not None}, result.next_token_ids={getattr(result, 'next_token_ids', None) if result else None}")
+        return result
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Semi-PD decode-only loop:
@@ -1155,14 +1159,35 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         if self.pp_rank == 0:
             self._maybe_authorize_prefill()
 
-        # 🔧 CRITICAL FIX: In PP mode, DECODE-PP>0 should NOT manually create batches
-        # The native PP flow will automatically create dummy batches to receive hidden states
-        # We just need to keep the requests in waiting_queue for tracking
-        # The actual batch creation and processing is handled by the native PP event loop
+        # 🔧 FIX V19: CRITICAL - Merge last_batch into running_batch (like base class)
+        # This is essential for PP mode where PREFILL sends tokens via IPC
+        # Without this, tokens from PREFILL are never merged into running_batch
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
 
-        # 🔧 FIX V12: Remove _ready_decode_batches queue logic for PP mode
-        # In PP mode, batches should be managed directly through running_batch
-        # The queue-based approach was designed for TP mode and doesn't work with PP's microbatch management
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            # Merge the new batch into the running_batch
+            if not self.last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Merging last_batch into empty running_batch, reqs={len(self.last_batch.reqs)}")
+                    self.running_batch = self.last_batch
+                else:
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Merging last_batch into running_batch, running={len(self.running_batch.reqs)}, last={len(self.last_batch.reqs)}")
+                    self.running_batch.merge_batch(self.last_batch)
 
         # Update/return decode batch only
         ret = None

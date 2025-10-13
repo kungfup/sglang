@@ -925,7 +925,19 @@ def _wait_and_warmup(
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    default_warmup_max_new_tokens = os.environ.get(
+        "SGLANG_WARMUP_MAX_NEW_TOKENS", "8"
+    )
+    try:
+        default_warmup_max_new_tokens = max(
+            1, int(default_warmup_max_new_tokens)
+        )
+    except ValueError:
+        default_warmup_max_new_tokens = 8
+
+    max_new_tokens = (
+        default_warmup_max_new_tokens if model_info["is_generation"] else 1
+    )
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -965,19 +977,40 @@ def _wait_and_warmup(
             logger.info(f"Start of prefill warmup ...")
             # 🔧 Semi-PD uses simple warmup format (single request)
             if server_args.enable_semi_pd:
+                semipd_warmup_max_new_tokens = os.environ.get(
+                    "SGLANG_SEMIPD_WARMUP_MAX_NEW_TOKENS",
+                    str(default_warmup_max_new_tokens),
+                )
+                try:
+                    semipd_warmup_max_new_tokens = max(
+                        1, int(semipd_warmup_max_new_tokens)
+                    )
+                except ValueError:
+                    semipd_warmup_max_new_tokens = default_warmup_max_new_tokens
+                semipd_warmup_prompt = os.environ.get(
+                    "SGLANG_SEMIPD_WARMUP_PROMPT",
+                    "Warmup prompt for Semi-PD pipeline."
+                )
                 json_data = {
+                    "text": semipd_warmup_prompt,
+                    "stream": False,
                     "sampling_params": {
                         "temperature": 0.0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": semipd_warmup_max_new_tokens,
+                        "min_new_tokens": min(
+                            semipd_warmup_max_new_tokens, 4
+                        ),
                         "ignore_eos": True,
                     },
-                    "input_ids": [0, 1, 2, 3],
                 }
             else:
                 json_data = {
                     "sampling_params": {
                         "temperature": 0.0,
-                        "max_new_tokens": 8,
+                        "max_new_tokens": default_warmup_max_new_tokens,
+                        "min_new_tokens": min(
+                            default_warmup_max_new_tokens, 4
+                        ),
                         "ignore_eos": True,
                     },
                     "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,

@@ -996,7 +996,8 @@ class Scheduler(
                     # 🔧 FIX V17: Wait for PREFILL INIT_DONE signal to ensure proper initialization order
                     # This prevents DECODE from starting event loop before PREFILL is fully initialized
                     # which could cause CUDA MPS / NCCL resource conflicts
-                    if hasattr(self, 'recv_from_prefill'):
+                    # 🔧 CRITICAL FIX: Use correct attribute name 'recv_from_p_instance' instead of 'recv_from_prefill'
+                    if hasattr(self, 'recv_from_p_instance') and getattr(self, 'recv_from_p_instance', None) is not None:
                         import time
                         import zmq
                         logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Waiting for PREFILL INIT_DONE signal...")
@@ -1005,7 +1006,7 @@ class Scheduler(
 
                         while time.time() < deadline:
                             try:
-                                msg = self.recv_from_prefill.recv_pyobj(zmq.NOBLOCK)
+                                msg = self.recv_from_p_instance.recv_pyobj(zmq.NOBLOCK)
                                 if isinstance(msg, dict) and msg.get("type") == "INIT_DONE":
                                     logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] Received INIT_DONE signal from PREFILL-PP{msg.get('pp', '?')}")
                                     init_done_received = True
@@ -1023,6 +1024,8 @@ class Scheduler(
 
                         sys.stdout.flush()
                         sys.stderr.flush()
+                    else:
+                        logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] No recv_from_p_instance socket, skipping INIT_DONE wait")
 
             # Semi-PD Pipeline Parallel: 权重共享走IPCInfo + share_params_from_ipc（已在上游完成）
 
@@ -1155,6 +1158,10 @@ class Scheduler(
                     self.pp_group is not None
                     and self.pp_group.is_last_rank
                 ):
+                    # 🔍 DEBUG: Log token sending decision
+                    if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
+                        logger.info(f"[PP{self.pp_rank}] 🔍 Token send check: cur_batch={self.cur_batch is not None}, result={result is not None}, result.next_token_ids={getattr(result, 'next_token_ids', None) if result else None}")
+
                     if self.cur_batch and result is not None:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
