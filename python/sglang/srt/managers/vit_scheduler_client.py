@@ -113,6 +113,7 @@ class VITSchedulerClient:
         self.zmq_host = zmq_host
         self.zmq_port = zmq_port
         self.timeout_ms = timeout_ms
+        self.max_inflight = int(os.environ.get("SGLANG_VIT_MAX_INFLIGHT", "4"))
         self.enable = enable
 
         if not self.enable:

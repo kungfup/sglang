@@ -628,6 +628,19 @@ def apply_fp8_linear(
                     assert (
                         weight_scale.numel() == weight.shape[1]
                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                    elem_size = torch.tensor([], dtype=input.dtype).element_size()
+                    last_dim = output_shape[-1] if len(output_shape) > 0 else weight.shape[0]
+                    if (last_dim * elem_size) % 16 != 0:
+                        return _apply_fallback_scaled_mm(
+                            qinput,
+                            weight,
+                            x_scale,
+                            weight_scale,
+                            input_2d.shape,
+                            output_shape,
+                            bias,
+                            input.dtype,
+                        )
                     output = fp8_scaled_mm(
                         qinput,
                         weight,
