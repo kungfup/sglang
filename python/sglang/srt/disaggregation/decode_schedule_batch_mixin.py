@@ -39,11 +39,50 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # Fill the tensor in one pass
         offset = 0
         for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
+            pool_idx = req.req_pool_idx
+            if isinstance(pool_idx, torch.Tensor):
+                if pool_idx.numel() != 1:
+                    logger.error(
+                        "[SEMI_PD][DECODE] Unexpected tensor req_pool_idx shape=%s for rid=%s; flattening",
+                        tuple(pool_idx.shape),
+                        getattr(req, "rid", "unknown"),
+                    )
+                pool_idx = int(pool_idx.reshape(-1)[0].item())
+            elif isinstance(pool_idx, (list, tuple)):
+                if len(pool_idx) != 1:
+                    logger.error(
+                        "[SEMI_PD][DECODE] Unexpected seq req_pool_idx len=%s for rid=%s; using first element",
+                        len(pool_idx),
+                        getattr(req, "rid", "unknown"),
+                    )
+                pool_idx = int(pool_idx[0])
+            elif isinstance(pool_idx, slice):
+                logger.error(
+                    "[SEMI_PD][DECODE] Unexpected slice req_pool_idx=%s for rid=%s; using slice start",
+                    pool_idx,
+                    getattr(req, "rid", "unknown"),
+                )
+                pool_idx = int(pool_idx.start or 0)
+            elif not isinstance(pool_idx, (int,)):
+                logger.error(
+                    "[SEMI_PD][DECODE] Invalid req_pool_idx type=%s for rid=%s; defaulting to 0",
+                    type(pool_idx),
+                    getattr(req, "rid", "unknown"),
+                )
+                pool_idx = 0
 
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
+            req_pool_indices.append(pool_idx)
+
+            chunk = self.req_to_token_pool.req_to_token[pool_idx, : req.extend_input_len]
+            if chunk.dim() != 1:
+                logger.error(
+                    "[SEMI_PD][DECODE] req_pool_idx=%s produced chunk shape=%s for rid=%s; flattening",
+                    pool_idx,
+                    tuple(chunk.shape),
+                    getattr(req, "rid", "unknown"),
+                )
+                chunk = chunk.reshape(-1)[: req.extend_input_len]
+            chunk = chunk.to(dtype=torch.int64)
             assert (
                 offset + req.extend_input_len <= total_size
             ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
@@ -99,9 +138,26 @@ class ScheduleBatchDisaggregationDecodeMixin:
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
         for req in self.reqs:
-            self.output_ids.append(req.output_ids[-1])
+            if req.output_ids:
+                last_token = req.output_ids[-1]
+            elif req.fill_ids:
+                last_token = req.fill_ids[-1]
+                logger.warning(
+                    "[SEMI_PD][DECODE] Request %s has empty output_ids during prebuilt extend; "
+                    "falling back to last fill_id=%s",
+                    getattr(req, "rid", "unknown"),
+                    last_token,
+                )
+            else:
+                last_token = 0
+                logger.error(
+                    "[SEMI_PD][DECODE] Request %s has no fill_ids or output_ids; using 0 as fallback token",
+                    getattr(req, "rid", "unknown"),
+                )
+
+            self.output_ids.append(last_token)
             self.tree_cache.cache_unfinished_req(req)
-            if req.grammar is not None:
+            if req.grammar is not None and req.output_ids:
                 req.grammar.accept_token(req.output_ids[-1])
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)

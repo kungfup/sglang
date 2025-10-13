@@ -657,24 +657,42 @@ def run_scheduler_process(
         logger.info(f"🚀 [SEMI_PD_TP2] PP{pp_rank} TP{tp_rank}: CPU亲和性设置完成")
 
     # Create a scheduler and run the event loop
-        # Ensure correct disaggregation mode is set before Scheduler init
-        # This is critical: it controls which queues/buffers are initialized inside Scheduler.__init__
-        try:
-            if instance_role == InstanceRole.DECODE:
-                # Decode engine: allocate only decode-side constructs; force chunk cache
-                server_args.disaggregation_mode = "decode"
-            elif instance_role == InstanceRole.PREFILL:
-                # Prefill engine: allocate prefill-side constructs
-                server_args.disaggregation_mode = "prefill"
-            else:
-                server_args.disaggregation_mode = "null"
-        except Exception:
-            # Be robust even if ServerArgs does not expose the attribute (older builds)
-            import traceback as _tb
-            logger.warning(f"[SEMI-PD] failed to set disaggregation_mode on server_args: {_tb.format_exc()}")
-        logger.info(
-            f"[SEMI-PD] Using disaggregation_mode={getattr(server_args,'disaggregation_mode',None)} for instance_role={instance_role.name}"
-        )
+    # Ensure correct disaggregation mode is set before Scheduler init
+    # This is critical: it controls which queues/buffers are initialized inside Scheduler.__init__
+    try:
+        tp_default = getattr(server_args, "tp_size", 1) or 1
+        dp_default = getattr(server_args, "dp_size", 1) or 1
+        pp_default = getattr(server_args, "pp_size", 1) or 1
+        if instance_role == InstanceRole.DECODE:
+            # Decode engine: allocate only decode-side constructs; force chunk cache
+            server_args.disaggregation_mode = "decode"
+        elif instance_role == InstanceRole.PREFILL:
+            # Prefill engine: allocate prefill-side constructs
+            server_args.disaggregation_mode = "prefill"
+        else:
+            server_args.disaggregation_mode = "null"
+        if getattr(server_args, "disaggregation_decode_tp", None) is None:
+            server_args.disaggregation_decode_tp = tp_default
+        if getattr(server_args, "disaggregation_decode_dp", None) is None:
+            server_args.disaggregation_decode_dp = dp_default
+        if getattr(server_args, "disaggregation_prefill_pp", None) is None:
+            server_args.disaggregation_prefill_pp = pp_default
+    except Exception:
+        # Be robust even if ServerArgs does not expose the attribute (older builds)
+        import traceback as _tb
+        logger.warning(f"[SEMI-PD] failed to set disaggregation_mode on server_args: {_tb.format_exc()}")
+    logger.info(
+        f"[SEMI-PD] Using disaggregation_mode={getattr(server_args,'disaggregation_mode',None)} for instance_role={instance_role.name}"
+    )
+    try:
+        backend = getattr(server_args, "disaggregation_transfer_backend", "mooncake")
+        if backend in (None, "", "mooncake"):
+            server_args.disaggregation_transfer_backend = "fake"
+            logger.info(
+                "[SEMI-PD] disaggregation_transfer_backend not specified; falling back to 'fake'"
+            )
+    except Exception:
+        pass
 
     try:
         if instance_role == InstanceRole.DECODE:

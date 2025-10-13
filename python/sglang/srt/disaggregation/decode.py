@@ -548,12 +548,40 @@ class DecodeTransferQueue:
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
 
         transferred_reqs = []
         indices_to_remove = set()
+
+        for i, decode_req in enumerate(self.queue):
+            req = decode_req.req
+            if hasattr(req, "_fallback_kv_cpu") and hasattr(req, "_fallback_kv_indices"):
+                dest_indices = (
+                    self.scheduler.req_to_token_pool.req_to_token[req.req_pool_idx, : len(req._fallback_kv_indices)]
+                    .cpu()
+                    .numpy()
+                )
+                self.scheduler.token_to_kv_pool_allocator.load_cpu_copy(
+                    req._fallback_kv_cpu, dest_indices
+                )
+                if hasattr(req, "_fallback_metadata_index") and req._fallback_metadata_index not in (-1, None):
+                    self.req_to_metadata_buffer_idx_allocator.free(req._fallback_metadata_index)
+                    req.metadata_buffer_index = -1
+                del req._fallback_kv_cpu
+                del req._fallback_kv_indices
+                if hasattr(req, "_fallback_metadata_index"):
+                    del req._fallback_metadata_index
+                transferred_reqs.append(req)
+                indices_to_remove.add(i)
+
+        if indices_to_remove:
+            self.queue = [entry for idx, entry in enumerate(self.queue) if idx not in indices_to_remove]
+            indices_to_remove = set()
+            if not self.queue:
+                return transferred_reqs
+
+        polls = poll_and_all_reduce(
+            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+        )
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -776,11 +804,35 @@ class SchedulerDisaggregationDecodeMixin:
             # Filter finished batches.
             last_batch.filter_batch()
             if not last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = last_batch
+                max_merge = (
+                    self.server_args.max_running_requests
+                    or self.req_to_token_pool.size
+                )
+                current_size = self.running_batch.batch_size()
+                if current_size >= max_merge:
+                    logger.debug(
+                        "[SEMI-PD][DECODE] skip merging prebuilt batch because running_batch size=%s already >= %s",
+                        current_size,
+                        max_merge,
+                    )
                 else:
-                    # merge running_batch with prefill batch
-                    self.running_batch.merge_batch(last_batch)
+                    if self.running_batch.is_empty():
+                        self.running_batch = last_batch
+                    else:
+                        new_size = current_size + last_batch.batch_size()
+                        if new_size > max_merge:
+                            logger.debug(
+                                "[SEMI-PD][DECODE] merge would exceed capacity (%s > %s); pushing back",
+                                new_size,
+                                max_merge,
+                            )
+                            self.waiting_queue[0:0] = last_batch.reqs
+                            for req in last_batch.reqs:
+                                req.already_computed -= req.cached_tokens
+                                req.cached_tokens = 0
+                        else:
+                            # merge running_batch with prefill batch
+                            self.running_batch.merge_batch(last_batch)
 
         new_prebuilt_batch = self.get_new_prebuilt_batch()
 

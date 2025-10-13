@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -52,6 +53,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1229,6 +1231,12 @@ class Scheduler(
                 seq_length = len(recv_req.input_embeds)
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
+
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                if recv_req.bootstrap_host is None:
+                    recv_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                if recv_req.bootstrap_room is None:
+                    recv_req.bootstrap_room = random.getrandbits(63)
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port

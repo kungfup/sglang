@@ -178,6 +178,8 @@ class PrefillBootstrapQueue:
         """
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
+        if not hasattr(req, "_orig_max_new_tokens"):
+            req._orig_max_new_tokens = req.sampling_params.max_new_tokens
         req.sampling_params.max_new_tokens = 1
 
     def pop_bootstrapped(
@@ -311,6 +313,7 @@ class SchedulerDisaggregationPrefillMixin:
             if require_mlp_sync(self.server_args):
                 batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
+            cur_sampling = getattr(self.tp_worker, "cur_sampling_info", None)
             if batch:
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
@@ -321,15 +324,13 @@ class SchedulerDisaggregationPrefillMixin:
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=cur_sampling,
                     )
                     self.set_next_batch_sampling_info_done(tmp_batch)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
+                tmp_batch.next_batch_sampling_info = cur_sampling if batch else None
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
@@ -370,10 +371,22 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         if self.enable_overlap:
-            # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
-            )
+            resolver = getattr(self.tp_worker, "resolve_last_batch_result", None)
+            if resolver is not None:
+                logits_output, next_token_ids, _ = resolver(launch_done)
+                if isinstance(next_token_ids, torch.Tensor):
+                    next_token_ids = next_token_ids.tolist()
+            else:
+                next_token_ids = result.next_token_ids.tolist()
+                if batch.return_logprob:
+                    if logits_output.next_token_logprobs is not None:
+                        logits_output.next_token_logprobs = (
+                            logits_output.next_token_logprobs.tolist()
+                        )
+                    if logits_output.input_token_logprobs is not None:
+                        logits_output.input_token_logprobs = tuple(
+                            logits_output.input_token_logprobs.tolist()
+                        )
         else:
             next_token_ids = result.next_token_ids.tolist()
             if batch.return_logprob:
@@ -394,8 +407,9 @@ class SchedulerDisaggregationPrefillMixin:
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
-                self.disagg_prefill_inflight_queue.append(req)
+                if hasattr(req, "_orig_max_new_tokens"):
+                    req.sampling_params.max_new_tokens = req._orig_max_new_tokens
+                    del req._orig_max_new_tokens
                 if logits_output.hidden_states is not None:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
@@ -421,6 +435,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                self.tree_cache.cache_unfinished_req(req)
+                self.disagg_prefill_inflight_queue.append(req)
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
@@ -464,12 +480,32 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_tp_cpu_group,
-        )
-
+        senders = [getattr(req, "disagg_kv_sender", None) for req in self.disagg_prefill_inflight_queue]
         undone_reqs: List[Req] = []
+        if any(s is None for s in senders):
+            for req, sender in zip(self.disagg_prefill_inflight_queue, senders):
+                if sender is None:
+                    logger.warning(
+                        "[SEMI-PD][PREFILL] inflight req rid=%s bootstrap_room=%s has no kv sender; marking as done",
+                        getattr(req, "rid", "unknown"),
+                        getattr(req, "bootstrap_room", None),
+                    )
+                    self.tree_cache.cache_finished_req(req)
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                    done_reqs.append(req)
+            senders = [s for s in senders if s is not None]
+            self.disagg_prefill_inflight_queue = [req for req in self.disagg_prefill_inflight_queue if getattr(req, "disagg_kv_sender", None) is not None]
+            if len(senders) == 0:
+                if done_reqs:
+                    self.stream_output(done_reqs, any(req.return_logprob for req in done_reqs), None)
+                    for req in done_reqs:
+                        if getattr(req, "metadata_buffer_index", -1) not in (-1, None):
+                            self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
+                            req.metadata_buffer_index = -1
+                return done_reqs
+
+        polls = poll_and_all_reduce(senders, self.attn_tp_cpu_group)
+
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
 
@@ -523,8 +559,23 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Used by PP, get the transferred rids but **do not pop**
         """
+        senders = [getattr(req, "disagg_kv_sender", None) for req in self.disagg_prefill_inflight_queue]
+        if any(s is None for s in senders):
+            for req, sender in zip(self.disagg_prefill_inflight_queue, senders):
+                if sender is None:
+                    logger.warning(
+                        "[SEMI-PD][PREFILL] inflight req rid=%s bootstrap_room=%s has no kv sender during polling",
+                        getattr(req, "rid", "unknown"),
+                        getattr(req, "bootstrap_room", None),
+                    )
+            self.disagg_prefill_inflight_queue = [req for req in self.disagg_prefill_inflight_queue if getattr(req, "disagg_kv_sender", None) is not None]
+            senders = [s for s in senders if s is not None]
+            if len(senders) == 0:
+                self.disagg_prefill_inflight_queue = []
+                return []
+
         polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            senders,
             self.tp_worker.get_tp_group().cpu_group,
         )
 
@@ -590,4 +641,17 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices)
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is None:
+            logger.warning(
+                "[SEMI-PD][PREFILL] request rid=%s bootstrap_room=%s has no kv sender when sending chunk",
+                getattr(req, "rid", "unknown"),
+                getattr(req, "bootstrap_room", None),
+            )
+            req._fallback_kv_indices = kv_indices
+            req._fallback_kv_cpu = self.token_to_kv_pool_allocator.get_cpu_copy(
+                kv_indices
+            )
+            req._fallback_metadata_index = req.metadata_buffer_index
+            return
+        sender.send(page_indices)

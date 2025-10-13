@@ -181,6 +181,7 @@ class TokenizerManager:
             if server_args.preferred_sampling_params
             else None
         )
+        self._missing_state_log_counter = 0
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -1271,9 +1272,16 @@ class TokenizerManager:
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
+                self._missing_state_log_counter += 1
+                if (
+                    self._missing_state_log_counter == 1
+                    or self._missing_state_log_counter % 100000 == 0
+                ):
+                    logger.error(
+                        "Received output for %s but the state was deleted in TokenizerManager. (occurrence=%d)",
+                        rid,
+                        self._missing_state_log_counter,
+                    )
                 continue
 
             # Build meta_info and return value
