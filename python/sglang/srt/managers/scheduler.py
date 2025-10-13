@@ -13,9 +13,12 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import gzip
+import json
 import faulthandler
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -2769,15 +2772,25 @@ class Scheduler(
 
                 # Save Chrome trace with role information
                 # Include PP rank in filename to distinguish pipeline stages
-                trace_filename = (
+                trace_basename = (
                     self.profile_id
                     + f"-{role_suffix}-PP-{self.pp_rank}-TP-{self.tp_rank}"
                     + stage_suffix
-                    + ".trace.json.gz"
+                    + ".trace.json"
                 )
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, trace_filename)
-                )
+                trace_path = Path(self.torch_profiler_output_dir) / trace_basename
+                self.torch_profiler.export_chrome_trace(trace_path.as_posix())
+                try:
+                    gz_path = trace_path.with_suffix(trace_path.suffix + ".gz")
+                    with trace_path.open("rt") as src, gzip.open(gz_path, "wt") as dst:
+                        shutil.copyfileobj(src, dst)
+                    trace_path.unlink(missing_ok=True)
+                except Exception:
+                    logger.warning(
+                        "[PROFILER] Failed to gzip profiler trace %s; leaving raw JSON",
+                        trace_path,
+                        exc_info=True,
+                    )
 
                 # Save statistics with role information
                 stats_file = os.path.join(
@@ -2818,6 +2831,17 @@ class Scheduler(
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
+        if (
+            self.world_group is not None
+            and getattr(self.world_group, "cpu_group", None) is not None
+        ):
+            torch.distributed.barrier(self.world_group.cpu_group)
+        if self._should_merge_profile_traces():
+            try:
+                self._merge_profile_traces(stage_suffix)
+            except Exception:
+                logger.exception("[PROFILER] Failed to merge cross-process profiler traces")
+
         logger.info(
             "Profiling done. Traces are saved to: %s",
             self.torch_profiler_output_dir,
@@ -2826,6 +2850,99 @@ class Scheduler(
         self.profile_in_progress = False
 
         return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _should_merge_profile_traces(self) -> bool:
+        if getattr(self.server_args, "pp_size", 1) <= 1:
+            return False
+        if getattr(self, "instance_role", None) != InstanceRole.DECODE:
+            return False
+        return getattr(self, "tp_rank", None) == 0
+
+    def _merge_profile_traces(self, stage_suffix: str) -> None:
+        output_dir = getattr(self, "torch_profiler_output_dir", None)
+        profile_id = getattr(self, "profile_id", None)
+        if not output_dir or not profile_id:
+            return
+
+        output_path = Path(output_dir)
+        if not output_path.exists():
+            return
+
+        suffix = stage_suffix or ""
+        pattern = f"{profile_id}-*-PP-*-TP-*{suffix}.trace.json.gz"
+        trace_paths = sorted(output_path.glob(pattern))
+        if len(trace_paths) <= 1:
+            return
+
+        merged = self._collect_and_merge_traces(trace_paths, suffix)
+        if merged is None:
+            return
+
+        merged_name = profile_id + suffix + "-merged.trace.json.gz"
+        merged_path = output_path / merged_name
+        with gzip.open(merged_path, "wt") as fh:
+            json.dump(merged, fh)
+        logger.info(
+            "[PROFILER] Merged %d traces for Semi-PD pipeline into %s",
+            len(trace_paths),
+            merged_path,
+        )
+
+    def _collect_and_merge_traces(
+        self, trace_paths: List[Path], stage_suffix: str
+    ) -> Optional[dict]:
+        traces: List[dict] = []
+        for path in trace_paths:
+            try:
+                with gzip.open(path, "rt") as fh:
+                    traces.append(json.load(fh))
+            except Exception:
+                logger.warning(
+                    "[PROFILER] Unable to load profiler trace %s", path, exc_info=True
+                )
+                return None
+        if not traces:
+            return None
+
+        merged: Dict[str, Union[dict, list, str, int]] = {}
+        for key, value in traces[0].items():
+            if key in (
+                "traceEvents",
+                "activityRecords",
+                "deviceProperties",
+                "baseTimeNanoseconds",
+            ):
+                continue
+            merged[key] = value
+
+        merged["traceEvents"] = []
+        merged["activityRecords"] = []
+
+        device_props: List[dict] = []
+        seen_devices = set()
+        base_times: List[int] = []
+
+        for trace in traces:
+            merged["traceEvents"].extend(trace.get("traceEvents", []))
+            merged["activityRecords"].extend(trace.get("activityRecords", []))
+            for dev in trace.get("deviceProperties", []):
+                key = (dev.get("id"), dev.get("name"))
+                if key not in seen_devices:
+                    device_props.append(dev)
+                    seen_devices.add(key)
+            bt = trace.get("baseTimeNanoseconds")
+            if bt is not None:
+                base_times.append(bt)
+
+        if device_props:
+            merged["deviceProperties"] = device_props
+        if base_times:
+            merged["baseTimeNanoseconds"] = min(base_times)
+
+        merged["traceName"] = f"Merged-SemiPD{stage_suffix or ''}"
+        merged["sglangMergedFrom"] = [p.name for p in trace_paths]
+
+        return merged
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:
