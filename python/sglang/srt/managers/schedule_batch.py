@@ -715,15 +715,22 @@ class Req:
             )
             return
 
+        # 🔍 DEBUG V24: Log check_finished details
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[REQ {self.rid[:8]}] check_finished: len(output_ids)={len(self.output_ids)}, max_new_tokens={self.sampling_params.max_new_tokens}, ignore_eos={self.sampling_params.ignore_eos}")
+
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            logger.info(f"[REQ {self.rid[:8]}] ❌ FINISH_LENGTH: len(output_ids)={len(self.output_ids)} >= max_new_tokens={self.sampling_params.max_new_tokens}")
             return
 
         if self.grammar is not None:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                logger.info(f"[REQ {self.rid[:8]}] ❌ FINISH_MATCHED_TOKEN (grammar): token={self.output_ids[-1]}")
                 return
 
         last_token_id = self.output_ids[-1]
@@ -744,7 +751,10 @@ class Req:
                     )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+                logger.info(f"[REQ {self.rid[:8]}] ❌ FINISH_MATCHED_TOKEN (EOS): token={last_token_id}, ignore_eos={self.sampling_params.ignore_eos}")
                 return
+
+        logger.info(f"[REQ {self.rid[:8]}] ✅ Not finished, continuing...")
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
@@ -1627,11 +1637,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        # 🔍 DEBUG V24: Log filter_batch details
+        import logging
+        logger = logging.getLogger(__name__)
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
+
+            # 🔍 DEBUG V24: Log each request's finished status
+            for i, req in enumerate(self.reqs):
+                is_finished = req.finished()
+                logger.info(f"[FILTER_BATCH] req[{i}]={req.rid[:8]}: finished={is_finished}, finished_reason={req.finished_reason}, len(output_ids)={len(req.output_ids)}")
+
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
@@ -1639,13 +1659,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
+            logger.info(f"[FILTER_BATCH] Before filter: {len(self.reqs)} reqs, After filter: {len(keep_indices)} reqs")
+
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
+            logger.info(f"[FILTER_BATCH] ❌ Filtering out ALL requests")
             self.reqs = []
             return
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
+            logger.info(f"[FILTER_BATCH] ✅ No filtering needed")
             return
 
         keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(

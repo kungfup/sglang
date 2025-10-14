@@ -2462,17 +2462,14 @@ class Scheduler(
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
-            # 🔧 CRITICAL FIX: For Semi-PD DECODE-PP0, process decode results even for IDLE batch
-            # because PP0 maintains the running_batch and needs to handle output
-            if is_semi_pd_decode_first:
-                # Throttled logging
-                if not hasattr(self, "_idle_batch_log_tick"):
-                    self._idle_batch_log_tick = 0
-                self._idle_batch_log_tick += 1
-                if self._idle_batch_log_tick % 100 == 0:
-                    logger.info(f"[PROCESS_BATCH_RESULT] PP{self.pp_rank} DECODE first_rank: Processing IDLE batch as decode for output")
-                self.process_batch_result_decode(batch, result, launch_done)
-            elif self.enable_overlap:
+            # 🔧 FIX V27: REMOVED duplicate process_batch_result_decode call for IDLE batch
+            # This was causing duplicate token append in DECODE-PP0
+            # IDLE batches are only for PP synchronization, not for token processing
+            # Original code (REMOVED):
+            # if is_semi_pd_decode_first:
+            #     self.process_batch_result_decode(batch, result, launch_done)  # ← 导致重复 append！
+
+            if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():

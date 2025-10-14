@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
+    Req,
+    ScheduleBatch,
+)
 
 # 导入InstanceRole枚举
 try:
@@ -225,12 +231,65 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
+        # 🔍 DEBUG V24: Log entry to process_batch_result_decode (with throttling)
+        import logging
+        logger = logging.getLogger(__name__)
+        instance_role = getattr(self, 'instance_role', 'UNKNOWN')
+        pp_rank = getattr(self, 'pp_rank', '?')
+
+        # Initialize throttling counter
+        if not hasattr(self, '_process_decode_log_counter'):
+            self._process_decode_log_counter = 0
+            self._last_batch_reqs_count = -1
+
+        self._process_decode_log_counter += 1
+        current_batch_reqs = len(batch.reqs)
+
+        # Log if: (1) every 500 iterations, (2) state change, or (3) non-empty batch
+        should_log = (
+            self._process_decode_log_counter % 500 == 1 or
+            current_batch_reqs != self._last_batch_reqs_count or
+            current_batch_reqs > 0
+        )
+
+        if should_log:
+            logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 ENTER process_batch_result_decode: batch.reqs={current_batch_reqs}, result.next_token_ids={result.next_token_ids if isinstance(result.next_token_ids, (list, tuple)) else 'tensor'} (iter={self._process_decode_log_counter})")
+
+        self._last_batch_reqs_count = current_batch_reqs
+
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        self.num_generated_tokens += len(batch.reqs)
+        # 🔧 FIX V25 (问题 3): Only count tokens for non-empty batches to prevent negative token count
+        if len(batch.reqs) > 0:
+            self.num_generated_tokens += len(batch.reqs)
+
+        # 🔧 FIX V26: Semi-PD PP0 可能在一次迭代中重复处理同一个 GenerationBatchResult
+        # （一次真实 decode + 一次 idle/broadcast 触发），提前消费同样的 token。
+        # 这里通过记录 result 标识来保证只处理一次，避免重复 append。
+        is_semi_pd_pp0 = (
+            getattr(self.server_args, 'enable_semi_pd', False)
+            and getattr(self, 'pp_size', 1) > 1
+            and getattr(self, 'pp_rank', 0) == 0
+            and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+        )
+
+        if is_semi_pd_pp0:
+            current_result_key = (id(result), getattr(result, "bid", None))
+            last_result_key = getattr(self, "_last_processed_generation_result", None)
+            if last_result_key == current_result_key:
+                logger.info(
+                    f"[{instance_role}-PP{pp_rank}] 🔁 Detected duplicate GenerationBatchResult "
+                    f"(id={current_result_key[0]}, bid={current_result_key[1]}), skip re-processing."
+                )
+                # 🔧 FIX V27+: MUST return here to prevent duplicate token append!
+                # Previously, we only set next_token_ids=[], but the function continued
+                # and next_token_ids was overwritten by result.next_token_ids.tolist()
+                return
+            else:
+                self._last_processed_generation_result = current_result_key
 
         if self.enable_overlap:
             logits_output, next_token_ids, can_run_cuda_graph = (
@@ -243,17 +302,32 @@ class SchedulerOutputProcessorMixin:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
+        if should_log:
+            logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 next_token_ids after tolist: {next_token_ids}")
+
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
+        if should_log:
+            logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 About to process {len(batch.reqs)} requests with {len(next_token_ids)} tokens")
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            # 🔍 DEBUG V24: Log request state before processing
+            logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Processing req[{i}]={req.rid[:8]}: is_retracted={req.is_retracted}, len(output_ids)={len(req.output_ids)}, next_token_id={next_token_id}")
+
             if req.is_retracted:
+                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping retracted req[{i}]={req.rid[:8]}")
+                continue
+
+            # 🔧 FIX V25 (问题 1): Skip already finished requests to prevent duplicate token append in IDLE batch
+            if req.finished():
+                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping already finished req[{i}]={req.rid[:8]}, finished_reason={req.finished_reason}")
                 continue
 
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
+                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Req[{i}]={req.rid[:8]} already finished (overlap mode)")
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
                 else:
@@ -267,13 +341,74 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if batch.spec_algorithm.is_none():
-                # speculative worker will solve the output_ids in speculative decoding
-                req.output_ids.append(next_token_id)
+                # 🔧 FIX V25 (问题 2): In Semi-PD+PP, only PP0 appends tokens to req.output_ids
+                # PP1 only generates tokens and sends them to PP0
+                is_semi_pd_pp_last = (
+                    getattr(self, 'server_args', None)
+                    and getattr(self.server_args, 'enable_semi_pd', False)
+                    and getattr(self, 'pp_size', 1) > 1
+                    and getattr(self, 'pp_rank', 0) == getattr(self, 'pp_size', 1) - 1
+                    and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+                )
 
-            req.check_finished()
+                if not is_semi_pd_pp_last:
+                    # PP0: Append token to req.output_ids
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Appending token {next_token_id} to req[{i}]={req.rid[:8]}, len(output_ids) before={len(req.output_ids)}")
+                    req.output_ids.append(next_token_id)
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 After append: req[{i}]={req.rid[:8]}, len(output_ids)={len(req.output_ids)}")
+                else:
+                    # PP1: Only generate token, do not append to req.output_ids
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 PP1: Generated token {next_token_id} for req[{i}]={req.rid[:8]}, NOT appending (PP0 will handle)")
+
+            # 🔧 FIX V25 (问题 2): PP1 uses local counter to track generated tokens
+            if batch.spec_algorithm.is_none():
+                is_semi_pd_pp_last = (
+                    getattr(self, 'server_args', None)
+                    and getattr(self.server_args, 'enable_semi_pd', False)
+                    and getattr(self, 'pp_size', 1) > 1
+                    and getattr(self, 'pp_rank', 0) == getattr(self, 'pp_size', 1) - 1
+                    and getattr(self, 'instance_role', None) == InstanceRole.DECODE
+                )
+
+                if is_semi_pd_pp_last:
+                    # PP1: Track generated tokens locally
+                    # 🔧 FIX V27: Use req.rid to detect new requests (not len(output_ids))
+                    # Initialize tracking attributes if not exists
+                    if not hasattr(req, '_pp1_generated_tokens'):
+                        req._pp1_generated_tokens = 0
+                        req._pp1_last_rid = None
+
+                    # Check if this is a new request (rid changed)
+                    if req._pp1_last_rid != req.rid:
+                        # New request: reset counter
+                        req._pp1_generated_tokens = 0
+                        req._pp1_last_rid = req.rid
+                        logger.info(f"[{instance_role}-PP{pp_rank}] 🔄 PP1: New request detected, reset counter for req[{i}]={req.rid[:8]}")
+
+                    req._pp1_generated_tokens += 1
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔢 PP1: Req[{i}]={req.rid[:8]}, counter={req._pp1_generated_tokens}/{req.sampling_params.max_new_tokens}")
+
+                    # Check finish based on local counter
+                    if req._pp1_generated_tokens >= req.sampling_params.max_new_tokens:
+                        logger.info(f"[{instance_role}-PP{pp_rank}] ❌ PP1: Req[{i}]={req.rid[:8]} reached max_new_tokens ({req._pp1_generated_tokens}/{req.sampling_params.max_new_tokens})")
+                        req.finished_reason = FINISH_LENGTH(req._pp1_generated_tokens)
+                    elif req.sampling_params.stop_token_ids and next_token_id in req.sampling_params.stop_token_ids:
+                        if not req.sampling_params.ignore_eos:
+                            logger.info(f"[{instance_role}-PP{pp_rank}] ❌ PP1: Req[{i}]={req.rid[:8]} hit EOS token {next_token_id}")
+                            req.finished_reason = FINISH_MATCHED_TOKEN(matched=next_token_id)
+                else:
+                    # PP0: Use standard check_finished()
+                    req.check_finished()
+            else:
+                # Spec decoding: Use standard check_finished()
+                req.check_finished()
+
             if req.finished():
+                logger.info(f"[{instance_role}-PP{pp_rank}] ❌ Req[{i}]={req.rid[:8]} marked as FINISHED: finished_reason={req.finished_reason}, len(output_ids)={len(req.output_ids)}")
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
+            else:
+                logger.info(f"[{instance_role}-PP{pp_rank}] ✅ Req[{i}]={req.rid[:8]} NOT finished, continuing...")
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding

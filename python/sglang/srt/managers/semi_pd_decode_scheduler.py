@@ -1095,58 +1095,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         This avoids re-running GPU decode at the last stage. The native event loop
         will then send these tokens via PP group to stage 0 as usual.
         """
-        try:
-            if (
-                self.is_generation
-                and getattr(self.server_args, 'enable_semi_pd', False)
-                and self.pp_group is not None
-                and self.pp_group.is_last_rank
-                and len(self._pending_token_ids) > 0
-            ):
-                from sglang.srt.managers.scheduler import GenerationBatchResult
-                from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-                import numpy as np
-                import torch
-
-                next_token_ids_list = self._pending_token_ids.popleft()
-                next_token_logits = self._pending_token_logits.popleft()
-
-                logits_processor_output = None
-                if next_token_logits is not None:
-                    logits_processor_output = LogitsProcessorOutput(
-                        next_token_logits=torch.from_numpy(next_token_logits).to(
-                            self.device, dtype=torch.float16, non_blocking=True
-                        ),
-                        hidden_states=None,
-                    )
-
-                # 🔧 FIX V21: Convert Python list to torch.Tensor
-                next_token_ids_tensor = torch.tensor(
-                    next_token_ids_list, device=self.device, dtype=torch.int64
-                ) if next_token_ids_list else torch.tensor([], device=self.device, dtype=torch.int64)
-
-                if next_token_ids_list:
-                    batch.output_ids = next_token_ids_tensor
-
-                logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Using pending token fastpath, next_token_ids_list={next_token_ids_list}, next_token_ids_tensor.shape={next_token_ids_tensor.shape}")
-
-                return GenerationBatchResult(
-                    logits_output=logits_processor_output,
-                    pp_hidden_states_proxy_tensors=None,
-                    next_token_ids=next_token_ids_tensor,
-                    extend_input_len_per_req=None,
-                    extend_logprob_start_len_per_req=None,
-                    bid=-1,
-                    can_run_cuda_graph=False,
-                )
-        except Exception:
-            logger.exception("[PP_DECODE] pending-token fastpath failed; fallback to default run")
-
-        # fallback to the default run
-        logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Fallback to normal GPU forward, batch.forward_mode={batch.forward_mode}, pending_tokens={len(self._pending_token_ids)}")
-        result = super().run_batch(batch)
-        logger.info(f"[DECODE-PP{self.pp_rank}] 🔍 Normal GPU forward completed, result={result is not None}, result.next_token_ids={getattr(result, 'next_token_ids', None) if result else None}")
-        return result
+        # For Semi-PD + PP we依旧走原生 run_batch 流程，避免 fastpath 打破 NCCL send/recv 配对
+        # 或提前将请求标记完成。pending token 仍通过下一轮标准处理被发送。
+        return super().run_batch(batch)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Semi-PD decode-only loop:
@@ -1191,17 +1142,40 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         # Update/return decode batch only
         ret = None
+
+        # 🔍 DEBUG V24: Throttle get_next_batch_to_run logs
+        if not hasattr(self, '_get_next_batch_log_counter'):
+            self._get_next_batch_log_counter = 0
+            self._last_running_batch_empty = None
+
+        self._get_next_batch_log_counter += 1
+        current_is_empty = self.running_batch.is_empty()
+
+        # Log if: (1) every 500 iterations, (2) state change, or (3) non-empty batch
+        should_log = (
+            self._get_next_batch_log_counter % 500 == 1 or
+            current_is_empty != self._last_running_batch_empty or
+            not current_is_empty
+        )
+
         if not self.running_batch.is_empty():
-            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch not empty, reqs={len(self.running_batch.reqs)}")
+            if should_log:
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch not empty, reqs={len(self.running_batch.reqs)} (iter={self._get_next_batch_log_counter})")
             self.running_batch = self.update_running_batch(self.running_batch)
-            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: after update_running_batch, reqs={len(self.running_batch.reqs)}")
+            if should_log:
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: after update_running_batch, reqs={len(self.running_batch.reqs)}")
             if not self.running_batch.is_empty():
                 ret = self.running_batch
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: returning running_batch, reqs={len(ret.reqs)}")
+                if should_log:
+                    logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: returning running_batch, reqs={len(ret.reqs)}")
             else:
-                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch became empty after update")
+                # Always log when batch becomes empty (state transition)
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] ❌ get_next_batch_to_run: running_batch became empty after update (iter={self._get_next_batch_log_counter})")
         else:
-            logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch is empty")
+            if should_log:
+                logger.info(f"[DECODE-PP{getattr(self,'pp_rank','?')}] get_next_batch_to_run: running_batch is empty (iter={self._get_next_batch_log_counter})")
+
+        self._last_running_batch_empty = self.running_batch.is_empty()
 
         # 🔧 CRITICAL: In Semi-PD+PP, ALL DECODE stages need to receive hidden states from previous stage
         # even when they have no running_batch. Return an IDLE batch to trigger NCCL recv.
