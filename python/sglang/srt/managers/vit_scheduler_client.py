@@ -18,10 +18,20 @@ from collections import deque
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, asdict
 from multiprocessing import shared_memory
+from io import BytesIO
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ✅ 尝试导入 posix_ipc (用于 SHM 模式)
+try:
+    import posix_ipc
+    import mmap
+    POSIX_IPC_AVAILABLE = True
+except ImportError:
+    POSIX_IPC_AVAILABLE = False
+    logger.warning("[VIT Client] posix_ipc not available, SHM mode will be disabled")
 
 
 @dataclass
@@ -161,8 +171,19 @@ class VITSchedulerClient:
         except Exception as e:
             logger.error(f"[VIT Client] ❌ Test failed: {e}")
 
-        # 管理共享内存
-        self.shm_objects: Dict[str, shared_memory.SharedMemory] = {}
+        # ✅ 环境变量控制 SHM/IPC 模式
+        self.use_shm = os.environ.get("SGLANG_VIT_USE_SHM", "true").lower() == "true"
+
+        if self.use_shm and POSIX_IPC_AVAILABLE:
+            logger.info("[VIT Client] ✅ Using POSIX SHM mode for embedding transfer")
+            self.shm_objects = None  # SHM 模式不使用 multiprocessing.shared_memory
+        else:
+            if not self.use_shm:
+                logger.info("[VIT Client] ⚠️ Using CUDA IPC mode (legacy, SGLANG_VIT_USE_SHM=false)")
+            else:
+                logger.warning("[VIT Client] ⚠️ posix_ipc not available, falling back to CUDA IPC mode")
+            # 管理共享内存 (CUDA IPC 模式)
+            self.shm_objects: Dict[str, shared_memory.SharedMemory] = {}
 
         # 异步请求管理
         self.pending_requests: Dict[str, Dict] = {}  # request_id -> request_info
@@ -232,10 +253,68 @@ class VITSchedulerClient:
 
     def _cleanup_shm(self, shm_name: str):
         """清理共享内存"""
-        if shm_name in self.shm_objects:
+        if self.shm_objects and shm_name in self.shm_objects:
             shm = self.shm_objects.pop(shm_name)
             shm.close()
             shm.unlink()
+
+    def _read_embedding_from_shm(
+        self,
+        request_id: str,
+        shape: Tuple[int, ...],
+        dtype_str: str
+    ) -> Optional[torch.Tensor]:
+        """从 POSIX 共享内存读取 embedding
+
+        Args:
+            request_id: 请求 ID
+            shape: Tensor shape
+            dtype_str: Tensor dtype (如 "float16")
+
+        Returns:
+            Tensor 或 None (如果失败)
+        """
+        if not POSIX_IPC_AVAILABLE:
+            logger.error("[VIT Client] posix_ipc not available")
+            return None
+
+        shm_name_embed = f"vit_embed_{request_id}"
+        shm_name_meta = f"vit_embed_meta_{request_id}"
+
+        try:
+            # 读取 metadata
+            shm_meta = posix_ipc.SharedMemory(shm_name_meta, flags=0)
+            mapfile_meta = mmap.mmap(shm_meta.fd, shm_meta.size)
+            shm_meta.close_fd()
+
+            meta_bytes = mapfile_meta.read(shm_meta.size)
+            mapfile_meta.close()
+
+            import json
+            meta = json.loads(meta_bytes.decode('utf-8'))
+
+            # 读取 embedding bytes
+            shm_embed = posix_ipc.SharedMemory(shm_name_embed, flags=0)
+            mapfile_embed = mmap.mmap(shm_embed.fd, shm_embed.size)
+            shm_embed.close_fd()
+
+            embed_bytes = mapfile_embed.read(shm_embed.size)
+            mapfile_embed.close()
+
+            # 反序列化 tensor
+            buf = BytesIO(embed_bytes)
+            tensor = torch.load(buf, map_location='cpu')
+
+            logger.info(
+                f"[VIT Client] ✅ Read embedding from SHM: {request_id}, "
+                f"shape={tensor.shape}, dtype={tensor.dtype}"
+            )
+
+            return tensor
+
+        except Exception as e:
+            logger.error(f"[VIT Client] ❌ Failed to read SHM: {request_id}: {e}", exc_info=True)
+            return None
 
     def submit_async(
         self,
@@ -535,51 +614,71 @@ class VITSchedulerClient:
                     resp_dict = pickle.loads(msg)
                     resp = VITResponse(**resp_dict)
 
-                    # 🔧 CUDA IPC: 从 IPC handle 重建 embedding
+                    # ✅ 根据模式选择不同的处理方式
                     try:
-                        from functools import reduce
-                        from sglang.semi_pd.utils import convert_ipc_handle_to_tensor
+                        if self.use_shm and resp.embedding_device == "cpu":
+                            # ✅ SHM 模式: 从 POSIX 共享内存读取
+                            logger.info(f"[VIT Client] 📖 Reading embedding from SHM: {resp.request_id}")
 
-                        ipc_handle, offset = resp.embedding_ipc_handle
-                        shape = resp.embedding_shape
-                        dtype_str = resp.embedding_dtype
-                        device_str = resp.embedding_device
+                            # 读取 embedding
+                            emb = self._read_embedding_from_shm(
+                                resp.request_id,
+                                resp.embedding_shape,
+                                resp.embedding_dtype
+                            )
 
-                        # 转换 dtype
-                        dtype = getattr(torch, dtype_str)
+                            if emb is None:
+                                logger.error(f"[VIT Client] ❌ Failed to read SHM: {resp.request_id}")
+                                continue
 
-                        # 🔧 关键: 使用 PP0 的设备 (GPU 0)
-                        # VIT Scheduler 和 PP0 都在 GPU 0 上，同一张卡，无需跨 GPU 访问
-                        device = torch.device("cuda:0")  # PP0 在 GPU 0
+                            logger.info(
+                                f"[VIT Client] ✅ Read embedding from SHM: "
+                                f"shape={emb.shape}, device={emb.device}"
+                            )
+                        else:
+                            # ❌ CUDA IPC 模式
+                            from functools import reduce
+                            from sglang.semi_pd.utils import convert_ipc_handle_to_tensor
 
-                        # 计算 size
-                        size = reduce(lambda x, y: x * y, shape)
+                            ipc_handle, offset = resp.embedding_ipc_handle
+                            shape = resp.embedding_shape
+                            dtype_str = resp.embedding_dtype
+                            device_str = resp.embedding_device
 
-                        logger.info(
-                            f"[VIT Client] 🔗 Opening CUDA IPC handle: "
-                            f"request_id={resp.request_id}, shape={shape}, dtype={dtype_str}, "
-                            f"device={device}, offset={offset}"
-                        )
+                            # 转换 dtype
+                            dtype = getattr(torch, dtype_str)
 
-                        # 从 IPC handle 重建 tensor
-                        emb = convert_ipc_handle_to_tensor(
-                            (ipc_handle, offset),
-                            size,
-                            dtype,
-                            device
-                        )
+                            # 🔧 关键: 使用 PP0 的设备 (GPU 0)
+                            device = torch.device("cuda:0")  # PP0 在 GPU 0
 
-                        # Reshape
-                        emb = emb.view(shape)
+                            # 计算 size
+                            size = reduce(lambda x, y: x * y, shape)
 
-                        logger.info(
-                            f"[VIT Client] ✅ Opened CUDA IPC handle: "
-                            f"shape={emb.shape}, device={emb.device}"
-                        )
+                            logger.info(
+                                f"[VIT Client] 🔗 Opening CUDA IPC handle: "
+                                f"request_id={resp.request_id}, shape={shape}, dtype={dtype_str}, "
+                                f"device={device}, offset={offset}"
+                            )
+
+                            # 从 IPC handle 重建 tensor
+                            emb = convert_ipc_handle_to_tensor(
+                                (ipc_handle, offset),
+                                size,
+                                dtype,
+                                device
+                            )
+
+                            # Reshape
+                            emb = emb.view(shape)
+
+                            logger.info(
+                                f"[VIT Client] ✅ Opened CUDA IPC handle: "
+                                f"shape={emb.shape}, device={emb.device}"
+                            )
 
                     except Exception as e:
                         logger.error(
-                            f"[VIT Client] ❌ Failed to open CUDA IPC handle for "
+                            f"[VIT Client] ❌ Failed to load embedding for "
                             f"{resp.request_id}: {e}",
                             exc_info=True
                         )

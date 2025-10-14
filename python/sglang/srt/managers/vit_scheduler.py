@@ -6,6 +6,13 @@ VIT Scheduler - 独立的 ViT 计算调度器
 - 通过 ZMQ 接收来自主 Scheduler 的请求
 - 通过共享内存传递 pixel_values 和 embedding
 - 支持批量计算和缓存优化
+
+改进方案 (借鉴 LightLLM):
+- 使用 POSIX 共享内存传递 embedding (替代 CUDA IPC)
+- VIT forward 后立即移到 CPU，释放 GPU 显存
+- 移除显存池预分配，依赖 PyTorch 动态管理
+- 双循环架构 (IO Loop + Compute Loop)
+- 动态 batch_size 调整
 """
 
 import os
@@ -14,17 +21,679 @@ import zmq
 import pickle
 import logging
 import hashlib
+import json
+import mmap
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, asdict, field
 from queue import Queue, Empty
 import threading
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from io import BytesIO
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import numpy as np
+
+# 尝试导入 posix_ipc (用于 POSIX 共享内存)
+try:
+    import posix_ipc
+    POSIX_IPC_AVAILABLE = True
+except ImportError:
+    POSIX_IPC_AVAILABLE = False
+    print("Warning: posix_ipc not available, SHM mode will be disabled")
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# SharedMemoryHelper - POSIX 共享内存工具类 (借鉴 LightLLM)
+# ============================================================================
+
+class SharedMemoryHelper:
+    """POSIX 共享内存工具类 (借鉴 LightLLM embed_cache/utils.py)
+
+    功能:
+    1. tensor 与 bytes 的转换
+    2. 写入/读取 POSIX 共享内存
+    3. 清理共享内存
+    4. 支持 float16/bfloat16/float32
+
+    设计参考:
+    - LightLLM/lightllm/server/embed_cache/utils.py
+    """
+
+    @staticmethod
+    def get_shm_name_embed(request_id: str, prefix: str = "vit_embed") -> str:
+        """生成 embedding 共享内存名称"""
+        return f"/{prefix}_{request_id}"
+
+    @staticmethod
+    def get_shm_name_meta(request_id: str, prefix: str = "vit_meta") -> str:
+        """生成 metadata 共享内存名称"""
+        return f"/{prefix}_{request_id}"
+
+    @staticmethod
+    def tensor2bytes(tensor: torch.Tensor) -> bytes:
+        """将 tensor 转换为 bytes (借鉴 LightLLM)
+
+        Args:
+            tensor: 输入 tensor (可以在 GPU 或 CPU)
+
+        Returns:
+            bytes: 序列化后的 bytes
+
+        Notes:
+            - 使用 torch.save 序列化，支持所有 dtype
+            - 自动移到 CPU
+            - 创建新 tensor 避免保存大 tensor 的所有数据
+        """
+        buf = BytesIO()
+        t = tensor.detach().cpu()
+
+        # 创建新 tensor 并复制，避免保存大 tensor 的所有数据
+        # (参考 LightLLM 的注释)
+        dest = torch.empty_like(t)
+        dest.copy_(t)
+
+        torch.save(dest, buf, _use_new_zipfile_serialization=False, pickle_protocol=4)
+        buf.seek(0)
+        return buf.read()
+
+    @staticmethod
+    def bytes2tensor(data: bytes) -> torch.Tensor:
+        """将 bytes 转换为 tensor (借鉴 LightLLM)
+
+        Args:
+            data: 序列化的 bytes
+
+        Returns:
+            torch.Tensor: CPU tensor
+        """
+        return torch.load(BytesIO(data), weights_only=False)
+
+    @staticmethod
+    def write_to_shm(request_id: str, embedding: torch.Tensor, prefix: str = "vit_embed") -> bool:
+        """将 embedding 写入 POSIX 共享内存
+
+        Args:
+            request_id: 请求 ID
+            embedding: CPU tensor (必须已经移到 CPU)
+            prefix: SHM 名称前缀
+
+        Returns:
+            bool: 是否成功
+        """
+        if not POSIX_IPC_AVAILABLE:
+            logger.error("[SharedMemoryHelper] posix_ipc not available")
+            return False
+
+        if embedding.is_cuda:
+            logger.error("[SharedMemoryHelper] Embedding must be on CPU before writing to SHM")
+            return False
+
+        shm_name_embed = SharedMemoryHelper.get_shm_name_embed(request_id, prefix)
+        shm_name_meta = SharedMemoryHelper.get_shm_name_meta(request_id, prefix)
+
+        try:
+            # 转换为 bytes
+            embed_bytes = SharedMemoryHelper.tensor2bytes(embedding)
+
+            # 写入 metadata (shape + dtype)
+            meta_dict = {
+                "shape": list(embedding.shape),
+                "dtype": str(embedding.dtype),
+                "size_bytes": len(embed_bytes),
+            }
+            meta_bytes = json.dumps(meta_dict).encode("utf-8")
+
+            # 创建 embedding 共享内存
+            shm_embed = posix_ipc.SharedMemory(
+                shm_name_embed,
+                flags=posix_ipc.O_CREAT,
+                size=len(embed_bytes)
+            )
+            mapfile_embed = mmap.mmap(shm_embed.fd, shm_embed.size)
+            mapfile_embed.write(embed_bytes)
+            mapfile_embed.close()
+            shm_embed.close_fd()
+
+            # 创建 metadata 共享内存
+            shm_meta = posix_ipc.SharedMemory(
+                shm_name_meta,
+                flags=posix_ipc.O_CREAT,
+                size=len(meta_bytes)
+            )
+            mapfile_meta = mmap.mmap(shm_meta.fd, shm_meta.size)
+            mapfile_meta.write(meta_bytes)
+            mapfile_meta.close()
+            shm_meta.close_fd()
+
+            logger.debug(
+                f"[SharedMemoryHelper] ✅ Embedding written to SHM: {shm_name_embed}, "
+                f"size={len(embed_bytes) / (1024**2):.2f} MB"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[SharedMemoryHelper] ❌ Failed to write to SHM: {e}", exc_info=True)
+            return False
+
+    @staticmethod
+    def read_from_shm(request_id: str, prefix: str = "vit_embed") -> Optional[torch.Tensor]:
+        """从 POSIX 共享内存读取 embedding
+
+        Args:
+            request_id: 请求 ID
+            prefix: SHM 名称前缀
+
+        Returns:
+            torch.Tensor: CPU tensor，如果不存在返回 None
+        """
+        if not POSIX_IPC_AVAILABLE:
+            logger.error("[SharedMemoryHelper] posix_ipc not available")
+            return None
+
+        shm_name_embed = SharedMemoryHelper.get_shm_name_embed(request_id, prefix)
+        shm_name_meta = SharedMemoryHelper.get_shm_name_meta(request_id, prefix)
+
+        try:
+            # 读取 metadata
+            shm_meta = posix_ipc.SharedMemory(shm_name_meta)
+            mapfile_meta = mmap.mmap(shm_meta.fd, shm_meta.size)
+            meta_bytes = mapfile_meta.read()
+            mapfile_meta.close()
+            shm_meta.close_fd()
+
+            meta_dict = json.loads(meta_bytes.decode("utf-8"))
+
+            # 读取 embedding
+            shm_embed = posix_ipc.SharedMemory(shm_name_embed)
+            mapfile_embed = mmap.mmap(shm_embed.fd, shm_embed.size)
+            embed_bytes = mapfile_embed.read()
+            mapfile_embed.close()
+            shm_embed.close_fd()
+
+            # 转换为 tensor
+            embedding = SharedMemoryHelper.bytes2tensor(embed_bytes)
+
+            logger.debug(
+                f"[SharedMemoryHelper] ✅ Embedding read from SHM: {shm_name_embed}, "
+                f"shape={meta_dict['shape']}"
+            )
+            return embedding
+
+        except posix_ipc.ExistentialError:
+            logger.error(f"[SharedMemoryHelper] ❌ Shared memory not found: {shm_name_embed}")
+            return None
+        except Exception as e:
+            logger.error(f"[SharedMemoryHelper] ❌ Failed to read from SHM: {e}", exc_info=True)
+            return None
+
+    @staticmethod
+    def cleanup_shm(request_id: str, prefix: str = "vit_embed") -> None:
+        """清理 POSIX 共享内存
+
+        Args:
+            request_id: 请求 ID
+            prefix: SHM 名称前缀
+        """
+        if not POSIX_IPC_AVAILABLE:
+            return
+
+        shm_name_embed = SharedMemoryHelper.get_shm_name_embed(request_id, prefix)
+        shm_name_meta = SharedMemoryHelper.get_shm_name_meta(request_id, prefix)
+
+        try:
+            posix_ipc.unlink_shared_memory(shm_name_embed)
+            posix_ipc.unlink_shared_memory(shm_name_meta)
+            logger.debug(f"[SharedMemoryHelper] ✅ Cleaned up SHM: {shm_name_embed}")
+        except posix_ipc.ExistentialError:
+            pass  # 已经被清理
+        except Exception as e:
+            logger.warning(f"[SharedMemoryHelper] ⚠️ Failed to cleanup SHM: {e}")
+
+
+# ============================================================================
+# SharedMemoryManager - 共享内存生命周期管理器 (借鉴 LightLLM)
+# ============================================================================
+
+@dataclass
+class SHMEntry:
+    """共享内存条目"""
+    request_id: str
+    shm_name_embed: str
+    shm_name_meta: str
+    size_bytes: int
+    ref_count: int
+    created_at: float
+    last_accessed: float
+
+
+class SharedMemoryManager:
+    """共享内存生命周期管理器 (借鉴 LightLLM cache server)
+
+    职责:
+    1. 管理 POSIX SHM 的创建、读取、删除
+    2. 引用计数，防止过早释放
+    3. 自动清理过期 SHM
+    4. 线程安全
+    5. LRU 驱逐策略
+
+    设计参考:
+    - LightLLM/lightllm/server/embed_cache/manager.py
+    - LightLLM/lightllm/server/embed_cache/impl/naive_memory_cache.py
+    """
+
+    def __init__(
+        self,
+        max_shm_size_gb: float = 20.0,
+        cleanup_interval_sec: float = 60.0,
+        expired_timeout_sec: float = 300.0,
+        prefix: str = "vit_embed"
+    ):
+        """初始化共享内存管理器
+
+        Args:
+            max_shm_size_gb: 最大 SHM 容量 (GB)
+            cleanup_interval_sec: 清理线程间隔 (秒)
+            expired_timeout_sec: 过期超时时间 (秒)
+            prefix: SHM 名称前缀
+        """
+        self.max_shm_size_bytes = int(max_shm_size_gb * 1024 ** 3)
+        self.cleanup_interval_sec = cleanup_interval_sec
+        self.expired_timeout_sec = expired_timeout_sec
+        self.prefix = prefix
+
+        self.shm_registry: Dict[str, SHMEntry] = {}  # request_id -> SHMEntry
+        self.lock = threading.Lock()
+        self.cleanup_thread = None
+        self.cleanup_stop_event = threading.Event()
+
+        # 启动清理线程
+        self._start_cleanup_thread()
+
+        logger.info(
+            f"[SharedMemoryManager] Initialized: max_size={max_shm_size_gb:.2f} GB, "
+            f"cleanup_interval={cleanup_interval_sec}s, expired_timeout={expired_timeout_sec}s"
+        )
+
+    def _start_cleanup_thread(self):
+        """启动清理线程"""
+        if not POSIX_IPC_AVAILABLE:
+            return
+
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleanup_thread.start()
+        logger.info("[SharedMemoryManager] Cleanup thread started")
+
+    def _cleanup_loop(self):
+        """清理过期 SHM (后台线程)"""
+        while not self.cleanup_stop_event.wait(self.cleanup_interval_sec):
+            try:
+                with self.lock:
+                    now = time.time()
+                    expired = []
+
+                    for request_id, entry in self.shm_registry.items():
+                        # 超过过期时间未访问，强制清理
+                        if now - entry.last_accessed > self.expired_timeout_sec:
+                            expired.append(request_id)
+
+                    for request_id in expired:
+                        entry = self.shm_registry[request_id]
+                        self._delete_shm(entry)
+                        del self.shm_registry[request_id]
+                        logger.warning(
+                            f"[SharedMemoryManager] ⚠️ SHM expired and cleaned: {request_id}, "
+                            f"idle_time={(now - entry.last_accessed):.1f}s"
+                        )
+
+                    if expired:
+                        logger.info(
+                            f"[SharedMemoryManager] Cleanup completed: {len(expired)} expired entries, "
+                            f"total_size={self._get_total_size() / (1024**3):.2f} GB"
+                        )
+            except Exception as e:
+                logger.error(f"[SharedMemoryManager] ❌ Error in cleanup loop: {e}", exc_info=True)
+
+    def write_embedding(self, request_id: str, embedding: torch.Tensor) -> bool:
+        """写入 embedding 到共享内存
+
+        Args:
+            request_id: 请求 ID
+            embedding: CPU tensor (必须已经移到 CPU)
+
+        Returns:
+            bool: 是否成功
+        """
+        if not POSIX_IPC_AVAILABLE:
+            return False
+
+        if embedding.is_cuda:
+            logger.error("[SharedMemoryManager] Embedding must be on CPU before writing to SHM")
+            return False
+
+        with self.lock:
+            # 检查容量
+            embedding_size = embedding.numel() * embedding.element_size()
+            if self._get_total_size() + embedding_size > self.max_shm_size_bytes:
+                logger.warning(
+                    f"[SharedMemoryManager] SHM capacity exceeded, evicting old entries... "
+                    f"(current={self._get_total_size() / (1024**3):.2f} GB, "
+                    f"max={self.max_shm_size_bytes / (1024**3):.2f} GB)"
+                )
+                if not self._evict_lru(embedding_size):
+                    logger.error("[SharedMemoryManager] ❌ Failed to evict enough space")
+                    return False
+
+            # 写入 SHM
+            success = SharedMemoryHelper.write_to_shm(request_id, embedding, self.prefix)
+            if not success:
+                return False
+
+            # 注册到 registry
+            shm_name_embed = SharedMemoryHelper.get_shm_name_embed(request_id, self.prefix)
+            shm_name_meta = SharedMemoryHelper.get_shm_name_meta(request_id, self.prefix)
+
+            self.shm_registry[request_id] = SHMEntry(
+                request_id=request_id,
+                shm_name_embed=shm_name_embed,
+                shm_name_meta=shm_name_meta,
+                size_bytes=embedding_size,
+                ref_count=1,
+                created_at=time.time(),
+                last_accessed=time.time(),
+            )
+
+            logger.debug(
+                f"[SharedMemoryManager] ✅ SHM written: {request_id}, "
+                f"size={embedding_size / (1024**2):.2f} MB, "
+                f"total={self._get_total_size() / (1024**3):.2f} GB"
+            )
+            return True
+
+    def read_embedding(self, request_id: str) -> Optional[torch.Tensor]:
+        """从共享内存读取 embedding
+
+        Args:
+            request_id: 请求 ID
+
+        Returns:
+            torch.Tensor: CPU tensor，如果不存在返回 None
+        """
+        if not POSIX_IPC_AVAILABLE:
+            return None
+
+        with self.lock:
+            if request_id not in self.shm_registry:
+                logger.warning(f"[SharedMemoryManager] ⚠️ SHM not found in registry: {request_id}")
+                return None
+
+            entry = self.shm_registry[request_id]
+            entry.last_accessed = time.time()
+            entry.ref_count += 1
+
+        # 读取 SHM (不持有锁，避免阻塞)
+        embedding = SharedMemoryHelper.read_from_shm(request_id, self.prefix)
+
+        if embedding is not None:
+            logger.debug(f"[SharedMemoryManager] ✅ SHM read: {request_id}, ref_count={entry.ref_count}")
+
+        return embedding
+
+    def release(self, request_id: str) -> None:
+        """释放引用计数
+
+        Args:
+            request_id: 请求 ID
+        """
+        if not POSIX_IPC_AVAILABLE:
+            return
+
+        with self.lock:
+            if request_id not in self.shm_registry:
+                return
+
+            entry = self.shm_registry[request_id]
+            entry.ref_count -= 1
+
+            # 引用计数归零，删除 SHM
+            if entry.ref_count <= 0:
+                self._delete_shm(entry)
+                del self.shm_registry[request_id]
+                logger.debug(f"[SharedMemoryManager] ✅ SHM released: {request_id}")
+
+    def _delete_shm(self, entry: SHMEntry):
+        """删除共享内存 (内部方法，需要持有锁)"""
+        try:
+            posix_ipc.unlink_shared_memory(entry.shm_name_embed)
+            posix_ipc.unlink_shared_memory(entry.shm_name_meta)
+        except posix_ipc.ExistentialError:
+            pass  # 已经被删除
+        except Exception as e:
+            logger.warning(f"[SharedMemoryManager] ⚠️ Failed to delete SHM: {e}")
+
+    def _evict_lru(self, required_bytes: int) -> bool:
+        """LRU 驱逐 (内部方法，需要持有锁)
+
+        Args:
+            required_bytes: 需要释放的字节数
+
+        Returns:
+            bool: 是否成功释放足够空间
+        """
+        if not self.shm_registry:
+            return False
+
+        # 按 last_accessed 排序
+        sorted_entries = sorted(
+            self.shm_registry.items(),
+            key=lambda x: x[1].last_accessed
+        )
+
+        # 驱逐最旧的条目，直到释放足够空间
+        evicted_bytes = 0
+        evicted_count = 0
+        for request_id, entry in sorted_entries:
+            if evicted_bytes >= required_bytes:
+                break
+
+            self._delete_shm(entry)
+            del self.shm_registry[request_id]
+            evicted_bytes += entry.size_bytes
+            evicted_count += 1
+            logger.info(
+                f"[SharedMemoryManager] 📤 SHM evicted (LRU): {request_id}, "
+                f"size={entry.size_bytes / (1024**2):.2f} MB"
+            )
+
+        logger.info(
+            f"[SharedMemoryManager] ✅ LRU eviction completed: {evicted_count} entries, "
+            f"freed={evicted_bytes / (1024**2):.2f} MB"
+        )
+
+        return evicted_bytes >= required_bytes
+
+    def _get_total_size(self) -> int:
+        """获取总大小 (内部方法，需要持有锁)"""
+        return sum(entry.size_bytes for entry in self.shm_registry.values())
+
+    def shutdown(self):
+        """关闭管理器，清理所有 SHM"""
+        if not POSIX_IPC_AVAILABLE:
+            return
+
+        # 停止清理线程
+        if self.cleanup_thread:
+            self.cleanup_stop_event.set()
+            self.cleanup_thread.join(timeout=5.0)
+
+        # 清理所有 SHM
+        with self.lock:
+            for request_id, entry in list(self.shm_registry.items()):
+                self._delete_shm(entry)
+            self.shm_registry.clear()
+
+        logger.info("[SharedMemoryManager] Shutdown completed, all SHM cleaned")
+
+
+# ============================================================================
+# DynamicMemoryEstimator - 动态显存估算器
+# ============================================================================
+
+@dataclass
+class MemorySnapshot:
+    """显存快照"""
+    timestamp: float
+    batch_size: int
+    allocated: int
+    reserved: int
+    success: bool
+
+
+class DynamicMemoryEstimator:
+    """动态显存估算器 (借鉴 LightLLM _check_max_len_infer)
+
+    职责:
+    1. 实时监控 GPU 可用显存
+    2. 估算单个请求的显存需求
+    3. 动态调整 batch_size
+    4. 预留安全余量
+    5. 基于历史数据优化估算倍数
+
+    设计参考:
+    - LightLLM 的显存估算逻辑
+    """
+
+    def __init__(
+        self,
+        device: str,
+        safety_margin_gb: float = 0.5,  # 预留 512 MB 安全余量
+        overhead_ratio: float = 4.0,    # 显存开销倍数
+        max_history_size: int = 100,
+    ):
+        """初始化显存估算器
+
+        Args:
+            device: GPU 设备
+            safety_margin_gb: 安全余量 (GB)
+            overhead_ratio: 显存开销倍数 (forward 时的临时显存)
+            max_history_size: 最大历史记录数
+        """
+        self.device = torch.device(device)
+        self.safety_margin_bytes = int(safety_margin_gb * 1024 ** 3)
+        self.overhead_ratio = overhead_ratio
+        self.max_history_size = max_history_size
+
+        # 历史统计
+        self.history: List[MemorySnapshot] = []
+
+        logger.info(
+            f"[DynamicMemoryEstimator] Initialized: device={device}, "
+            f"safety_margin={safety_margin_gb:.2f} GB, overhead_ratio={overhead_ratio:.2f}"
+        )
+
+    def get_available_memory(self) -> int:
+        """获取可用显存 (bytes)"""
+        torch.cuda.synchronize(self.device)
+
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        allocated = torch.cuda.memory_allocated(self.device)
+
+        # 可用 = 总量 - 已分配 - 安全余量
+        available = total - allocated - self.safety_margin_bytes
+
+        return max(0, available)
+
+    def estimate_request_memory(self, pixel_values: torch.Tensor) -> int:
+        """估算单个请求的显存需求 (bytes)
+
+        Args:
+            pixel_values: 输入 tensor
+
+        Returns:
+            int: 估算的显存需求 (bytes)
+        """
+        # 输入大小
+        input_bytes = pixel_values.numel() * pixel_values.element_size()
+
+        # 估算总需求 = 输入 * 开销倍数
+        estimated_bytes = int(input_bytes * self.overhead_ratio)
+
+        return estimated_bytes
+
+    def get_max_batch_size(self, pixel_values_list: List[torch.Tensor]) -> int:
+        """获取最大 batch_size
+
+        Args:
+            pixel_values_list: 待处理的请求列表
+
+        Returns:
+            int: 最大 batch_size
+        """
+        available = self.get_available_memory()
+
+        # 估算单个请求的平均显存需求
+        if not pixel_values_list:
+            return 0
+
+        avg_request_memory = sum(
+            self.estimate_request_memory(pv) for pv in pixel_values_list
+        ) / len(pixel_values_list)
+
+        # 计算最大 batch_size
+        max_batch_size = int(available / avg_request_memory)
+
+        # 限制在 [1, len(pixel_values_list)]
+        max_batch_size = max(1, min(max_batch_size, len(pixel_values_list)))
+
+        logger.debug(
+            f"[DynamicMemoryEstimator] available={available / 1024**3:.2f} GB, "
+            f"avg_request={avg_request_memory / 1024**3:.2f} GB, "
+            f"max_batch_size={max_batch_size}"
+        )
+
+        return max_batch_size
+
+    def record_snapshot(self, batch_size: int, success: bool):
+        """记录显存快照 (用于优化估算)
+
+        Args:
+            batch_size: 批次大小
+            success: 是否成功
+        """
+        snapshot = MemorySnapshot(
+            timestamp=time.time(),
+            batch_size=batch_size,
+            allocated=torch.cuda.memory_allocated(self.device),
+            reserved=torch.cuda.memory_reserved(self.device),
+            success=success,
+        )
+
+        self.history.append(snapshot)
+
+        # 限制历史大小
+        if len(self.history) > self.max_history_size:
+            self.history.pop(0)
+
+    def optimize_overhead_ratio(self):
+        """优化开销倍数 (基于历史数据)"""
+        if len(self.history) < 10:
+            return
+
+        # 统计成功和失败的 batch
+        success_batches = [s for s in self.history if s.success]
+        failed_batches = [s for s in self.history if not s.success]
+
+        if failed_batches:
+            # 如果有失败，增大开销倍数
+            self.overhead_ratio *= 1.1
+            logger.info(f"[DynamicMemoryEstimator] 📈 Overhead ratio increased to {self.overhead_ratio:.2f}")
+        elif len(success_batches) > 50:
+            # 如果连续成功，减小开销倍数
+            self.overhead_ratio *= 0.95
+            logger.info(f"[DynamicMemoryEstimator] 📉 Overhead ratio decreased to {self.overhead_ratio:.2f}")
 
 
 @dataclass
@@ -288,6 +957,13 @@ class VITModelRunner:
                     logger.error(f"[VIT Runner] ❌ Output embedding contains Inf!")
                 logger.info(f"[VIT Runner] 📊 Output embedding: shape={embedding.shape}, dtype={embedding.dtype}, min={embedding.min().item() if not torch.isnan(embedding).any() else 'nan'}, max={embedding.max().item() if not torch.isnan(embedding).any() else 'nan'}")
 
+                # ✅ 立即移到 CPU，释放 GPU 显存 (借鉴 LightLLM)
+                use_shm = os.environ.get("SGLANG_VIT_USE_SHM", "true").lower() == "true"
+                if use_shm:
+                    embedding = embedding.to("cpu")
+                    torch.cuda.synchronize(self.device)
+                    logger.info(f"[VIT Runner] ✅ Embedding moved to CPU, GPU memory released (SHM mode)")
+
                 return embedding
 
         except Exception as e:
@@ -356,6 +1032,14 @@ class VITModelRunner:
                 if self.tp_size > 1:
                     logger.info(f"[VIT Runner] 🔄 TP mode: embedding already all-reduced by RowParallelLinear")
 
+                # ✅ 立即移到 CPU，释放 GPU 显存 (借鉴 LightLLM)
+                # 检查是否启用 SHM 模式
+                use_shm = os.environ.get("SGLANG_VIT_USE_SHM", "true").lower() == "true"
+                if use_shm:
+                    batched_embedding = batched_embedding.to("cpu")
+                    torch.cuda.synchronize(self.device)
+                    logger.info(f"[VIT Runner] ✅ Batched embedding moved to CPU, GPU memory released (SHM mode)")
+
                 # 🔧 拆分 embedding 回各个请求
                 # batched_embedding 的 shape: (total_num_images, seq_len, hidden_size)
                 # 我们需要根据每个请求的 num_images 拆分
@@ -371,7 +1055,7 @@ class VITModelRunner:
                     start_idx = end_idx
                     logger.info(f"[VIT Runner] 📦 Request {i}: embedding.shape={embedding.shape}")
 
-                logger.info(f"[VIT Runner] ✅ Batch compute completed: {batch_size} embeddings")
+                logger.info(f"[VIT Runner] ✅ Batch compute completed: {batch_size} embeddings (on {'CPU' if use_shm else 'GPU'})")
                 return embeddings
 
         except Exception as e:
@@ -876,43 +1560,78 @@ class VITScheduler:
         self._last_gpu_memory_check = time.time()
         self._gpu_memory_check_interval = 1.0  # GPU 显存检查间隔（秒）
 
-        # ✅✅✅ 核心重构: 使用 EmbeddingPagePool 代替 EmbeddingMemoryManager
-        # 参考: sglang/docs/vit_scheduler_decoupling_plan.md 第 6.2 节
+        # ✅ 新增: 环境变量控制 SHM/IPC 模式
+        self.use_shm = os.environ.get("SGLANG_VIT_USE_SHM", "true").lower() == "true"
 
-        # 从环境变量读取显存池大小，默认 10.0 GB
-        vit_memory_pool_gb = float(os.environ.get("SGLANG_VIT_MEMORY_POOL_GB", "10.0"))
+        if self.use_shm and POSIX_IPC_AVAILABLE:
+            # ✅ SHM 模式: 使用 SharedMemoryManager 和 DynamicMemoryEstimator
+            logger.info(f"[VIT Scheduler] ✅ Using POSIX SHM mode (LightLLM-inspired)")
+            logger.info(f"[VIT Scheduler] ✅ No memory pool pre-allocation, GPU memory will be released after forward")
 
-        # 从环境变量读取页面大小，默认 100 MB（约为单张图片 embedding 的大小）
-        # 页面大小 = seq_len * hidden_dim * dtype_size
-        # 例如: Qwen2.5-VL 的 embedding 约为 (25920, 3584) * 2 bytes ≈ 186 MB
-        # 保守估计使用 100 MB
-        vit_page_size_mb = float(os.environ.get("SGLANG_VIT_PAGE_SIZE_MB", "100.0"))
+            # 初始化 SharedMemoryManager
+            max_shm_size_gb = float(os.environ.get("SGLANG_VIT_SHM_SIZE_GB", "20.0"))
+            self.shm_manager = SharedMemoryManager(
+                max_shm_size_gb=max_shm_size_gb,
+                cleanup_interval_sec=60.0,
+                expired_timeout_sec=300.0,
+                prefix="vit_embed"
+            )
 
-        # 从环境变量读取每个请求需要的页面数，默认 2 页/请求（2 * 100 MB = 200 MB）
-        self._pages_per_request = int(os.environ.get("SGLANG_VIT_PAGES_PER_REQUEST", "2"))
+            # 初始化 DynamicMemoryEstimator
+            safety_margin_gb = float(os.environ.get("SGLANG_VIT_SAFETY_MARGIN_GB", "0.5"))
+            overhead_ratio = float(os.environ.get("SGLANG_VIT_OVERHEAD_RATIO", "4.0"))
+            self.memory_estimator = DynamicMemoryEstimator(
+                device=str(self.device),
+                safety_margin_gb=safety_margin_gb,
+                overhead_ratio=overhead_ratio,
+            )
 
-        # 从环境变量读取最大并发请求数（用于流量控制）
-        self._max_inflight = int(os.environ.get("SGLANG_VIT_MAX_INFLIGHT", "4"))
+            # 不使用显存池
+            self.embedding_page_pool = None
+            self.memory_manager = None
 
-        logger.info(f"[VIT Scheduler] 🔧 Initializing Embedding Page Pool:")
-        logger.info(f"[VIT Scheduler]   - Pool size: {vit_memory_pool_gb:.2f} GB")
-        logger.info(f"[VIT Scheduler]   - Page size: {vit_page_size_mb:.2f} MB")
-        logger.info(f"[VIT Scheduler]   - Pages per request: {self._pages_per_request}")
-        logger.info(f"[VIT Scheduler]   - Max inflight requests: {self._max_inflight}")
+            logger.info(f"[VIT Scheduler] SharedMemoryManager initialized: max_size={max_shm_size_gb:.2f} GB")
+            logger.info(f"[VIT Scheduler] DynamicMemoryEstimator initialized: safety_margin={safety_margin_gb:.2f} GB, overhead_ratio={overhead_ratio:.2f}")
+        else:
+            # ❌ CUDA IPC 模式 (向后兼容)
+            if not self.use_shm:
+                logger.info(f"[VIT Scheduler] ⚠️ Using CUDA IPC mode (legacy, SGLANG_VIT_USE_SHM=false)")
+            else:
+                logger.warning(f"[VIT Scheduler] ⚠️ posix_ipc not available, falling back to CUDA IPC mode")
 
-        self.embedding_page_pool = EmbeddingPagePool(
-            pool_size_gb=vit_memory_pool_gb,
-            page_size_mb=vit_page_size_mb,
-            device=self.device
-        )
+            # 从环境变量读取显存池大小，默认 10.0 GB
+            vit_memory_pool_gb = float(os.environ.get("SGLANG_VIT_MEMORY_POOL_GB", "10.0"))
 
-        # ✅✅✅ 核心重构: 创建基于 EmbeddingPagePool 的 EmbeddingMemoryManager
-        # 这样可以保持原有接口兼容性，同时获得显存预分配的优势
-        self.memory_manager = EmbeddingMemoryManager(
-            page_pool=self.embedding_page_pool,
-            pages_per_request=self._pages_per_request,
-            max_inflight=self._max_inflight
-        )
+            # 从环境变量读取页面大小，默认 100 MB（约为单张图片 embedding 的大小）
+            vit_page_size_mb = float(os.environ.get("SGLANG_VIT_PAGE_SIZE_MB", "100.0"))
+
+            # 从环境变量读取每个请求需要的页面数，默认 2 页/请求（2 * 100 MB = 200 MB）
+            self._pages_per_request = int(os.environ.get("SGLANG_VIT_PAGES_PER_REQUEST", "2"))
+
+            # 从环境变量读取最大并发请求数（用于流量控制）
+            self._max_inflight = int(os.environ.get("SGLANG_VIT_MAX_INFLIGHT", "4"))
+
+            logger.info(f"[VIT Scheduler] 🔧 Initializing Embedding Page Pool:")
+            logger.info(f"[VIT Scheduler]   - Pool size: {vit_memory_pool_gb:.2f} GB")
+            logger.info(f"[VIT Scheduler]   - Page size: {vit_page_size_mb:.2f} MB")
+            logger.info(f"[VIT Scheduler]   - Pages per request: {self._pages_per_request}")
+            logger.info(f"[VIT Scheduler]   - Max inflight requests: {self._max_inflight}")
+
+            self.embedding_page_pool = EmbeddingPagePool(
+                pool_size_gb=vit_memory_pool_gb,
+                page_size_mb=vit_page_size_mb,
+                device=self.device
+            )
+
+            self.memory_manager = EmbeddingMemoryManager(
+                page_pool=self.embedding_page_pool,
+                pages_per_request=self._pages_per_request,
+                max_inflight=self._max_inflight
+            )
+
+            # 不使用 SHM 管理器
+            self.shm_manager = None
+            self.memory_estimator = None
 
         logger.info(f"[VIT Scheduler] ✅ Memory manager initialized with page pool backend")
 
@@ -1322,33 +2041,72 @@ class VITScheduler:
                 )
                 self.total_compute_time += compute_time
 
-                from sglang.semi_pd.utils import get_ipc_handle
+                # ✅ 根据模式选择不同的处理方式
+                if self.use_shm and self.shm_manager:
+                    # ✅ SHM 模式: 写入共享内存
+                    logger.info(f"[VIT Scheduler] 📝 Writing {batch_size} embeddings to SHM...")
+                    for idx, (request, _pv, _grid, hash_val, _estimate) in enumerate(cache_misses):
+                        embedding = embeddings[idx]
+                        real_bytes = embedding.element_size() * embedding.nelement()
 
-                for idx, (request, _pv, _grid, hash_val, _estimate) in enumerate(cache_misses):
-                    embedding = embeddings[idx]
-                    real_bytes = embedding.element_size() * embedding.nelement()
-                    self.memory_manager.commit(request.request_id, real_bytes)
-                    self._update_cache(request, hash_val, embedding, real_bytes)
+                        # 写入 SHM
+                        success = self.shm_manager.write_embedding(request.request_id, embedding)
+                        if not success:
+                            logger.error(f"[VIT Scheduler] ❌ Failed to write SHM: {request.request_id}")
+                            continue
 
-                    ipc_handle, offset = get_ipc_handle(embedding)
-                    response = VITResponse(
-                        request_id=request.request_id,
-                        embedding_ipc_handle=(ipc_handle, offset),
-                        embedding_shape=tuple(embedding.shape),
-                        embedding_dtype=str(embedding.dtype).replace("torch.", ""),
-                        embedding_device=str(embedding.device),
-                        image_hash=hash_val,
-                        compute_time=compute_time / batch_size,
-                        from_cache=False,
-                        vit_compute_start_time=compute_start,
-                        vit_compute_end_time=compute_start + compute_time,
-                    )
-                    self._send_response(response)
-                    self._deferred_until.pop(request.request_id, None)
-                    self._defer_counter.pop(request.request_id, None)
-                    self._clear_request_tensors(request)
-                    with self._processing_lock:
-                        self._processing_requests.discard(request.request_id)
+                        # 更新缓存 (embedding 已经在 CPU)
+                        self._update_cache(request, hash_val, embedding, real_bytes)
+
+                        # 发送响应 (使用 SHM 模式标记)
+                        response = VITResponse(
+                            request_id=request.request_id,
+                            embedding_ipc_handle=([], 0),  # SHM 模式不使用 IPC handle
+                            embedding_shape=tuple(embedding.shape),
+                            embedding_dtype=str(embedding.dtype).replace("torch.", ""),
+                            embedding_device="cpu",  # SHM 模式 embedding 在 CPU
+                            image_hash=hash_val,
+                            compute_time=compute_time / batch_size,
+                            from_cache=False,
+                            vit_compute_start_time=compute_start,
+                            vit_compute_end_time=compute_start + compute_time,
+                        )
+                        self._send_response(response)
+                        self._deferred_until.pop(request.request_id, None)
+                        self._defer_counter.pop(request.request_id, None)
+                        self._clear_request_tensors(request)
+                        with self._processing_lock:
+                            self._processing_requests.discard(request.request_id)
+                    logger.info(f"[VIT Scheduler] ✅ SHM write completed for {batch_size} embeddings")
+                else:
+                    # ❌ CUDA IPC 模式 (向后兼容)
+                    from sglang.semi_pd.utils import get_ipc_handle
+
+                    for idx, (request, _pv, _grid, hash_val, _estimate) in enumerate(cache_misses):
+                        embedding = embeddings[idx]
+                        real_bytes = embedding.element_size() * embedding.nelement()
+                        self.memory_manager.commit(request.request_id, real_bytes)
+                        self._update_cache(request, hash_val, embedding, real_bytes)
+
+                        ipc_handle, offset = get_ipc_handle(embedding)
+                        response = VITResponse(
+                            request_id=request.request_id,
+                            embedding_ipc_handle=(ipc_handle, offset),
+                            embedding_shape=tuple(embedding.shape),
+                            embedding_dtype=str(embedding.dtype).replace("torch.", ""),
+                            embedding_device=str(embedding.device),
+                            image_hash=hash_val,
+                            compute_time=compute_time / batch_size,
+                            from_cache=False,
+                            vit_compute_start_time=compute_start,
+                            vit_compute_end_time=compute_start + compute_time,
+                        )
+                        self._send_response(response)
+                        self._deferred_until.pop(request.request_id, None)
+                        self._defer_counter.pop(request.request_id, None)
+                        self._clear_request_tensors(request)
+                        with self._processing_lock:
+                            self._processing_requests.discard(request.request_id)
 
                 self._consecutive_oom_count = 0
 
@@ -1417,13 +2175,17 @@ class VITScheduler:
         """单请求回退处理。"""
         logger.info(f"[VIT Scheduler] 🔄 Processing single request (fallback): {request.request_id}")
 
-        estimate_bytes = self._estimate_request_bytes(pixel_values)
-        reserved = self.memory_manager.try_reserve(request.request_id, estimate_bytes)
-        if not reserved:
-            logger.debug(
-                f"[VIT Scheduler] ⚠️ 预留显存失败，将在降级路径直接计算: request={request.request_id}, "
-                f"estimate={estimate_bytes / (1024**2):.1f} MB"
-            )
+        # ✅ SHM 模式不需要预留显存
+        if not self.use_shm and self.memory_manager:
+            estimate_bytes = self._estimate_request_bytes(pixel_values)
+            reserved = self.memory_manager.try_reserve(request.request_id, estimate_bytes)
+            if not reserved:
+                logger.debug(
+                    f"[VIT Scheduler] ⚠️ 预留显存失败，将在降级路径直接计算: request={request.request_id}, "
+                    f"estimate={estimate_bytes / (1024**2):.1f} MB"
+                )
+        else:
+            reserved = False
 
         if self.tp_size > 1:
             from sglang.srt.distributed.communication_op import broadcast_tensor_dict
@@ -1439,26 +2201,48 @@ class VITScheduler:
         embedding = embeddings[0]
         compute_time = time.time() - compute_start
 
-        if reserved:
+        # ✅ 根据模式选择不同的处理方式
+        if self.use_shm and self.shm_manager:
+            # ✅ SHM 模式
             real_bytes = embedding.element_size() * embedding.nelement()
-            self.memory_manager.commit(request.request_id, real_bytes)
+            success = self.shm_manager.write_embedding(request.request_id, embedding)
+            if not success:
+                logger.error(f"[VIT Scheduler] ❌ Failed to write SHM (fallback): {request.request_id}")
+
             self._update_cache(request, hash_val, embedding, real_bytes)
+
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_ipc_handle=([], 0),
+                embedding_shape=tuple(embedding.shape),
+                embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                embedding_device="cpu",
+                image_hash=hash_val,
+                compute_time=compute_time,
+                from_cache=False,
+            )
         else:
-            logger.debug(f"[VIT Scheduler] ⏭️ 跳过缓存降级请求: {request.request_id}")
+            # ❌ CUDA IPC 模式
+            if reserved:
+                real_bytes = embedding.element_size() * embedding.nelement()
+                self.memory_manager.commit(request.request_id, real_bytes)
+                self._update_cache(request, hash_val, embedding, real_bytes)
+            else:
+                logger.debug(f"[VIT Scheduler] ⏭️ 跳过缓存降级请求: {request.request_id}")
 
-        from sglang.semi_pd.utils import get_ipc_handle
-        ipc_handle, offset = get_ipc_handle(embedding)
+            from sglang.semi_pd.utils import get_ipc_handle
+            ipc_handle, offset = get_ipc_handle(embedding)
 
-        response = VITResponse(
-            request_id=request.request_id,
-            embedding_ipc_handle=(ipc_handle, offset),
-            embedding_shape=tuple(embedding.shape),
-            embedding_dtype=str(embedding.dtype).replace('torch.', ''),
-            embedding_device=str(embedding.device),
-            image_hash=hash_val,
-            compute_time=compute_time,
-            from_cache=False,
-        )
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_ipc_handle=(ipc_handle, offset),
+                embedding_shape=tuple(embedding.shape),
+                embedding_dtype=str(embedding.dtype).replace('torch.', ''),
+                embedding_device=str(embedding.device),
+                image_hash=hash_val,
+                compute_time=compute_time,
+                from_cache=False,
+            )
 
         self._send_response(response)
 
@@ -1471,26 +2255,45 @@ class VITScheduler:
         )
     def _send_cached_response(self, request: VITRequest, cached_embedding: torch.Tensor, hash_val: int):
         """发送缓存的响应"""
-        # 创建 CUDA IPC handle
-        from sglang.semi_pd.utils import get_ipc_handle
-        ipc_handle, offset = get_ipc_handle(cached_embedding)
-
         # 🔧 缓存命中: 记录时间
         cache_hit_time = time.time()
 
-        # 构造响应
-        response = VITResponse(
-            request_id=request.request_id,
-            embedding_ipc_handle=(ipc_handle, offset),
-            embedding_shape=tuple(cached_embedding.shape),
-            embedding_dtype=str(cached_embedding.dtype).replace('torch.', ''),
-            embedding_device=str(cached_embedding.device),
-            image_hash=hash_val,
-            compute_time=0.0,
-            from_cache=True,
-            vit_compute_start_time=cache_hit_time,  # 缓存命中时间
-            vit_compute_end_time=cache_hit_time,
-        )
+        # ✅ 根据模式选择不同的处理方式
+        if self.use_shm and self.shm_manager:
+            # ✅ SHM 模式: 写入共享内存
+            success = self.shm_manager.write_embedding(request.request_id, cached_embedding)
+            if not success:
+                logger.error(f"[VIT Scheduler] ❌ Failed to write cached embedding to SHM: {request.request_id}")
+
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_ipc_handle=([], 0),
+                embedding_shape=tuple(cached_embedding.shape),
+                embedding_dtype=str(cached_embedding.dtype).replace('torch.', ''),
+                embedding_device="cpu",
+                image_hash=hash_val,
+                compute_time=0.0,
+                from_cache=True,
+                vit_compute_start_time=cache_hit_time,
+                vit_compute_end_time=cache_hit_time,
+            )
+        else:
+            # ❌ CUDA IPC 模式
+            from sglang.semi_pd.utils import get_ipc_handle
+            ipc_handle, offset = get_ipc_handle(cached_embedding)
+
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_ipc_handle=(ipc_handle, offset),
+                embedding_shape=tuple(cached_embedding.shape),
+                embedding_dtype=str(cached_embedding.dtype).replace('torch.', ''),
+                embedding_device=str(cached_embedding.device),
+                image_hash=hash_val,
+                compute_time=0.0,
+                from_cache=True,
+                vit_compute_start_time=cache_hit_time,
+                vit_compute_end_time=cache_hit_time,
+            )
 
         # 发送响应
         self._send_response(response)
