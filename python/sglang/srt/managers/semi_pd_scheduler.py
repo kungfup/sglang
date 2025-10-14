@@ -11,6 +11,7 @@ import psutil
 import setproctitle
 
 from sglang.semi_pd.utils import InstanceRole
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, MultimodalInputs
@@ -496,6 +497,20 @@ def run_scheduler_process(
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
     # IPC info already received above for Prefill instances
+
+    # 🔧 默认开启多模态增量detokenizer，除非用户已显式指定
+    try:
+        if not os.environ.get("SGLANG_MM_DETOKENIZER_MODE"):
+            model_config = ModelConfig.from_server_args(server_args)
+            if getattr(model_config, "is_multimodal_gen", False):
+                os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "incremental"
+                logger.info(
+                    f"🔧 [SEMI_PD] TP{tp_rank}: 自动设置 SGLANG_MM_DETOKENIZER_MODE=incremental，避免多模态重复输出"
+                )
+    except Exception:
+        logger.exception(
+            f"⚠️ [SEMI_PD] TP{tp_rank}: 初始化多模态 detokenizer 模式失败，请手动设置 SGLANG_MM_DETOKENIZER_MODE=incremental"
+        )
 
     # Create a scheduler and run the event loop
     try:

@@ -90,6 +90,16 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         else:
             self.bridge_socket = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_p_instance = SimpleNamespace(send_pyobj=lambda x: None)
+        self._log_throttle_counter = 0
+        self._LOG_THROTTLE_INTERVAL = 5000
+
+    def _throttled_log(self, message: str):
+        self._log_throttle_counter += 1
+        if (
+            self._log_throttle_counter == 1
+            or self._log_throttle_counter % self._LOG_THROTTLE_INTERVAL == 0
+        ):
+            logger.info(message)
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """
@@ -208,6 +218,22 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
+        chunk_limit = self.chunked_prefill_size
+        if chunk_limit is not None:
+            try:
+                mm_sensitive = False
+                rid_set = set(rids)
+                for req in self.waiting_queue:
+                    if req.rid in rid_set:
+                        mm_inputs = getattr(req, "multimodal_inputs", None)
+                        if mm_inputs and mm_inputs.contains_mm_input():
+                            mm_sensitive = True
+                            break
+                if mm_sensitive:
+                    chunk_limit = None
+            except Exception:
+                pass
+
         adder = PrefillAdder(
             self.page_size,  # v0.4.8 requires page_size as first parameter
             self.tree_cache,
@@ -215,7 +241,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunk_limit,
             running_bs if self.is_mixed_chunk else 0,
         )
 
@@ -227,7 +253,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        logger.info(f"[DECODE] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}")
+        self._throttled_log(
+            f"[DECODE] Processing waiting queue, rids={rids}, waiting_queue_size={len(self.waiting_queue)}"
+        )
         for req in self.waiting_queue:
             # Semi-PD
             if req.rid not in rids:
@@ -337,7 +365,9 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
 
         重要：D-Scheduler拥有最终决策权
         """
-        logger.info(f"[DECODE] 📥 D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler: {recv_req.rids}")
+        self._throttled_log(
+            f"[DECODE] 📥 D-Scheduler received {len(recv_req.rids)} candidate requests from P-Scheduler: {recv_req.rids}"
+        )
 
         if self.chunked_req:
             self.tree_cache.cache_unfinished_req(self.chunked_req)
@@ -422,6 +452,3 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 self.running_batch = batch
             else:
                 self.running_batch.merge_batch(batch)
-
-
-

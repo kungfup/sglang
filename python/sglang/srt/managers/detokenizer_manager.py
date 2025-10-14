@@ -42,12 +42,13 @@ from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
     get_exception_traceback,
+    trim_overlap,
 )
 
 logger = logging.getLogger(__name__)
 
-# 添加调试日志控制
-DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+# 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -162,6 +163,12 @@ class DetokenizerManager:
                         _txt = self.tokenizer.decode(_heads[0])
                         if DEBUG_LOGS_ENABLED:
                             logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
+                            if os.environ.get("SGLANG_DEBUG_DETOK_BYTES", "0").lower() in ("1", "true", "yes"):
+                                try:
+                                    _b = _txt.encode("utf-8", errors="backslashreplace")
+                                    logger.info(f"[DBG_DETOKENIZER_BYTES] bytes_head={_b[:64]!r} len={len(_b)}")
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
         except Exception:
@@ -171,19 +178,37 @@ class DetokenizerManager:
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
+                # 默认按照“增量+相对 read_offset”的契约初始化
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
                     surr_offset=0,
-                    read_offset=recv_obj.read_offsets[i],
+                    read_offset=int(recv_obj.read_offsets[i]),
                 )
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids = recv_obj.decode_ids[i]
+                if mm_mode == "full":
+                    # “全量+绝对”窗口模式（仅用于兼容调试），用新的窗口替换状态
+                    s.decode_ids = recv_obj.decode_ids[i]
+                    s.surr_offset = 0
+                    try:
+                        s.read_offset = int(recv_obj.read_offsets[i])
+                    except Exception:
+                        pass
+                else:
+                    # 增量：在已有 decode_ids 后追加
+                    try:
+                        s.decode_ids.extend(recv_obj.decode_ids[i])
+                    except Exception:
+                        # 防御：异常时退化为替换
+                        s.decode_ids = recv_obj.decode_ids[i]
+                        s.surr_offset = 0
+                        s.read_offset = int(recv_obj.read_offsets[i])
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -195,18 +220,44 @@ class DetokenizerManager:
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        surr_texts = self.tokenizer.batch_decode(
-            surr_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
-        read_texts = self.tokenizer.batch_decode(
-            read_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
+        try:
+            surr_texts = self.tokenizer.batch_decode(
+                surr_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+            read_texts = self.tokenizer.batch_decode(
+                read_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+        except OverflowError:
+            # Fallback: sanitize negative/sentinel ids and retry to avoid HF overflow
+            def _sanitize(ids):
+                out = []
+                for t in ids or []:
+                    try:
+                        ti = int(t)
+                    except Exception:
+                        continue
+                    if ti >= 0:
+                        out.append(ti)
+                return out
+
+            surr_texts = self.tokenizer.batch_decode(
+                [_sanitize(x) for x in surr_ids],
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+            read_texts = self.tokenizer.batch_decode(
+                [_sanitize(x) for x in read_ids],
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
 
         # Incremental decoding
+        # IMPORTANT: Detokenizer should return the delta chunk only.
+        # TokenizerManager is responsible for accumulating full text (`state.text += chunk`).
         output_strs = []
         for i in range(bs):
             try:
@@ -220,24 +271,50 @@ class DetokenizerManager:
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
+
+            # New text w.r.t. the current surr window
             new_text = read_texts[i][len(surr_texts[i]) :]
+
             if recv_obj.finished_reasons[i] is None:
-                # Streaming chunk: update the decode status
+                # Streaming step
                 if len(new_text) > 0 and not new_text.endswith("�"):
+                    # Flushable chunk: commit offsets and return the delta only
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    new_text = ""
+                    output_chunk = new_text
                 else:
-                    new_text = find_printable_text(new_text)
-
-            output_strs.append(
-                self.trim_matched_stop(
+                    # Not flushable yet: only return the non-overlapping printable delta
+                    cand = find_printable_text(new_text)
+                    # Remove any overlap with what has already been sent to avoid duplicates
+                    output_chunk = trim_overlap(s.decoded_text, cand)
+                    if len(output_chunk) > 0:
+                        # Remember what we actually sent this round
+                        s.decoded_text = s.decoded_text + output_chunk
+            else:
+                # Finished step: trim stop on the final full text, then return only the final delta
+                final_full = self.trim_matched_stop(
                     s.decoded_text + new_text,
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
-            )
+                if DEBUG_LOGS_ENABLED:
+                    try:
+                        _h = final_full[:80]
+                        _t = final_full[-80:]
+                        logger.info(
+                            f"[DBG_DETOKENIZER_FINAL] rid={str(recv_obj.rids[i])[:8]} len={len(final_full)} head={_h!r} tail={_t!r}"
+                        )
+                    except Exception:
+                        pass
+                # Delta relative to accumulated decoded_text
+                output_chunk = final_full[len(s.decoded_text) :]
+                # Commit state to final
+                s.decoded_text = final_full
+                s.surr_offset = s.read_offset
+                s.read_offset = len(s.decode_ids)
+
+            output_strs.append(output_chunk)
 
         return BatchStrOut(
             rids=recv_obj.rids,

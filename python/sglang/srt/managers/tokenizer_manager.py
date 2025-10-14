@@ -420,6 +420,15 @@ class TokenizerManager:
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
 
+        # Warmup control for FP8 quantized models.
+        self._fp8_warmup_needed = self.server_args.quantization == "fp8"
+        self._fp8_warmup_lock = asyncio.Lock()
+        # Additional warmup for multimodal FP8 models to stabilize chunked prefill.
+        self._fp8_mm_warmup_needed = (
+            self.server_args.quantization == "fp8" and self.model_config.is_multimodal
+        )
+        self._fp8_mm_warmup_lock = asyncio.Lock()
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -428,6 +437,8 @@ class TokenizerManager:
         created_time = time.time()
 
         self.auto_create_handle_loop()
+
+        await self._maybe_run_fp8_warmup()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -458,6 +469,12 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
+            if (
+                self._fp8_mm_warmup_needed
+                and isinstance(obj, GenerateReqInput)
+                and obj.contains_mm_input()
+            ):
+                await self._maybe_run_fp8_mm_warmup(obj)
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
@@ -839,6 +856,81 @@ class TokenizerManager:
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+
+    async def _maybe_run_fp8_warmup(self):
+        if not self._fp8_warmup_needed:
+            return
+
+        async with self._fp8_warmup_lock:
+            if not self._fp8_warmup_needed:
+                return
+
+            # Mark as handled to avoid repeated warmup attempts even if the dummy request fails.
+            self._fp8_warmup_needed = False
+            try:
+                dummy_req = GenerateReqInput(
+                    text="warmup",
+                    sampling_params={
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "max_new_tokens": 1,
+                    },
+                    stream=False,
+                    log_metrics=False,
+                )
+                dummy_req.normalize_batch_and_arguments()
+                tokenized_obj = await self._tokenize_one_request(dummy_req)
+                state = self._send_one_request(dummy_req, tokenized_obj, time.time())
+                async for _ in self._wait_one_response(dummy_req, state):
+                    break
+                logger.info(
+                    "[FP8_WARMUP] 完成一次内部预热推理，稳定量化缩放系数。"
+                )
+            except Exception:
+                logger.warning(
+                    "[FP8_WARMUP] 预热推理失败，继续处理外部请求。",
+                    exc_info=True,
+                )
+
+    async def _maybe_run_fp8_mm_warmup(self, obj: GenerateReqInput):
+        if not self._fp8_mm_warmup_needed:
+            return
+
+        async with self._fp8_mm_warmup_lock:
+            if not self._fp8_mm_warmup_needed:
+                return
+
+            self._fp8_mm_warmup_needed = False
+            try:
+                warmup_obj = copy.deepcopy(obj)
+                warmup_obj.rid = uuid.uuid4().hex
+                warmup_obj.log_metrics = False
+                warmup_obj.stream = False
+                warmup_obj.return_logprob = False
+                warmup_obj.top_logprobs_num = 0
+                warmup_obj.logprob_start_len = -1
+                warmup_obj.return_hidden_states = False
+                warmup_obj.token_ids_logprob = []
+
+                if isinstance(warmup_obj.sampling_params, dict):
+                    sp = copy.deepcopy(warmup_obj.sampling_params)
+                else:
+                    sp = {}
+                sp["max_new_tokens"] = 1
+                sp.setdefault("temperature", 0.0)
+                sp.setdefault("top_p", 1.0)
+                warmup_obj.sampling_params = sp
+
+                tokenized = await self._tokenize_one_request(warmup_obj)
+                state = self._send_one_request(warmup_obj, tokenized, time.time())
+                async for _ in self._wait_one_response(warmup_obj, state):
+                    break
+                logger.info("[FP8_WARMUP] 完成多模态路径预热，后续回复将稳定。")
+            except Exception:
+                logger.warning(
+                    "[FP8_WARMUP] 多模态预热失败，继续处理用户请求。",
+                    exc_info=True,
+                )
 
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]

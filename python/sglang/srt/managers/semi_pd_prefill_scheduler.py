@@ -70,6 +70,16 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
         else:
             self.send_to_d_instance = SimpleNamespace(send_pyobj=lambda x: None)
             self.bridge_socket = SimpleNamespace(recv_pyobj=lambda: None)
+        self._log_throttle_counter = 0
+        self._LOG_THROTTLE_INTERVAL = 5000
+
+    def _throttled_log(self, message: str):
+        self._log_throttle_counter += 1
+        if (
+            self._log_throttle_counter == 1
+            or self._log_throttle_counter % self._LOG_THROTTLE_INTERVAL == 0
+        ):
+            logger.info(message)
 
     def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
         """
@@ -147,7 +157,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             logger.debug("[PREFILL] No waiting requests, entering Idle mode")
             return None
 
-        logger.info(f"[PREFILL] 🚀 get_next_batch_to_run called, waiting_queue_size={len(self.waiting_queue)}, attn_tp_rank={self.attn_tp_rank}")
+        self._throttled_log(
+            f"[PREFILL] 🚀 get_next_batch_to_run called, waiting_queue_size={len(self.waiting_queue)}, attn_tp_rank={self.attn_tp_rank}"
+        )
 
         resp = None
         if self.waiting_queue and self.attn_tp_rank == 0:
@@ -161,11 +173,11 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 candidates.append(r.rid)
 
             req = GetNextPrefillBatchInput(rids=candidates)
-            logger.info(f"[PREFILL] 📤 Send request to D worker: {req}")
+            self._throttled_log(f"[PREFILL] 📤 Send request to D worker: {req}")
             self.send_to_d_instance.send_pyobj(req)
-            logger.info(f"[PREFILL] ⏳ Waiting for response from D worker...")
+            self._throttled_log("[PREFILL] ⏳ Waiting for response from D worker...")
             resp = self.bridge_socket.recv_pyobj()
-            logger.info(f"[PREFILL] ✅ Recv response from D worker: {resp}")
+            self._throttled_log(f"[PREFILL] ✅ Recv response from D worker: {resp}")
             assert isinstance(
                 resp, GetNextPrefillBatchOutput
             ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"

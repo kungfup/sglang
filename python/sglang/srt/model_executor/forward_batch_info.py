@@ -490,10 +490,41 @@ class ForwardBatch:
                         * 3
                     )
                 else:
+                    # Slice mrope_positions for this chunk
                     mrope_positions = mm_input.mrope_positions[
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+
+                    # If slicing resulted in fewer positions than expected (e.g., due to out-of-bounds),
+                    # pad with default text positions
+                    actual_len = mrope_positions.shape[1]
+                    if actual_len < extend_seq_len:
+                        # Generate default positions for the missing tokens (text tokens)
+                        # For text tokens in mRoPE, all 3 dimensions (T/H/W) should have the same value
+                        missing_len = extend_seq_len - actual_len
+
+                        # Calculate the starting position for new text tokens
+                        # It should continue from the maximum position in the original mrope_positions
+                        if mm_input.mrope_positions.numel() > 0:
+                            max_pos = mm_input.mrope_positions.max().item()
+                            positions_used = extend_prefix_len
+                            start_pos = max_pos + 1 + (positions_used - mm_input.mrope_positions.shape[1])
+                        else:
+                            start_pos = extend_prefix_len
+
+                        # Generate positions: all 3 dimensions have the same incrementing values
+                        default_positions = torch.arange(
+                            start_pos,
+                            start_pos + missing_len,
+                            dtype=mrope_positions.dtype if mrope_positions.numel() > 0 else torch.long,
+                            device=mrope_positions.device if mrope_positions.numel() > 0 else "cpu",
+                        ).unsqueeze(0).expand(3, -1)
+
+                        if mrope_positions.numel() > 0:
+                            mrope_positions = torch.cat([mrope_positions, default_positions], dim=1)
+                        else:
+                            mrope_positions = default_positions
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
