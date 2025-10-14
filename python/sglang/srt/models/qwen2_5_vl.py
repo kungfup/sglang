@@ -471,6 +471,23 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
 
+        # ViT async computation optimization: create a dedicated CUDA stream on PP-first
+        self.vit_async_enabled = os.environ.get("SGLANG_VIT_ASYNC_DISABLED", "0") != "1"
+        self.vit_stream = None
+        if self.pp_group.is_first_rank and self.vit_async_enabled:
+            try:
+                self.vit_stream = torch.cuda.Stream()
+                if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
+                    logger.info("[ViT Async] Enabled dedicated CUDA stream for vision encoder")
+            except Exception:
+                # If stream creation fails (e.g., CPU device), fall back to sync path
+                self.vit_stream = None
+                self.vit_async_enabled = False
+        else:
+            self.vit_stream = None
+            if not self.pp_group.is_first_rank:
+                self.vit_async_enabled = False
+
         # Debug: PP 信息与设备信息（默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 开启）
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
@@ -628,34 +645,38 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat(pv_list, dim=0)
         image_grid_thw = torch.concat(grid_list, dim=0)
 
-        # Lightweight visibility for vision device usage (always on)
-        try:
-            logger.info(
-                "[VLM_VISION] pp_first=%s target_dev=%s pv_shape=%s grid_shape=%s dtype=%s",
-                getattr(getattr(self, "pp_group", None), "is_first_rank", None),
-                str(self.device),
-                tuple(pixel_values.shape),
-                tuple(image_grid_thw.shape),
-                str(self.visual.dtype),
-            )
-        except Exception:
-            pass
+        debug_logs_enabled = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
+
+        # Lightweight visibility for vision device usage (optional)
+        if debug_logs_enabled:
+            try:
+                logger.info(
+                    "[VLM_VISION] pp_first=%s target_dev=%s pv_shape=%s grid_shape=%s dtype=%s",
+                    getattr(getattr(self, "pp_group", None), "is_first_rank", None),
+                    str(self.device),
+                    tuple(pixel_values.shape),
+                    tuple(image_grid_thw.shape),
+                    str(self.visual.dtype),
+                )
+            except Exception:
+                pass
 
         # Detailed audit log to confirm who really runs ViT
-        try:
-            role = getattr(self.model, "instance_role", None)
-            pp_rank = getattr(getattr(self, "pp_group", None), "rank_in_group", None)
+        if debug_logs_enabled:
             try:
-                tp_rank = get_tp_group().rank_in_group
+                role = getattr(self.model, "instance_role", None)
+                pp_rank = getattr(getattr(self, "pp_group", None), "rank_in_group", None)
+                try:
+                    tp_rank = get_tp_group().rank_in_group
+                except Exception:
+                    tp_rank = None
+                logger.info(
+                    "[VLM_VIT_FORWARD] pid=%d role=%s pp_first=%s pp_rank=%s tp_rank=%s dev=%s items=%d",
+                    os.getpid(), str(role), getattr(getattr(self, "pp_group", None), "is_first_rank", None),
+                    str(pp_rank), str(tp_rank), str(self.device), len(items)
+                )
             except Exception:
-                tp_rank = None
-            logger.info(
-                "[VLM_VIT_FORWARD] pid=%d role=%s pp_first=%s pp_rank=%s tp_rank=%s dev=%s items=%d",
-                os.getpid(), str(role), getattr(getattr(self, "pp_group", None), "is_first_rank", None),
-                str(pp_rank), str(tp_rank), str(self.device), len(items)
-            )
-        except Exception:
-            pass
+                pass
 
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
@@ -693,7 +714,24 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 )
         except Exception:
             pass
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # Execute ViT forward; overlap with prefill when async stream is available
+        if (
+            self.vit_async_enabled
+            and self.vit_stream is not None
+            and isinstance(pixel_values.device, torch.device)
+            and pixel_values.device.type == "cuda"
+        ):
+            current_stream = torch.cuda.current_stream(device=pixel_values.device)
+            with torch.cuda.stream(self.vit_stream):
+                # ensure data transfers (copy_stream) are visible
+                self.vit_stream.wait_stream(current_stream)
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds = image_embeds.contiguous()
+            current_stream.wait_stream(self.vit_stream)
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).contiguous()
+
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
                 _dev = pixel_values.device
@@ -709,7 +747,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 )
         except Exception:
             pass
-        return image_embeds.contiguous()
+        return image_embeds
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)

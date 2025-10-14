@@ -344,6 +344,14 @@ class ServerArgs:
             logger.info(
                 f"Semi-PD: Reduced chunked_prefill_size to {self.chunked_prefill_size} for dual-instance memory management."
             )
+            if (
+                self.chunked_prefill_size
+                and self.chunked_prefill_size > 0
+                and not self.enable_mixed_chunk
+            ):
+                self.enable_mixed_chunk = True
+
+                
 
         assert self.chunked_prefill_size % self.page_size == 0
 

@@ -895,7 +895,7 @@ class CudaGraphRunner:
             # Debug: dump bs/raw_bs and head of req_pool_indices/seq_lens for mapping verification
             try:
                 import os
-                dbg = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "1").lower() not in ("0", "false", "no")
+                dbg = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
                 if dbg:
                     try:
                         rpi = self.req_pool_indices[:bs].clone().to("cpu", non_blocking=True).tolist()

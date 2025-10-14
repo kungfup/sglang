@@ -190,16 +190,18 @@ class SemiPDScheduler(Scheduler):
           - 使用add_to_waiting_queue管理队列
         """
         # Log new requests only from DECODE to avoid duplicate logs from PREFILL
-        try:
-            if getattr(self, "instance_role", None) == InstanceRole.DECODE:
+        debug_logs_enabled = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
+        if debug_logs_enabled:
+            try:
+                if getattr(self, "instance_role", None) == InstanceRole.DECODE:
+                    logger.info(
+                        f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}"
+                    )
+            except Exception:
+                # Fallback: keep service robust even if attribute missing
                 logger.info(
                     f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}"
                 )
-        except Exception:
-            # Fallback: keep service robust even if attribute missing
-            logger.info(
-                f"New request {recv_req.rid}, #tokens: {len(recv_req.input_ids)}"
-            )
 
         # Create a new request
         if (

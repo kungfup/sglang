@@ -47,8 +47,9 @@ from sglang.utils import (
 
 logger = logging.getLogger(__name__)
 
-# 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
+# 调试日志：默认关闭；如需开启 detokenizer 相关日志，使用 SGLANG_ENABLE_DETOKENIZER_LOGS=1
 DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
+DETOK_DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DETOKENIZER_LOGS", "0").lower() in ("1", "true", "yes")
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -149,7 +150,7 @@ class DetokenizerManager:
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         # DEBUG: detokenizer receiving decode ids (truncate for log)
         try:
-            if DEBUG_LOGS_ENABLED:
+            if DETOK_DEBUG_LOGS_ENABLED:
                 _heads = []
                 for lst in recv_obj.decode_ids[: min(1, len(recv_obj.decode_ids))]:
                     if isinstance(lst, list):
@@ -161,7 +162,7 @@ class DetokenizerManager:
                 if self.tokenizer and _heads and isinstance(_heads[0], list):
                     try:
                         _txt = self.tokenizer.decode(_heads[0])
-                        if DEBUG_LOGS_ENABLED:
+                        if DETOK_DEBUG_LOGS_ENABLED:
                             logger.info(f"[DBG_DETOKENIZER_DECODE] head_text={_txt!r}")
                             # optional: dump bytes for diagnosing garbled characters
                             if os.environ.get("SGLANG_DEBUG_DETOK_BYTES", "0").lower() in ("1", "true", "yes"):
@@ -298,7 +299,7 @@ class DetokenizerManager:
                     recv_obj.finished_reasons[i],
                     recv_obj.no_stop_trim[i],
                 )
-                if DEBUG_LOGS_ENABLED:
+                if DETOK_DEBUG_LOGS_ENABLED:
                     try:
                         _h = final_full[:80]
                         _t = final_full[-80:]
