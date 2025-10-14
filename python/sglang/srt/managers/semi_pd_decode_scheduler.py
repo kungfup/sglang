@@ -307,7 +307,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         """
         Semi-PD changes:
           - keep scheduled prefill batches in scheduled_prefill_batches
-          - disable mixed-style chunked prefill
+          - support mixed-style chunked prefill (enabled after VIT optimizations)
           - skip requests that not in rids
         """
         # Check if the grammar is ready in the grammar queue
@@ -445,9 +445,15 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
-            # Semi-PD
-            raise NotImplementedError(
-                "Mixed chunked prefill is not supported in Semi-PD mode"
+            # Semi-PD: Enable mixed chunked prefill (same as base scheduler)
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full
             )
         else:
             new_batch.decoding_reqs = None
