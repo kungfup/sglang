@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import os
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -465,6 +466,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
+
+        self.vit_async_enabled = (
+            os.environ.get("SGLANG_VIT_ASYNC_DISABLED", "0") != "1"
+            and torch.cuda.is_available()
+        )
+        self.vit_stream: Optional[torch.cuda.Stream] = None
+        if self.vit_async_enabled:
+            try:
+                self.vit_stream = torch.cuda.Stream()
+                logger.info(
+                    "[ViT Async] Enabled ViT asynchronous computation with dedicated CUDA stream"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ViT Async] Failed to initialize CUDA stream, fallback to synchronous execution: %s",
+                    str(exc),
+                )
+                self.vit_async_enabled = False
+
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -494,6 +514,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+    @property
+    def device(self) -> torch.device:
+        """Return the primary device location of the language model."""
+        return next(self.model.parameters()).device
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
         im_token_id: int = mm_inputs.im_token_id
@@ -501,15 +526,41 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            self.visual.dtype
+        """Compute image embeddings, optionally overlapping ViT with LLM prefill."""
+        target_device = self.device
+
+        pixel_values = torch.cat(
+            [
+                item.pixel_values.to(device=target_device, dtype=self.visual.dtype)
+                for item in items
+            ],
+            dim=0,
         )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        image_grid_thw = torch.concat(
+            [item.image_grid_thw.to(device=target_device) for item in items],
+            dim=0,
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+
+        vision_async_ready = (
+            self.vit_async_enabled
+            and self.vit_stream is not None
+            and isinstance(target_device, torch.device)
+            and target_device.type == "cuda"
+        )
+
+        if vision_async_ready:
+            current_stream = torch.cuda.current_stream(device=target_device)
+            self.vit_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.vit_stream):
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds = image_embeds.contiguous()
+            current_stream.wait_stream(self.vit_stream)
+            return image_embeds
+
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+        return image_embeds.contiguous()
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
