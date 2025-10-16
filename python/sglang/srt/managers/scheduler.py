@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    Modality,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -164,6 +165,11 @@ from sglang.srt.utils import (
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -608,6 +614,53 @@ class Scheduler(
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
 
+        # Init VIT Scheduler Client (for VLM models) and related state
+        self.vit_client = None
+        self._vit_embedding_cache: Dict[str, torch.Tensor] = {}
+        # 🔧 VIT Pipeline Parallelism: Save last received requests and VIT-ready requests
+        # Align with sglang_vit: no _forwarded_req_ids tracking
+        self._last_recv_reqs: List = []
+        self._vit_ready_reqs: List[Req] = []
+        if self.model_config.is_multimodal and self.pp_group.is_first_rank:
+            enable_vit_scheduler = (
+                os.environ.get("SGLANG_VIT_SCHEDULER_ENABLED", "0") == "1"
+            )
+            if enable_vit_scheduler:
+                try:
+                    from sglang.srt.managers.vit_scheduler_client import (
+                        VITSchedulerClient,
+                    )
+
+                    vit_zmq_host = os.environ.get(
+                        "SGLANG_VIT_SCHEDULER_HOST", "localhost"
+                    )
+                    vit_zmq_port = int(
+                        os.environ.get("SGLANG_VIT_SCHEDULER_PORT", "5555")
+                    )
+                    vit_timeout_ms = int(
+                        os.environ.get("SGLANG_VIT_SCHEDULER_TIMEOUT_MS", "5000")
+                    )
+
+                    self.vit_client = VITSchedulerClient(
+                        zmq_host=vit_zmq_host,
+                        zmq_port=vit_zmq_port,
+                        timeout_ms=vit_timeout_ms,
+                        enable=True,
+                    )
+                    logger.info(
+                        "[Scheduler] VIT Scheduler Client initialized: "
+                        f"host={vit_zmq_host}, port={vit_zmq_port}, timeout={vit_timeout_ms}ms"
+                    )
+                except Exception:
+                    logger.exception(
+                        "[Scheduler] Failed to initialize VIT Scheduler Client; falling back to inline ViT."
+                    )
+                    self.vit_client = None
+            else:
+                logger.info(
+                    "[Scheduler] VIT Scheduler disabled, using synchronous ViT computation"
+                )
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -943,12 +996,16 @@ class Scheduler(
         pp_outputs: Optional[PPProxyTensors] = None
 
         while True:
+            # Poll VIT results at the beginning of each loop iteration so ViT-ready
+            # requests can be forwarded or scheduled promptly even if PP comm blocks.
+            self.poll_vit_results()
+
             server_is_idle = True
             for mb_id in range(self.pp_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
-                recv_reqs = self.recv_requests()
+                recv_reqs = self.recv_requests() or []
                 self.process_input_requests(recv_reqs)
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -1042,34 +1099,39 @@ class Scheduler(
                             all_gather_group=self.attn_tp_group
                         )
                     )
-                    # In PP, only the stage following the last rank receives tokens.
-                    # Other stages will receive hidden-state proxies without 'next_token_ids'.
-                    if "next_token_ids" in next_pp_outputs.tensors:
-                        mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-                        logits_output_args = {
-                            k[len("logits_output.") :]: v
-                            for k, v in next_pp_outputs.tensors.items()
-                            if k.startswith("logits_output.")
-                        }
-                        if len(logits_output_args) > 0:
-                            logits_output = LogitsProcessorOutput(**logits_output_args)
-                        else:
-                            logits_output = None
-                        output_result = GenerationBatchResult(
-                            logits_output=logits_output,
-                            pp_hidden_states_proxy_tensors=None,
-                            next_token_ids=next_pp_outputs["next_token_ids"],
-                            extend_input_len_per_req=next_pp_outputs.tensors.get(
-                                "extend_input_len_per_req", None
-                            ),
-                            extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
-                                "extend_logprob_start_len_per_req", None
-                            ),
-                            bid=bids[next_mb_id],
-                            can_run_cuda_graph=result.can_run_cuda_graph,
-                        )
-                        self.process_batch_result(mbs[next_mb_id], output_result)
-                        last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                    # 🔧 FIX: Always assign output_ids and process batch result (align with sglang_vit)
+                    # Remove conditional check to ensure process_batch_result is always called
+                    # This fixes the "A A A A..." bug where req.output_ids is not updated
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+
+                    # Build logits_output from received tensors
+                    logits_output_args = {
+                        k[len("logits_output.") :]: v
+                        for k, v in next_pp_outputs.tensors.items()
+                        if k.startswith("logits_output.")
+                    }
+                    if len(logits_output_args) > 0:
+                        logits_output = LogitsProcessorOutput(**logits_output_args)
+                    else:
+                        logits_output = None
+
+                    output_result = GenerationBatchResult(
+                        logits_output=logits_output,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_input_len_per_req", None
+                        ),
+                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_logprob_start_len_per_req", None
+                        ),
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph if result else False,
+                    )
+
+                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
                 if self.pp_group is not None and not self.pp_group.is_last_rank:
@@ -1086,13 +1148,83 @@ class Scheduler(
                     # send out reqs to the next stage
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
+                        # 🔧 FIX: VIT Pipeline Parallelism - PP0 forwards requests to PP1
+                        # Only forward non-VIT-pending requests (forward after VIT completion)
+                        # Align with sglang_vit: no _forwarded_req_ids tracking
+                        reqs_to_forward = []
+
+                        # 1. Forward newly received non-VIT-pending requests
+                        if hasattr(self, '_last_recv_reqs'):
+                            for req in self._last_recv_reqs:
+                                if not (hasattr(req, 'vit_pending') and req.vit_pending):
+                                    reqs_to_forward.append(req)
+
+                        # 2. Forward VIT-completed requests
+                        if hasattr(self, '_vit_ready_reqs') and self._vit_ready_reqs:
+                            for req in self._vit_ready_reqs:
+                                if hasattr(req, '_original_recv_req'):
+                                    original_req = req._original_recv_req
+
+                                    # Copy VIT embedding to original request
+                                    if req.multimodal_inputs is not None and original_req.mm_inputs is not None:
+                                        if isinstance(original_req.mm_inputs, dict):
+                                            original_req.mm_inputs["mm_items"] = req.multimodal_inputs.mm_items
+                                            logger.info(
+                                                f"[PP{self.pp_rank}] 🔧 Updated mm_inputs for request {req.rid} with VIT embedding"
+                                            )
+
+                                    # Set vit_pending=False to tell PP1 that VIT is complete
+                                    original_req.vit_pending = False
+                                    logger.info(f"[PP{self.pp_rank}] 🔧 Set vit_pending=False for request {req.rid}")
+
+                                    reqs_to_forward.append(original_req)
+                                    logger.info(f"[PP{self.pp_rank}] 📤 Forwarding VIT-ready request {req.rid}")
+                            # Clear forwarded VIT requests
+                            self._vit_ready_reqs = []
+
+                        if reqs_to_forward:
+                            logger.info(
+                                f"[PP{self.pp_rank}] 📤 Forwarding {len(reqs_to_forward)} TokenizedGenerateReqInput to PP{self.pp_rank+1}"
+                            )
+                        elif DEBUG_LOGS_ENABLED:
+                            self._forward_zero_log_count = getattr(
+                                self, "_forward_zero_log_count", 0
+                            ) + 1
+                            if self._forward_zero_log_count % 100000 == 0:
+                                logger.info(
+                                    "[PP%s] Forwarding 0 TokenizedGenerateReqInput (pending vit=%d)",
+                                    getattr(self, "pp_rank", "?"),
+                                    len(getattr(self, "_vit_ready_reqs", [])),
+                                )
+
+                        if DEBUG_LOGS_ENABLED and reqs_to_forward:
+                            try:
+                                forward_states = [
+                                    (
+                                        getattr(req, "rid", None),
+                                        getattr(req, "vit_pending", None),
+                                    )
+                                    for req in reqs_to_forward
+                                ]
+                                logger.info(
+                                    "[PP%s] forward rid/vit=%s",
+                                    getattr(self, "pp_rank", "?"),
+                                    forward_states[:8],
+                                )
+                            except Exception:
+                                pass
+
+                        # Forward requests to PP1 (send even if empty to ensure handshake)
                         point_to_point_pyobj(
-                            recv_reqs,
+                            reqs_to_forward,
                             self.pp_rank * self.tp_size + dp_offset,
                             self.world_group.cpu_group,
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
+
+                        if reqs_to_forward:
+                            logger.info(f"[PP{self.pp_rank}] ✅ Request metadata forwarded")
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
@@ -1198,6 +1330,43 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        # 🔧 FIX: Ensure all received requests have vit_pending attribute
+        # This is important for PP mode, as requests received by PP1 may not have this attribute
+        if recv_reqs is not None:
+            for recv_req in recv_reqs:
+                # Only process Req objects (not control requests)
+                if hasattr(recv_req, 'rid') and not hasattr(recv_req, 'vit_pending'):
+                    recv_req.vit_pending = False
+
+        if DEBUG_LOGS_ENABLED and recv_reqs:
+            try:
+                rid_states = [
+                    (getattr(req, "rid", None), getattr(req, "vit_pending", None))
+                    for req in recv_reqs
+                    if hasattr(req, "rid")
+                ]
+                logger.info(
+                    "[PP%s] recv_requests: total=%d rid/vit=%s",
+                    getattr(self, "pp_rank", "?"),
+                    len(recv_reqs),
+                    rid_states[:8],
+                )
+            except Exception:
+                logger.info(
+                    "[PP%s] recv_requests: total=%d",
+                    getattr(self, "pp_rank", "?"),
+                    len(recv_reqs),
+                )
+
+        # 🔧 FIX: Save last received requests for PP forwarding (align with sglang_vit)
+        # In sglang_vit, _last_recv_reqs is set to recv_reqs directly (all requests, not just generate)
+        # This ensures that each batch of requests is forwarded exactly once
+        if getattr(self.pp_group, "is_first_rank", False):
+            self._last_recv_reqs = recv_reqs if recv_reqs is not None else []
+        else:
+            self._last_recv_reqs = []
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1257,6 +1426,16 @@ class Scheduler(
                 data_parallel_rank=recv_req.data_parallel_rank,
             )
             req.tokenizer = self.tokenizer
+            req.vit_pending = getattr(recv_req, "vit_pending", False)
+
+            # 🔧 FIX: In PP mode, read vit_pending from TokenizedGenerateReqInput
+            # This allows PP1 to know if PP0 has submitted a VIT task
+            if hasattr(recv_req, 'vit_pending'):
+                req.vit_pending = recv_req.vit_pending
+
+            # 🔧 VIT Pipeline Parallelism: Save original request for forwarding to PP1 after VIT completion
+            if self.pp_group.is_first_rank:
+                req._original_recv_req = recv_req
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1283,6 +1462,7 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            req.vit_pending = getattr(recv_req, "vit_pending", False)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -1305,6 +1485,50 @@ class Scheduler(
                     req.origin_input_ids, image_inputs
                 )
                 req.extend_image_inputs(image_inputs)
+
+                # Submit ViT computation asynchronously if configured.
+                vit_submitted = False
+                image_count = 0
+                if (
+                    self.vit_client is not None
+                    and req.multimodal_inputs is not None
+                    and getattr(self.pp_group, "is_first_rank", False)
+                ):
+                    for mm_item in req.multimodal_inputs.mm_items:
+                        if (
+                            mm_item.modality == Modality.IMAGE
+                            and getattr(mm_item, "pixel_values", None) is not None
+                        ):
+                            image_count += 1
+                            try:
+                                success = self.vit_client.submit_async(
+                                    request_id=req.rid,
+                                    pixel_values=mm_item.pixel_values,
+                                    image_grid_thw=mm_item.image_grid_thw,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[Scheduler] Failed to submit ViT task for %s: %s",
+                                    req.rid,
+                                    exc,
+                                )
+                                success = False
+
+                            if success:
+                                vit_submitted = True
+
+                    if vit_submitted:
+                        req.vit_pending = True
+                        recv_req.vit_pending = True
+                    else:
+                        req.vit_pending = False
+                        recv_req.vit_pending = False
+                        if image_count > 0:
+                            logger.warning(
+                                "[Scheduler] ViT submission failed for request %s (images=%d); proceeding without precomputed features",
+                                req.rid,
+                                image_count,
+                            )
             else:
                 # Skip mm inputs in non-first PP stages or on DECODE instance (disaggregation)
                 try:
@@ -1395,6 +1619,74 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def poll_vit_results(self):
+        """Check whether asynchronous ViT computations have completed."""
+        if self.vit_client is None:
+            return
+
+        self._poll_count = getattr(self, "_poll_count", 0) + 1
+        try:
+            results = self.vit_client.poll_results()
+        except Exception as exc:
+            logger.warning("[Scheduler] Failed to poll ViT results: %s", exc)
+            return
+
+        if not results:
+            if DEBUG_LOGS_ENABLED:
+                logger.info(
+                    "[Scheduler] poll_vit_results(): no results (pending cache=%d)",
+                    len(self._vit_embedding_cache),
+                )
+            return
+
+        logger.info("[Scheduler] Received %d ViT result(s)", len(results))
+
+        for request_id, vit_result in results.items():
+            found = False
+            for req in self.waiting_queue:
+                if req.rid != request_id or not getattr(req, "vit_pending", False):
+                    continue
+
+                if req.multimodal_inputs is not None:
+                    for mm_item in req.multimodal_inputs.mm_items:
+                        if mm_item.modality == Modality.IMAGE:
+                            try:
+                                mm_item.precomputed_features = vit_result.embedding.to(
+                                    self.device
+                                )
+                            except Exception:
+                                mm_item.precomputed_features = vit_result.embedding
+
+                req.vit_pending = False
+                if hasattr(vit_result, "image_hash"):
+                    req._vit_image_hash = vit_result.image_hash
+                self._vit_ready_reqs.append(req)
+                if DEBUG_LOGS_ENABLED:
+                    logger.info(
+                        "[Scheduler] ViT ready rid=%s (cache hit=%s)",
+                        request_id,
+                        False,
+                    )
+                found = True
+                break
+
+            if not found:
+                # Cache the embedding so that when the request returns to the queue
+                # we can immediately attach the precomputed features.
+                try:
+                    self._vit_embedding_cache[request_id] = vit_result.embedding
+                except Exception as exc:
+                    logger.warning(
+                        "[Scheduler] Failed to cache ViT embedding for %s: %s",
+                        request_id,
+                        exc,
+                    )
+                else:
+                    if DEBUG_LOGS_ENABLED:
+                        logger.info(
+                            "[Scheduler] Cached ViT embedding for rid=%s", request_id
+                        )
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1405,6 +1697,30 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.add(req)
         else:
             self.waiting_queue.append(req)
+            # Apply cached ViT embeddings if they arrived before the request
+            try:
+                if (
+                    getattr(self.pp_group, "is_first_rank", False)
+                    and getattr(req, "vit_pending", False)
+                    and req.rid in self._vit_embedding_cache
+                ):
+                    embedding = self._vit_embedding_cache.pop(req.rid)
+                    if req.multimodal_inputs is not None:
+                        for mm_item in req.multimodal_inputs.mm_items:
+                            if mm_item.modality == Modality.IMAGE:
+                                try:
+                                    mm_item.precomputed_features = embedding.to(
+                                        self.device
+                                    )
+                                except Exception:
+                                    mm_item.precomputed_features = embedding
+                    req.vit_pending = False
+            except Exception as exc:
+                logger.warning(
+                    "[Scheduler] Failed to apply cached ViT embedding for %s: %s",
+                    getattr(req, "rid", "<unknown>"),
+                    exc,
+                )
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1786,7 +2102,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
@@ -1807,8 +2123,44 @@ class Scheduler(
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
-        # Get requests from the waiting queue to a new prefill batch
+        # 🔧 FIX: Pipeline Parallelism - Classify requests, prioritize VIT-ready requests
+        # Only check vit_pending on PP0, PP1 doesn't need to check
+        vit_ready_reqs = []
+        vit_pending_reqs = []
+
         for req in self.waiting_queue:
+            # Only check vit_pending on PP0
+            if self.pp_group.is_first_rank:
+                has_vit_pending = hasattr(req, 'vit_pending')
+                vit_pending_value = getattr(req, 'vit_pending', None)
+
+                if has_vit_pending and vit_pending_value:
+                    vit_pending_reqs.append(req)
+                    continue
+
+            vit_ready_reqs.append(req)
+
+        # Log skipped VIT pending requests (reduce logging frequency)
+        if vit_pending_reqs and self.pp_group.is_first_rank:
+            if not hasattr(self, '_skip_vit_log_count'):
+                self._skip_vit_log_count = 0
+            self._skip_vit_log_count += 1
+            if self._skip_vit_log_count % 10000 == 0:
+                logger.info(
+                    f"[Scheduler] ⏭️ Skipping {len(vit_pending_reqs)} requests waiting for VIT "
+                    f"(ready={len(vit_ready_reqs)}) [logged every 10000 times]"
+                )
+        elif DEBUG_LOGS_ENABLED and self.pp_group.is_first_rank:
+            logger.info(
+                "[Scheduler] Prefill vit gating: ready=%d pending=%d queue=%d",
+                len(vit_ready_reqs),
+                len(vit_pending_reqs),
+                len(self.waiting_queue),
+            )
+
+        # Get requests from the waiting queue to a new prefill batch
+        # Prioritize VIT-ready requests
+        for req in vit_ready_reqs:
             if (
                 self.lora_paths
                 and len(
@@ -1832,8 +2184,18 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
+            # 🔧 FIX: Pass tree_cache and enable_hierarchical_cache correctly
+            # This aligns with sglang_vit's implementation
+            req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+
+            # 🔧 FIX: Pass chunked_req object and enable_hierarchical_cache
+            # This aligns with sglang_vit's implementation
+            res = adder.add_one_req(
+                req, self.chunked_req, self.enable_hierarchical_cache
+            )
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

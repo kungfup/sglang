@@ -489,7 +489,21 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(self, req: Req, has_chunked_req: bool):
+    def add_one_req(
+        self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
+    ):
+        """
+        Add one request to the prefill batch.
+
+        Args:
+            req: The request to add
+            has_chunked_req: Whether there is a chunked request (can be bool or Req object)
+            enable_hierarchical_cache: Whether hierarchical cache is enabled
+        """
+        # Convert has_chunked_req to bool if it's a Req object (for compatibility with sglang_vit)
+        if not isinstance(has_chunked_req, bool):
+            has_chunked_req = has_chunked_req is not None
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 

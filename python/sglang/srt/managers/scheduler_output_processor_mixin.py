@@ -525,22 +525,31 @@ class SchedulerOutputProcessorMixin:
     ):
         # PP 流式来源守卫（可配置）：默认仅允许 PP stage-0 + attn_tp_rank==0 输出
         try:
-            if getattr(self.server_args, 'enable_semi_pd', False):
-                if getattr(self, 'attn_tp_rank', 0) != 0:
+            pp_group = getattr(self, "pp_group", None)
+            pp_size = getattr(self.server_args, "pp_size", 1)
+            src_mode = os.environ.get("SGLANG_PP_STREAM_SOURCE", "stage0").lower()
+
+            if pp_group is not None and pp_size > 1:
+                # Only stream from one PP stage (default: PP0) to avoid duplicated deltas.
+                if getattr(self, "attn_tp_rank", 0) != 0:
                     return
-                pp_group = getattr(self, 'pp_group', None)
-                src_mode = os.environ.get("SGLANG_PP_STREAM_SOURCE", "stage0").lower()
-                if pp_group is not None:
-                    if src_mode in ("stage0", "first"):
-                        if not getattr(pp_group, 'is_first_rank', False):
-                            return
-                    elif src_mode in ("lastrank", "last"):
-                        if not getattr(pp_group, 'is_last_rank', False):
-                            return
-                    else:
-                        # 默认回退到 stage0
-                        if not getattr(pp_group, 'is_first_rank', False):
-                            return
+
+                if src_mode in ("stage0", "first"):
+                    if not getattr(pp_group, "is_first_rank", False):
+                        return
+                elif src_mode in ("lastrank", "last"):
+                    if not getattr(pp_group, "is_last_rank", False):
+                        return
+                elif src_mode in ("all", "any", "both"):
+                    pass
+                else:
+                    # 默认回退到 stage0
+                    if not getattr(pp_group, "is_first_rank", False):
+                        return
+            elif getattr(self.server_args, "enable_semi_pd", False):
+                # Semi-PD 单卡场景：仍然约束 attn_tp_rank=0 避免重复输出
+                if getattr(self, "attn_tp_rank", 0) != 0:
+                    return
         except Exception:
             pass
         rids = []

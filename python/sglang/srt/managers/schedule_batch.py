@@ -664,17 +664,44 @@ class Req:
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
+        enable_hierarchical_cache: bool = False,
     ):
+        """
+        Initialize the input for the next round of processing.
+
+        Args:
+            tree_cache: The prefix cache to use for matching
+            enable_hierarchical_cache: Whether hierarchical cache is enabled
+        """
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=self.adjust_max_prefix_ids(),
-            )
+            # tree cache is None if the prefix is not computed with tree cache.
+            if enable_hierarchical_cache:
+                # Hierarchical cache mode: include evicted entries
+                result = tree_cache.match_prefix(
+                    key=self.adjust_max_prefix_ids(), include_evicted=True
+                )
+                if len(result) == 3:
+                    self.prefix_indices, self.last_node, self.last_node_global = result
+                else:
+                    # Fallback if include_evicted is not supported
+                    self.prefix_indices, self.last_node = result[:2]
+            else:
+                # Standard mode
+                result = tree_cache.match_prefix(
+                    key=self.adjust_max_prefix_ids(),
+                )
+                if len(result) == 4:
+                    # semipd_pp format: (prefix_indices, last_node, last_host_node, host_hit_length)
+                    (
+                        self.prefix_indices,
+                        self.last_node,
+                        self.last_host_node,
+                        self.host_hit_length,
+                    ) = result
+                else:
+                    # sglang_vit format: (prefix_indices, last_node)
+                    self.prefix_indices, self.last_node = result[:2]
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
