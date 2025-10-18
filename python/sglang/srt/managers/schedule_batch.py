@@ -746,6 +746,14 @@ class Req:
                     return
 
     def reset_for_retract(self):
+        import logging
+        import os
+        logger = logging.getLogger(__name__)
+        DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
+
+        if DEBUG_LOGS_ENABLED:
+            logger.info(f"[DBG_RESET_RETRACT] rid={str(self.rid)[:8]} BEFORE: send_decode_id_offset={self.send_decode_id_offset} last_full_decode_len={getattr(self, 'last_full_decode_len', None)} output_ids_len={len(self.output_ids)}")
+
         self.prefix_indices = []
         self.last_node = None
         self.extend_input_len = 0
@@ -761,6 +769,12 @@ class Req:
         self.send_decode_id_offset = 0
         self.surr_offset = None
         self.read_offset = None
+        # Reset full-seq streaming baseline as well
+        self.last_full_decode_len = len(self.origin_input_ids_unpadded)
+
+        if DEBUG_LOGS_ENABLED:
+            logger.info(f"[DBG_RESET_RETRACT] rid={str(self.rid)[:8]} AFTER: send_decode_id_offset={self.send_decode_id_offset} last_full_decode_len={self.last_full_decode_len} origin_input_ids_unpadded_len={len(self.origin_input_ids_unpadded)}")
+        self.last_full_decode_len = len(self.origin_input_ids_unpadded)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

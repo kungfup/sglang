@@ -556,14 +556,15 @@ class SchedulerOutputProcessorMixin:
                 # DEBUG: scheduler sending decode ids (truncate for log)
                 try:
                     _rid = getattr(req, "rid", "NA")
-                    _send_off = getattr(req, "send_decode_id_offset", 0)
+                    _send_off_before = getattr(req, "send_decode_id_offset", 0)
+                    _last_full_len = getattr(req, "last_full_decode_len", None)
                     if self.model_config.is_multimodal_gen:
                         _to_send = decode_ids
                     else:
-                        _to_send = decode_ids[_send_off:]
+                        _to_send = decode_ids[_send_off_before:]
                     _head = _to_send[:10] if isinstance(_to_send, list) else []
                     if DEBUG_LOGS_ENABLED:
-                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
+                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off_before={_send_off_before} read_off={read_offset} send_len={len(_to_send)} head={_head} last_full_len={_last_full_len} output_ids_len={len(req.output_ids)}")
                 except Exception:
                     pass
 
@@ -593,9 +594,18 @@ class SchedulerOutputProcessorMixin:
                     read_offset_to_send = read_offset
 
                 # Update baselines for next round
+                _old_send_off = req.send_decode_id_offset
                 req.send_decode_id_offset = len(decode_ids)
                 req.last_full_decode_len = len(req.origin_input_ids_unpadded + req.output_ids)
                 read_offsets.append(read_offset_to_send)
+
+                # DEBUG: track offset updates
+                if DEBUG_LOGS_ENABLED:
+                    try:
+                        _rid = getattr(req, "rid", "NA")
+                        logger.info(f"[DBG_SCHEDULER_UPDATE] rid={str(_rid)[:8]} send_off: {_old_send_off} -> {req.send_decode_id_offset} (delta={req.send_decode_id_offset - _old_send_off}) last_full_len={req.last_full_decode_len}")
+                    except Exception:
+                        pass
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)
