@@ -1368,6 +1368,17 @@ class Scheduler(
             # 在 waiting_queue 中查找请求
             for req in self.waiting_queue:
                 if req.rid == request_id and hasattr(req, 'vit_pending') and req.vit_pending:
+                    # 🔧 检查错误标志
+                    if vit_result.error:
+                        logger.error(
+                            f"[Scheduler] ❌ VIT computation failed for request {req.rid}: {vit_result.error_message}"
+                        )
+                        # 调用 set_finish_with_abort 终止请求
+                        req.set_finish_with_abort(f"VIT computation failed: {vit_result.error_message}")
+                        req.vit_pending = False
+                        found = True
+                        break
+
                     # 找到了！更新 embedding
                     if req.multimodal_inputs is not None:
                         for mm_item in req.multimodal_inputs.mm_items:
@@ -1375,12 +1386,14 @@ class Scheduler(
                                 _emb = vit_result.embedding.to(self.device)
                                 mm_item.precomputed_features = _emb
 
-                                # 🔧 关键修改: 使用 VITResult 中的 image_hash（VIT Scheduler 计算的）
-                                if not hasattr(req, '_vit_image_hash'):
-                                    req._vit_image_hash = vit_result.image_hash  # ✅ 使用 VIT Scheduler 的 hash
+                                # 🔧 关键修改: 记录 cache_id 和 image_hash（用于释放缓存）
+                                # 新架构优先使用 cache_id，旧架构使用 image_hash
+                                if not hasattr(req, '_vit_cache_id'):
+                                    req._vit_cache_id = vit_result.cache_id  # 🔧 新架构使用
+                                    req._vit_image_hash = vit_result.image_hash  # 保留兼容性: 旧架构使用
                                     logger.info(
-                                        f"[Scheduler] 📝 Recorded image_hash={vit_result.image_hash} for request {req.rid} "
-                                        f"(from VIT Scheduler, not mm_item.hash={mm_item.hash})"
+                                        f"[Scheduler] 📝 Recorded cache_id={vit_result.cache_id}, image_hash={vit_result.image_hash} "
+                                        f"for request {req.rid}"
                                     )
 
                                 try:
@@ -1977,12 +1990,21 @@ class Scheduler(
                     if hasattr(self, 'vit_client') and self.vit_client and self.vit_client.enable:
                         if batch.forward_mode.is_prefill():
                             for req in batch.reqs:
-                                # 使用之前记录的 image_hash
-                                if hasattr(req, '_vit_image_hash'):
-                                    image_hash = req._vit_image_hash
-                                    self.vit_client.notify_embedding_consumed(image_hash)
-                                    logger.info(f"[PP{self.pp_rank}] 🗑️ Notified VIT Scheduler to free embedding: hash={image_hash}, req_id={req.rid}")
+                                # 🔧 新架构优先使用 cache_id，旧架构使用 image_hash
+                                if hasattr(req, '_vit_cache_id'):
+                                    cache_id = req._vit_cache_id
+                                    image_hash = getattr(req, '_vit_image_hash', 0)
+                                    self.vit_client.notify_embedding_consumed(image_hash=image_hash, cache_id=cache_id)
+                                    logger.info(f"[PP{self.pp_rank}] 🗑️ Notified VIT Scheduler to free embedding: cache_id={cache_id}, hash={image_hash}, req_id={req.rid}")
                                     # 清除标记，避免重复释放
+                                    delattr(req, '_vit_cache_id')
+                                    if hasattr(req, '_vit_image_hash'):
+                                        delattr(req, '_vit_image_hash')
+                                elif hasattr(req, '_vit_image_hash'):
+                                    # 旧架构兼容性
+                                    image_hash = req._vit_image_hash
+                                    self.vit_client.notify_embedding_consumed(image_hash=image_hash)
+                                    logger.info(f"[PP{self.pp_rank}] 🗑️ Notified VIT Scheduler to free embedding (legacy): hash={image_hash}, req_id={req.rid}")
                                     delattr(req, '_vit_image_hash')
                 bid = model_worker_batch.bid
             else:

@@ -656,6 +656,7 @@ def _launch_subprocesses(
 
     # Launch VIT Scheduler if enabled
     vit_scheduler_procs = []
+    vit_cache_server_proc = None
     if server_args.enable_vit_scheduler and server_args.node_rank == 0:
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -673,6 +674,85 @@ def _launch_subprocesses(
                 # 例如: --port 30019 => vit_scheduler_port = 31019
                 server_args.vit_scheduler_port = server_args.port + 1000
                 logger.info(f"VIT Scheduler port auto-generated: {server_args.vit_scheduler_port} (server_port + 1000)")
+
+            # 🔧 新架构: 启动 CacheServer 进程
+            use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+            if use_new_arch:
+                from sglang.srt.managers.vit_cache_server import start_cache_server
+
+                cache_rpc_port = int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
+                cache_size_mb = server_args.vit_scheduler_cache_size_mb
+
+                logger.info(f"[NEW ARCH] Launching VIT CacheServer on port {cache_rpc_port}, cache_size={cache_size_mb}MB...")
+
+                cache_reader, cache_writer = mp.Pipe(duplex=False)
+                vit_cache_server_proc = mp.Process(
+                    target=start_cache_server,
+                    args=(cache_rpc_port, cache_size_mb * 1024 * 1024, cache_writer),
+                    daemon=True,
+                )
+                vit_cache_server_proc.start()
+
+                # 等待 CacheServer 就绪
+                if cache_reader.poll(timeout=10):
+                    data = cache_reader.recv()
+                    if data != "ready":
+                        raise RuntimeError(f"VIT CacheServer failed to start: {data}")
+                    logger.info(f"[NEW ARCH] VIT CacheServer is ready on port {cache_rpc_port}, PID={vit_cache_server_proc.pid}")
+                else:
+                    raise RuntimeError("VIT CacheServer startup timeout")
+
+                # 设置环境变量供 VITScheduler 使用
+                os.environ["SGLANG_VIT_CACHE_RPC_PORT"] = str(cache_rpc_port)
+            else:
+                logger.info("[LEGACY ARCH] Using in-process CacheServer")
+
+            # 🔧 Worker Pool: 启动 Worker Pool（如果启用）
+            vit_worker_procs = []
+            use_worker_pool = os.environ.get("SGLANG_VIT_USE_WORKER_POOL", "0") == "1"
+            if use_worker_pool:
+                vit_dp = int(os.environ.get("SGLANG_VIT_DP", "1"))
+                vit_tp_size = server_args.vit_tp_size
+                worker_rpc_port_start = int(os.environ.get("SGLANG_VIT_WORKER_RPC_PORT_START", "19000"))
+
+                logger.info(f"[WORKER POOL] Launching {vit_dp} Worker(s) with TP={vit_tp_size}, port_start={worker_rpc_port_start}...")
+
+                for worker_id in range(vit_dp):
+                    # 每个 Worker 启动 vit_tp_size 个进程（TP ranks）
+                    worker_procs_for_this_worker = []
+
+                    for tp_rank in range(vit_tp_size):
+                        reader, writer = mp.Pipe(duplex=False)
+
+                        # Worker RPC 端口（每个 Worker 一个端口，所有 TP ranks 共享）
+                        worker_rpc_port = worker_rpc_port_start + worker_id
+
+                        proc = mp.Process(
+                            target=run_vit_worker_process,
+                            args=(server_args, worker_id, tp_rank, vit_tp_size, worker_rpc_port, writer),
+                            daemon=True,
+                        )
+                        proc.start()
+                        worker_procs_for_this_worker.append((proc, reader, tp_rank))
+
+                        logger.info(
+                            f"[WORKER POOL] Started Worker {worker_id} TP rank {tp_rank}/{vit_tp_size}, "
+                            f"PID={proc.pid}, port={worker_rpc_port}"
+                        )
+
+                    # 等待该 Worker 的所有 TP ranks 就绪
+                    for proc, reader, tp_rank in worker_procs_for_this_worker:
+                        if reader.poll(timeout=30):
+                            data = reader.recv()
+                            if data != "ready":
+                                raise RuntimeError(f"Worker {worker_id} TP rank {tp_rank} failed to start: {data}")
+                            logger.info(f"[WORKER POOL] Worker {worker_id} TP rank {tp_rank} is ready")
+                        else:
+                            raise RuntimeError(f"Worker {worker_id} TP rank {tp_rank} startup timeout")
+
+                    vit_worker_procs.extend(worker_procs_for_this_worker)
+
+                logger.info(f"[WORKER POOL] All {vit_dp} Worker(s) are ready")
 
             # 🔧 VIT TP: 启动多个 VIT Scheduler 进程（如果 vit_tp_size > 1）
             vit_tp_size = server_args.vit_tp_size
@@ -864,6 +944,68 @@ def _launch_subprocesses(
     return tokenizer_manager, scheduler_info
 
 
+def run_vit_worker_process(
+    server_args: ServerArgs,
+    worker_id: int,
+    tp_rank: int,
+    tp_size: int,
+    rpc_port: int,
+    pipe_writer,
+):
+    """Run VIT Worker process
+
+    Args:
+        server_args: Server arguments
+        worker_id: Worker ID (for DP)
+        tp_rank: TP rank (0 to tp_size-1)
+        tp_size: TP size
+        rpc_port: Worker RPC port
+        pipe_writer: Pipe writer for sending ready signal
+    """
+    try:
+        # 设置环境变量
+        os.environ["SGLANG_VIT_TP_RANK"] = str(tp_rank)
+        os.environ["SGLANG_VIT_TP_SIZE"] = str(tp_size)
+        os.environ["SGLANG_VIT_TP_PORT"] = str(server_args.vit_tp_port + worker_id)  # 每个 Worker 独立的 NCCL 端口
+
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.managers.vit_worker_rpc import start_vit_worker_process
+
+        # Load model config
+        model_config = ModelConfig(
+            model_path=server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            model_override_args="{}",
+        )
+
+        # 获取 CacheServer 配置
+        cache_rpc_host = "localhost"
+        cache_rpc_port = int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
+
+        # 通知父进程当前 rank 就绪，必须所有 rank 都发送
+        pipe_writer.send("ready")
+        logger.info(
+            f"[Worker {worker_id}] TP rank {tp_rank} sent ready signal to parent process"
+        )
+
+        # 启动 Worker（这会阻塞）
+        start_vit_worker_process(
+            worker_id=worker_id,
+            model_config=model_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            rpc_port=rpc_port,
+            cache_rpc_host=cache_rpc_host,
+            cache_rpc_port=cache_rpc_port,
+        )
+    except Exception as e:
+        logger.error(f"[Worker {worker_id}] Worker process failed: {e}")
+        import traceback
+        traceback.print_exc()
+        pipe_writer.send(f"error: {e}")
+        raise
+
+
 def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer, env_vars: dict = None):
     """Run VIT Scheduler process
 
@@ -888,6 +1030,12 @@ def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer, env_vars: di
             model_override_args="{}",
         )
 
+        # 🔧 新架构: 获取 cache_rpc_port
+        cache_rpc_port = None
+        use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+        if use_new_arch:
+            cache_rpc_port = int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
+
         # Start VIT Scheduler (this will block)
         # NOTE: start_vit_scheduler will send "ready" signal via pipe_writer when ZMQ is listening
         start_vit_scheduler(
@@ -897,6 +1045,7 @@ def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer, env_vars: di
             batch_size=server_args.vit_scheduler_batch_size,
             batch_timeout_ms=server_args.vit_scheduler_batch_timeout_ms,
             cache_size_mb=server_args.vit_scheduler_cache_size_mb,
+            cache_rpc_port=cache_rpc_port,
             pipe_writer=pipe_writer,
         )
     except Exception as e:

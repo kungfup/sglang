@@ -13,20 +13,25 @@ import zmq
 import pickle
 import logging
 import threading
+from queue import Queue, Empty
 from collections import deque
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, asdict
 from multiprocessing import shared_memory
+from io import BytesIO
 
 import torch
 
-from sglang.srt.managers.vit_shm_utils import (
-    cleanup_embedding_shm,
-    cleanup_shared_memory,
-    read_embedding_from_shm,
-)
-
 logger = logging.getLogger(__name__)
+
+# ✅ 尝试导入 posix_ipc (用于 SHM 模式)
+try:
+    import posix_ipc
+    import mmap
+    POSIX_IPC_AVAILABLE = True
+except ImportError:
+    POSIX_IPC_AVAILABLE = False
+    logger.warning("[VIT Client] posix_ipc not available, SHM mode will be disabled")
 
 
 @dataclass
@@ -54,12 +59,9 @@ class VITResponse:
         embedding_shape: Embedding tensor 的 shape
         embedding_dtype: Embedding tensor 的 dtype (如 "float32")
         embedding_device: Embedding tensor 的 device (如 "cuda:0")
-        image_hash: 图片的 hash 值（用于 cache 管理，保留兼容性）
-        cache_id: 缓存 ID（用于 free，新架构使用）
+        image_hash: 图片的 hash 值（用于 cache 管理）
         compute_time: 计算耗时（秒）
         from_cache: 是否从 cache 中获取
-        error: 是否发生错误
-        error_message: 错误信息
         vit_compute_start_time: VIT 计算开始时间（用于并行性分析）
         vit_compute_end_time: VIT 计算结束时间（用于并行性分析）
     """
@@ -69,14 +71,10 @@ class VITResponse:
     embedding_shape: Tuple[int, ...]
     embedding_dtype: str
     embedding_device: str  # 新增: 设备信息
-    image_hash: int  # 保留兼容性: 用于旧架构 cache 管理
-    cache_id: Optional[int] = None  # 🔧 新增: 缓存 ID (用于新架构 free)
+    image_hash: int  # 新增: 用于 cache 管理
     # 保留原有字段
-    compute_time: float = 0.0
-    from_cache: bool = False
-    # 🔧 新增: 错误处理
-    error: bool = False
-    error_message: str = ""
+    compute_time: float
+    from_cache: bool
     # 🔧 新增: 时间戳（用于并行性分析和缓存生命周期跟踪）
     vit_compute_start_time: float = 0.0
     vit_compute_end_time: float = 0.0
@@ -88,20 +86,14 @@ class VITResult:
 
     Attributes:
         embedding: 计算得到的 embedding tensor
-        image_hash: VIT Scheduler 计算的 hash 值（用于旧架构 cache 释放，保留兼容性）
-        cache_id: 缓存 ID（用于新架构 cache 释放）
+        image_hash: VIT Scheduler 计算的 hash 值（用于 cache 释放）
         compute_time: 计算耗时（毫秒）
         from_cache: 是否从 cache 中获取
-        error: 是否发生错误
-        error_message: 错误信息
     """
     embedding: torch.Tensor
-    image_hash: int  # 保留兼容性: 旧架构使用
-    cache_id: Optional[int] = None  # 🔧 新增: 新架构使用
-    compute_time: float = 0.0
-    from_cache: bool = False
-    error: bool = False  # 🔧 新增: 错误标志
-    error_message: str = ""  # 🔧 新增: 错误信息
+    image_hash: int  # 🔧 关键: VIT Scheduler 计算的 hash，用于 cache 释放
+    compute_time: float
+    from_cache: bool
 
 
 class VITSchedulerClient:
@@ -181,13 +173,19 @@ class VITSchedulerClient:
 
         # ✅ 环境变量控制 SHM/IPC 模式
         self.use_shm = os.environ.get("SGLANG_VIT_USE_SHM", "true").lower() == "true"
-        if self.use_shm:
-            logger.info("[VIT Client] ✅ Using SHM mode for embedding transfer")
-        else:
-            logger.info("[VIT Client] ⚠️ Using CUDA IPC mode (legacy, SGLANG_VIT_USE_SHM=false)")
 
-        # 管理 pixel/grid 的 multiprocessing.shared_memory
+        # 🔧 修复: SHM 模式也需要 shm_objects 字典来管理 pixel_values 的共享内存
+        # 只有 embedding 使用 POSIX SHM,pixel_values 仍使用 multiprocessing.shared_memory
         self.shm_objects: Dict[str, shared_memory.SharedMemory] = {}
+
+        if self.use_shm and POSIX_IPC_AVAILABLE:
+            logger.info("[VIT Client] ✅ Using POSIX SHM mode for embedding transfer")
+            logger.info("[VIT Client] 📝 pixel_values still use multiprocessing.shared_memory")
+        else:
+            if not self.use_shm:
+                logger.info("[VIT Client] ⚠️ Using CUDA IPC mode (legacy, SGLANG_VIT_USE_SHM=false)")
+            else:
+                logger.warning("[VIT Client] ⚠️ posix_ipc not available, falling back to CUDA IPC mode")
 
         # 异步请求管理
         self.pending_requests: Dict[str, Dict] = {}  # request_id -> request_info
@@ -201,16 +199,8 @@ class VITSchedulerClient:
         # 根据日志分析，处理 8 个请求需要 11.6 秒，10 秒超时太短
         # 增加到 30 秒留有余量
         self._send_timeout_s = 1.0   # 未成功发出后重发阈值
-        self._drop_timeout_s = float(
-            os.environ.get("SGLANG_VIT_CLIENT_DROP_TIMEOUT_S", "300.0")
-        )  # 连续未发出/未应答的丢弃阈值
+        self._drop_timeout_s = 30.0  # 连续未发出/未应答的丢弃阈值（从 10.0 增加到 30.0）
         self._max_retries = 5        # 最多重发次数
-        # 🔧 Phase 2.C: 响应超时阈值（避免 TP 计算时被误判为超时，默认 120s，可通过环境变量调整）
-        self._response_timeout_s = float(
-            os.environ.get("SGLANG_VIT_CLIENT_RESPONSE_TIMEOUT_S", "120.0")
-        )
-        if self._drop_timeout_s <= self._response_timeout_s:
-            self._drop_timeout_s = self._response_timeout_s * 1.5
         self._last_free_ts: Dict[int, float] = {}  # free 信号去重节流
 
         # 后台通信线程（唯一持有 socket）
@@ -265,23 +255,75 @@ class VITSchedulerClient:
 
     def _cleanup_shm(self, shm_name: str):
         """清理共享内存"""
-        if shm_name in self.shm_objects:
+        if self.shm_objects and shm_name in self.shm_objects:
             shm = self.shm_objects.pop(shm_name)
             shm.close()
             shm.unlink()
-        elif shm_name:
-            cleanup_shared_memory(shm_name)
 
     def _read_embedding_from_shm(
         self,
         request_id: str,
         shape: Tuple[int, ...],
-        dtype_str: str,
+        dtype_str: str
     ) -> Optional[torch.Tensor]:
-        embedding = read_embedding_from_shm(request_id, max_retries=5, retry_delay_ms=10.0)
-        if embedding is None:
-            logger.error("[VIT Client] ❌ Failed to read SHM embedding: %s", request_id)
-        return embedding
+        """从 POSIX 共享内存读取 embedding
+
+        Args:
+            request_id: 请求 ID
+            shape: Tensor shape
+            dtype_str: Tensor dtype (如 "float16")
+
+        Returns:
+            Tensor 或 None (如果失败)
+        """
+        if not POSIX_IPC_AVAILABLE:
+            logger.error("[VIT Client] posix_ipc not available")
+            return None
+
+        shm_name_embed = f"/vit_embed_{request_id}"
+        shm_name_meta = f"/vit_embed_meta_{request_id}"
+
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                shm_meta = posix_ipc.SharedMemory(shm_name_meta, flags=0)
+                mapfile_meta = mmap.mmap(shm_meta.fd, shm_meta.size)
+                shm_meta.close_fd()
+
+                meta_bytes = mapfile_meta.read(shm_meta.size)
+                mapfile_meta.close()
+
+                import json
+                meta = json.loads(meta_bytes.decode('utf-8'))
+
+                shm_embed = posix_ipc.SharedMemory(shm_name_embed, flags=0)
+                mapfile_embed = mmap.mmap(shm_embed.fd, shm_embed.size)
+                shm_embed.close_fd()
+
+                embed_bytes = mapfile_embed.read(shm_embed.size)
+                mapfile_embed.close()
+
+                buf = BytesIO(embed_bytes)
+                tensor = torch.load(buf, map_location='cpu')
+
+                logger.info(
+                    f"[VIT Client] ✅ Read embedding from SHM: {request_id}, "
+                    f"shape={tensor.shape}, dtype={tensor.dtype}"
+                )
+                return tensor
+
+            except posix_ipc.ExistentialError:
+                if attempt < max_attempts - 1:
+                    time.sleep(0.001)
+                    continue
+                logger.error(
+                    f"[VIT Client] ❌ Failed to read SHM: {request_id}: shared memory not found "
+                    f"(embed={shm_name_embed}, meta={shm_name_meta})"
+                )
+                return None
+            except Exception as e:
+                logger.error(f"[VIT Client] ❌ Failed to read SHM: {request_id}: {e}", exc_info=True)
+                return None
 
     def submit_async(
         self,
@@ -509,7 +551,7 @@ class VITSchedulerClient:
                 # 情况 2：已发送但长期无响应（sent=True but no response）
                 # 这种情况可能是消息在 ZMQ 缓冲区中丢失，或 VIT Scheduler 未收到
                 # ✅ 优化: 从 3秒 增加到 15秒，避免在 VIT 计算过程中重试（VIT 计算约 9.4秒）
-                if sent and (now - submit_time) > self._response_timeout_s:
+                if sent and (now - submit_time) > self._send_timeout_s * 15:  # 从 * 3 改为 * 15
                     payload = info.get('payload')
                     if payload is not None:
                         with self._tx_queue_lock:
@@ -583,17 +625,7 @@ class VITSchedulerClient:
 
                     # ✅ 根据模式选择不同的处理方式
                     try:
-                        # 🔧 检查错误标志
-                        if resp.error or resp.embedding_shape == (0, 0):
-                            logger.error(
-                                "[VIT Client] ❌ Received error response for %s: %s (cache_id=%s, hash=%s)",
-                                resp.request_id,
-                                resp.error_message or "Unknown error",
-                                resp.cache_id,
-                                resp.image_hash,
-                            )
-                            emb = torch.empty(0)
-                        elif self.use_shm and resp.embedding_device == "cpu":
+                        if self.use_shm and resp.embedding_device == "cpu":
                             # ✅ SHM 模式: 从 POSIX 共享内存读取
                             logger.info(f"[VIT Client] 📖 Reading embedding from SHM: {resp.request_id}")
 
@@ -607,8 +639,6 @@ class VITSchedulerClient:
                             if emb is None:
                                 logger.error(f"[VIT Client] ❌ Failed to read SHM: {resp.request_id}")
                                 continue
-
-                            cleanup_embedding_shm(resp.request_id)
 
                             logger.info(
                                 f"[VIT Client] ✅ Read embedding from SHM: "
@@ -665,11 +695,7 @@ class VITSchedulerClient:
                         continue
 
                     # 验证 embedding
-                    if emb.numel() == 0:
-                        logger.warning(
-                            f"[VIT Client] ⚠️ Received empty embedding for {resp.request_id}"
-                        )
-                    elif torch.isnan(emb).any():
+                    if torch.isnan(emb).any():
                         logger.error(
                             f"[VIT Client] ❌ Loaded embedding contains NaN! "
                             f"shape={emb.shape}"
@@ -688,22 +714,19 @@ class VITSchedulerClient:
                         self._cleanup_shm(info.get('pixel_values_shm_name', ''))
                         self._cleanup_shm(info.get('image_grid_thw_shm_name', ''))
 
-                    # 🔧 关键修改: 存储 VITResult（包含 embedding、cache_id 和错误信息）
+                    # 🔧 关键修改: 存储 VITResult（包含 embedding 和 image_hash）
                     vit_result = VITResult(
                         embedding=emb,
-                        image_hash=resp.image_hash,  # 保留兼容性: 旧架构使用
-                        cache_id=resp.cache_id,  # 🔧 新增: 新架构使用
+                        image_hash=resp.image_hash,  # 🔧 VIT Scheduler 计算的 hash
                         compute_time=resp.compute_time,
                         from_cache=resp.from_cache,
-                        error=resp.error,  # 🔧 新增: 错误标志
-                        error_message=resp.error_message,  # 🔧 新增: 错误信息
                     )
 
                     with self._results_lock:
                         self._results[resp.request_id] = vit_result
                         logger.info(
                             f"[VIT Client] 🔧 Worker put result into _results: {resp.request_id}, "
-                            f"_results_len={len(self._results)}, cache_id={resp.cache_id}, image_hash={resp.image_hash}, error={resp.error}"
+                            f"_results_len={len(self._results)}, image_hash={resp.image_hash}"
                         )
 
                     self.completed_count += 1
@@ -726,49 +749,31 @@ class VITSchedulerClient:
 
         logger.info("[VIT Client] 🧵 worker exit")
 
-    def notify_embedding_consumed(self, image_hash: int = 0, cache_id: Optional[int] = None):
-        """通知 VIT Scheduler 释放 embedding（事件驱动释放）
-
-        Args:
-            image_hash: 图片 hash (旧架构使用，保留兼容性)
-            cache_id: 缓存 ID (新架构使用)
-        """
+    def notify_embedding_consumed(self, image_hash: int):
+        """通知 VIT Scheduler 释放 embedding（事件驱动释放）"""
         if not self.enable:
             logger.warning(f"[VIT Client] ⚠️ notify_embedding_consumed called but VIT client is disabled")
             return
 
-        # 🔧 新架构优先使用 cache_id
-        if cache_id is not None:
-            message = {
-                "type": "free_embedding",
-                "cache_id": cache_id,
-                "image_hash": 0,  # 保留兼容性
-            }
-            dedup_key = cache_id
-        else:
-            # 旧架构使用 image_hash
-            message = {
-                "type": "free_embedding",
-                "image_hash": image_hash,
-                "cache_id": None,
-            }
-            dedup_key = image_hash
-
+        message = {
+            "type": "free_embedding",
+            "image_hash": image_hash,
+        }
         try:
             # free 信号去重：0.5s 内重复信号直接跳过，避免刷屏与队列膨胀
             now = time.time()
-            last = self._last_free_ts.get(dedup_key, 0.0)
+            last = self._last_free_ts.get(image_hash, 0.0)
             if now - last < 0.5:
-                logger.debug(f"[VIT Client] ⏭️ Skip duplicate free signal within 0.5s for key={dedup_key}")
+                logger.debug(f"[VIT Client] ⏭️ Skip duplicate free signal within 0.5s for hash={image_hash}")
                 return
-            self._last_free_ts[dedup_key] = now
+            self._last_free_ts[image_hash] = now
 
             # 通过后台线程发送（非阻塞）
             with self._tx_queue_lock:
                 self._tx_queue.append(("free", message))
-            logger.debug(f"[VIT Client] 📝 Queued free signal for cache_id={cache_id}, hash={image_hash}")
+            logger.debug(f"[VIT Client] 📝 Queued free signal for hash={image_hash}")
         except Exception as e:
-            logger.warning(f"[VIT Client] Failed to send free signal for cache_id={cache_id}, hash={image_hash}: {e}")
+            logger.warning(f"[VIT Client] Failed to send free signal for hash={image_hash}: {e}")
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
