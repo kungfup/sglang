@@ -69,6 +69,43 @@ class VITWorkerService(rpyc.Service):
         self.last_ping_time = time.time()
         self.is_healthy = True
 
+        # 🔧 缓存禁用开关 (参考 LightLLM)
+        self.cache_enabled = os.environ.get("SGLANG_VIT_DISABLE_CACHE", "0") != "1"
+        if not self.cache_enabled:
+            logger.info(f"[Worker {self.worker_id}] ViT embedding cache is DISABLED")
+
+        # 🔧 显存池管理 (对齐 LightLLM)
+        memory_pool_gb = float(os.environ.get("SGLANG_VIT_MEMORY_POOL_GB", "0"))
+        if memory_pool_gb > 0:
+            from sglang.srt.managers.vit_memory_pool import VITMemoryPool
+            self.memory_pool = VITMemoryPool(
+                max_memory_gb=memory_pool_gb,
+                enable_monitoring=True,
+                monitoring_interval=30.0,
+            )
+            logger.info(
+                f"[Worker {self.worker_id}] Memory pool enabled: {memory_pool_gb:.2f} GB"
+            )
+        else:
+            self.memory_pool = None
+            logger.info(f"[Worker {self.worker_id}] Memory pool disabled")
+
+        # 🔧 限制单进程显存占用 (torch.cuda.set_per_process_memory_fraction)
+        self.memory_fraction = float(os.environ.get("SGLANG_VIT_MEMORY_FRACTION", "0"))
+        if self.memory_fraction > 0 and torch.cuda.is_available():
+            try:
+                fraction = min(max(self.memory_fraction, 0.0), 0.99)
+                torch.cuda.set_per_process_memory_fraction(
+                    fraction, device=torch.device(self.device)
+                )
+                logger.info(
+                    f"[Worker {self.worker_id}] Set per-process memory fraction to {fraction:.3f} on {self.device}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {self.worker_id}] Failed to set per-process memory fraction ({self.memory_fraction}): {e}"
+                )
+
         # 🔧 Phase 2.C: TP 真正并行 - 初始化顺序调整
         # 1. 先初始化 NCCL (如果 tp_size > 1)，确保 parallel_state 正确设置
         if self.tp_size > 1:
@@ -77,12 +114,15 @@ class VITWorkerService(rpyc.Service):
         # 2. 再初始化模型 (所有 rank 都加载权重切片)
         self._init_model()
 
-        # 3. 只有 rank0 连接 CacheServer
-        if self.tp_rank == 0:
+        # 3. 只有 rank0 连接 CacheServer (仅当缓存启用时)
+        if self.tp_rank == 0 and self.cache_enabled:
             self._init_cache_client()
         else:
             self.cache_client = None
-            logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank}: skipping CacheServer connection")
+            if self.tp_rank == 0:
+                logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank}: CacheServer NOT connected (cache disabled)")
+            else:
+                logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank}: skipping CacheServer connection")
 
         logger.info(
             f"[Worker {self.worker_id}] Initialized: tp_rank={self.tp_rank}, "
@@ -380,6 +420,29 @@ class VITWorkerService(rpyc.Service):
             "total_compute_time": self.total_compute_time,
         }
 
+    def exposed_get_memory_stats(self) -> Dict[str, float]:
+        """Return current GPU memory statistics for watchdog/high-water checks."""
+        stats = {"total": 0.0, "free": 0.0, "used": 0.0}
+        try:
+            if torch.cuda.is_available():
+                device = torch.device(self.device)
+                torch.cuda.synchronize(device)
+                free, total = torch.cuda.mem_get_info(device=device)
+                used = total - free
+                stats.update(
+                    {
+                        "total": float(total),
+                        "free": float(free),
+                        "used": float(used),
+                    }
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[Worker {self.worker_id}] Failed to query GPU memory stats: {exc}"
+            )
+            stats["error"] = str(exc)
+        return stats
+
     def _read_inputs_and_check_cache(
         self,
         pixel_values_shm_keys: List[str],
@@ -433,7 +496,14 @@ class VITWorkerService(rpyc.Service):
     def _check_cache(
         self, content_hash: int, size_bytes: int
     ) -> Optional[Dict]:
-        """检查缓存是否命中"""
+        """检查缓存是否命中
+
+        🔧 缓存禁用时，总是返回 None (缓存未命中)
+        """
+        # 🔧 缓存禁用时，跳过缓存检查
+        if not self.cache_enabled or self.cache_client is None:
+            return None
+
         try:
             result = self.cache_client.root.alloc(content_hash, size_bytes)
             if result is None:
@@ -538,6 +608,7 @@ class VITWorkerService(rpyc.Service):
         🔧 Phase 2.C: rank0 通过 broadcast_tensor_dict 通知其他 rank 参与计算
         🔧 修复: 所有 rank 都执行 forward，只有 rank0 写缓存和返回结果
         🔧 修复: 复用 _check_cache 返回的 cache_id，避免重复分配
+        🔧 显存池: 估算显存需求，不满足则拒绝请求 (backpressure)
         """
         from sglang.srt.managers.vit_shm_utils import write_embedding_to_shm_raw
         from sglang.srt.distributed.communication_op import broadcast_tensor_dict
@@ -560,6 +631,101 @@ class VITWorkerService(rpyc.Service):
             f"[Worker {self.worker_id}] Rank {self.tp_rank}: computing batch size={len(cache_misses)} "
             f"request_ids={sample_ids}{more}"
         )
+
+        # 🔧 Phase 0: 显存池估算与监控
+        estimated_memory = 0
+        gpu_memory_before = 0
+        predicted_oom = False
+        available_mb = 0.0
+        safety_ratio = float(os.environ.get("SGLANG_VIT_MEMORY_SAFETY_RATIO", "0.9"))
+
+        if self.tp_rank == 0:
+            from sglang.srt.managers.vit_memory_pool import estimate_batch_memory
+            import torch
+
+            # 记录 forward 前的显存使用
+            if torch.cuda.is_available():
+                gpu_memory_before = torch.cuda.memory_allocated(self.device) / 1024**2  # MB
+
+            estimated_memory = estimate_batch_memory(
+                pixel_values_list=pixel_values_list,
+                image_grid_list=image_grid_thw_list,
+                embedding_dim=3584,  # Qwen2.5-VL
+                dtype_size=2,  # fp16
+                overhead_factor=1.5,
+            )
+
+            # 🔧 预估显存不足 -> 直接拒绝，避免触发 CUDA OOM
+            if torch.cuda.is_available():
+                try:
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(
+                        device=torch.device(self.device)
+                    )
+                    available_bytes = free_bytes * max(min(safety_ratio, 1.0), 0.1)
+                    available_mb = available_bytes / 1024**2
+                    if estimated_memory > available_bytes:
+                        predicted_oom = True
+                except Exception as e:
+                    logger.warning(
+                        f"[Worker {self.worker_id}] Failed to query GPU free memory before forward: {e}"
+                    )
+
+            if predicted_oom:
+                logger.warning(
+                    f"[Worker {self.worker_id}] ❌ OOM predicted: batch size={len(cache_misses)}, "
+                    f"estimated={estimated_memory / 1024**2:.2f} MB, "
+                    f"available~={available_mb:.2f} MB (safety_ratio={safety_ratio})"
+                )
+                for idx, *_ in cache_misses:
+                    results.append(
+                        {
+                            "request_id": request_ids[idx],
+                            "error": True,
+                            "error_message": "OOM predicted on ViT worker; please reduce batch size",
+                            "cache_id": None,
+                        }
+                    )
+                return results
+
+        if self.memory_pool is not None and self.tp_rank == 0:
+            if not self.memory_pool.can_allocate(estimated_memory):
+                # 显存池满，拒绝请求
+                logger.warning(
+                    f"[Worker {self.worker_id}] ❌ Memory pool full, rejecting batch size={len(cache_misses)}, "
+                    f"estimated_memory={estimated_memory / 1024**2:.2f} MB, "
+                    f"pool_usage={self.memory_pool.current_usage / 1024**2:.2f}/{self.memory_pool.max_memory_bytes / 1024**2:.2f} MB, "
+                    f"gpu_allocated={gpu_memory_before:.2f} MB"
+                )
+                # 返回错误给所有请求
+                for idx, *_ in cache_misses:
+                    results.append({
+                        "request_id": request_ids[idx],
+                        "error": True,
+                        "error_message": "Memory pool full, please retry later",
+                        "cache_id": None,
+                    })
+                return results
+
+            # 分配显存
+            if not self.memory_pool.allocate(estimated_memory):
+                # 分配失败（理论上不应该发生，因为 can_allocate 已经检查过）
+                logger.error(
+                    f"[Worker {self.worker_id}] ❌ Memory allocation failed, batch size={len(cache_misses)}"
+                )
+                for idx, *_ in cache_misses:
+                    results.append({
+                        "request_id": request_ids[idx],
+                        "error": True,
+                        "error_message": "Memory allocation failed",
+                        "cache_id": None,
+                    })
+                return results
+
+            logger.info(
+                f"[Worker {self.worker_id}] 📊 Memory allocated: estimated={estimated_memory / 1024**2:.2f} MB, "
+                f"pool_usage={self.memory_pool.current_usage / 1024**2:.2f}/{self.memory_pool.max_memory_bytes / 1024**2:.2f} MB, "
+                f"gpu_before={gpu_memory_before:.2f} MB"
+            )
 
         # 🔧 Phase 2.C: rank0 通过 broadcast_tensor_dict 通知其他 rank
         if self.tp_size > 1:
@@ -595,37 +761,68 @@ class VITWorkerService(rpyc.Service):
             try:
                 embedding = embeddings[i]
 
-                # 使用已分配的 cache_id，不再重复分配
-                if cache_id is None:
-                    # 如果没有 cache_id（缓存检查失败），重新分配
-                    size_bytes = embedding.nelement() * embedding.element_size()
-                    result = self.cache_client.root.alloc(content_hash, size_bytes)
-                    if result is None:
-                        raise RuntimeError("Failed to allocate cache")
-                    cache_id, is_new = result
+                # 🔧 缓存禁用时，跳过缓存写入
+                if self.cache_enabled and self.cache_client is not None:
+                    # 使用已分配的 cache_id，不再重复分配
+                    if cache_id is None:
+                        # 如果没有 cache_id（缓存检查失败），重新分配
+                        size_bytes = embedding.nelement() * embedding.element_size()
+                        result = self.cache_client.root.alloc(content_hash, size_bytes)
+                        if result is None:
+                            raise RuntimeError("Failed to allocate cache")
+                        cache_id, is_new = result
+                    else:
+                        # 复用已分配的 cache_id
+                        is_new = True  # 已经在 _check_cache 中分配，需要写入
+
+                    # 写入缓存 (如果是新分配)
+                    if is_new:
+                        shm_key = self.cache_client.root.get_shm_key(cache_id)
+                        if shm_key:
+                            from sglang.srt.managers.vit_shm_utils import cleanup_shared_memory
+
+                            # 确保旧的缓存块被清理，避免 FileExistsError
+                            cleanup_shared_memory(shm_key)
+
+                            success = write_embedding_to_shm_raw(shm_key, embedding.cpu())
+                            if not success:
+                                logger.error(
+                                    f"[Worker {self.worker_id}] Failed to write embedding to cache"
+                                )
+                                # 🔧 写入失败，释放 cache_id
+                                try:
+                                    self.cache_client.root.release(cache_id)
+                                except Exception as release_err:
+                                    logger.error(f"[Worker {self.worker_id}] Failed to release cache_id: {release_err}")
                 else:
-                    # 复用已分配的 cache_id
-                    is_new = True  # 已经在 _check_cache 中分配，需要写入
+                    # 🔧 缓存禁用，不分配 cache_id，直接通过请求级 SHM 返回 embedding
+                    cache_id = None
 
-                # 写入缓存 (如果是新分配)
-                if is_new:
-                    shm_key = self.cache_client.root.get_shm_key(cache_id)
-                    if shm_key:
-                        from sglang.srt.managers.vit_shm_utils import cleanup_shared_memory
+                    # 写入请求级 SHM
+                    from sglang.srt.managers.vit_shm_utils import (
+                        cleanup_embedding_shm,
+                        write_embedding_to_shm,
+                    )
 
-                        # 确保旧的缓存块被清理，避免 FileExistsError
-                        cleanup_shared_memory(shm_key)
-
-                        success = write_embedding_to_shm_raw(shm_key, embedding.cpu())
-                        if not success:
-                            logger.error(
-                                f"[Worker {self.worker_id}] Failed to write embedding to cache"
-                            )
-                            # 🔧 写入失败，释放 cache_id
-                            try:
-                                self.cache_client.root.release(cache_id)
-                            except Exception as release_err:
-                                logger.error(f"[Worker {self.worker_id}] Failed to release cache_id: {release_err}")
+                    request_id = request_ids[idx]
+                    cleanup_embedding_shm(request_id)
+                    success = write_embedding_to_shm(request_id, embedding.cpu())
+                    if not success:
+                        logger.error(
+                            f"[Worker {self.worker_id}] Failed to write embedding to request SHM: {request_id}"
+                        )
+                        # 写入失败，返回错误
+                        results.append(
+                            {
+                                "request_id": request_id,
+                                "cache_id": None,
+                                "from_cache": False,
+                                "compute_time": 0.0,
+                                "error": True,
+                                "error_message": "Failed to write embedding to request SHM",
+                            }
+                        )
+                        continue
 
                 results.append(
                     {
@@ -654,11 +851,33 @@ class VITWorkerService(rpyc.Service):
                         "request_id": request_ids[idx],  # 🔧 使用真实 request_id
                         "cache_id": None,
                         "from_cache": False,
-                            "compute_time": 0.0,
-                            "error": True,
-                            "error_message": str(e),
-                        }
-                    )
+                        "compute_time": 0.0,
+                        "error": True,
+                        "error_message": str(e),
+                    }
+                )
+
+        # 🔧 Phase 0: 显存池释放与监控
+        if self.memory_pool is not None and self.tp_rank == 0 and estimated_memory > 0:
+            import torch
+
+            # 记录 forward 后的显存使用
+            gpu_memory_after = 0
+            if torch.cuda.is_available():
+                gpu_memory_after = torch.cuda.memory_allocated(self.device) / 1024**2  # MB
+
+            self.memory_pool.release(estimated_memory)
+
+            # 计算实际显存增量
+            actual_memory_delta = gpu_memory_after - gpu_memory_before
+
+            logger.info(
+                f"[Worker {self.worker_id}] 📊 Memory released: estimated={estimated_memory / 1024**2:.2f} MB, "
+                f"actual_delta={actual_memory_delta:.2f} MB, "
+                f"gpu_after={gpu_memory_after:.2f} MB, "
+                f"pool_usage={self.memory_pool.current_usage / 1024**2:.2f}/{self.memory_pool.max_memory_bytes / 1024**2:.2f} MB, "
+                f"pool_peak={self.memory_pool.peak_usage / 1024**2:.2f} MB"
+            )
 
         return results
 

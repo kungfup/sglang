@@ -675,9 +675,16 @@ def _launch_subprocesses(
                 server_args.vit_scheduler_port = server_args.port + 1000
                 logger.info(f"VIT Scheduler port auto-generated: {server_args.vit_scheduler_port} (server_port + 1000)")
 
-            # 🔧 新架构: 启动 CacheServer 进程
+            # 🔧 设置 VIT 缓存禁用环境变量
+            if server_args.disable_vit_cache:
+                os.environ["SGLANG_VIT_DISABLE_CACHE"] = "1"
+                logger.info("[VIT CACHE] ViT embedding cache is DISABLED (--disable-vit-cache)")
+            else:
+                os.environ["SGLANG_VIT_DISABLE_CACHE"] = "0"
+
+            # 🔧 新架构: 启动 CacheServer 进程 (仅当缓存启用时)
             use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
-            if use_new_arch:
+            if use_new_arch and not server_args.disable_vit_cache:
                 from sglang.srt.managers.vit_cache_server import start_cache_server
 
                 cache_rpc_port = int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
@@ -704,8 +711,19 @@ def _launch_subprocesses(
 
                 # 设置环境变量供 VITScheduler 使用
                 os.environ["SGLANG_VIT_CACHE_RPC_PORT"] = str(cache_rpc_port)
+            elif use_new_arch and server_args.disable_vit_cache:
+                logger.info("[NEW ARCH] VIT CacheServer NOT started (cache disabled)")
             else:
                 logger.info("[LEGACY ARCH] Using in-process CacheServer")
+
+            # 默认开启 Worker Pool（除非用户显式关闭）
+            if (
+                use_new_arch
+                and "SGLANG_VIT_USE_WORKER_POOL" not in os.environ
+                and os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+            ):
+                os.environ["SGLANG_VIT_USE_WORKER_POOL"] = "1"
+                logger.info("[WORKER POOL] Default enable SGLANG_VIT_USE_WORKER_POOL=1 for batched ViT processing")
 
             # 🔧 Worker Pool: 启动 Worker Pool（如果启用）
             vit_worker_procs = []

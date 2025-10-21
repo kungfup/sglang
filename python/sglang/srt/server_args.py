@@ -104,6 +104,9 @@ class ServerArgs:
     vit_tp_size: int = 1  # VIT Tensor Parallelism size
     vit_tp_port: int = 29500  # VIT TP communication port (for NCCL)
 
+    # VIT Cache options
+    disable_vit_cache: bool = False  # Disable ViT embedding cache reuse across requests
+
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
@@ -914,6 +917,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.vit_tp_port,
             help="The NCCL communication port for VIT Scheduler TP (default: 29500).",
+        )
+        parser.add_argument(
+            "--disable-vit-cache",
+            action="store_true",
+            help="Disable ViT embedding cache reuse across requests. When enabled, each request will recompute ViT embeddings even for identical images.",
         )
 
         # Logging

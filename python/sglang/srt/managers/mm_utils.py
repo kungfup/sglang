@@ -294,6 +294,12 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
+    chunk_size = global_server_args_dict.get("chunked_prefill_size", None)
+    logger.info(
+        "[MM Utils] 🔧 Chunked prefill path triggered: chunked_prefill_size=%s, num_items=%d",
+        chunk_size,
+        len(embedding_items),
+    )
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
     for i in range(len(items_size) - 1):
@@ -403,11 +409,17 @@ def get_embedding_and_mask(
         A tuple containing:
         - The generated embeddings tensor
         - A boolean mask tensor indicating where these embeddings should be placed
+
+    🔧 CPU Staging 优化:
+    - embedding 优先留在 CPU（从 precomputed_features 获取）
+    - 只在即将使用时才搬到 GPU（就在这个函数内）
+    - 调用方不需要关心 CPU/GPU 转换
+    - 这样可以避免队列中的所有请求同时占用 GPU 显存
     """
-    # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items)
-    if embedding is None:
-        embedding = _get_chunked_prefill_embedding(
+    # 1. Get embedding (保持在 CPU)
+    embedding_cpu = _get_precomputed_embedding(embedding_items)
+    if embedding_cpu is None:
+        embedding_cpu = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
             items_size,
@@ -415,12 +427,49 @@ def get_embedding_and_mask(
             extend_length,
             items_offset_list,
         )
-        if embedding is None:
+        if embedding_cpu is None:
             return None, None
+
+    # ✅ CPU Staging: 将 embedding 从 CPU 搬到 GPU（对齐 LightLLM）
+    # LightLLM 在 ViT worker 中将嵌入 to(cpu)，只有在准备拼文本时才拷贝回 GPU
+    # 这样可以避免 GPU 内存累积，减少 OOM 风险
+    #
+    # 🔧 关键优化:
+    # - 只在这里即时搬到 GPU，而不是提前搬
+    # - 使用后由调用方负责释放（通过 Python GC 或显式 del）
+    if embedding_cpu.device.type == 'cpu':
+        target_device = input_ids.device
+        logger.debug(
+            "[MM Utils] 🔄 Moving embedding from CPU to GPU for prefill: "
+            "shape=%s, target_device=%s",
+            tuple(embedding_cpu.shape),
+            target_device,
+        )
+        embedding = embedding_cpu.to(target_device, non_blocking=True)
+        logger.debug(
+            "[MM Utils] ✅ Embedding moved to GPU: device=%s", embedding.device
+        )
+        # 显式删除 CPU tensor 引用，帮助 GC 及时释放
+        del embedding_cpu
+    else:
+        # 如果已经在 GPU 上（例如 chunked prefill 路径），直接使用
+        logger.debug(
+            "[MM Utils] ⚠️ Embedding already on GPU: device=%s",
+            embedding_cpu.device,
+        )
+        embedding = embedding_cpu
+
     # 2. Get mask
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+
+    # 🔧 返回的 embedding 在 GPU 上，调用方使用后应尽快释放
+    # 使用完后清理预计算特征，避免重复搬运
+    for item in embedding_items:
+        if hasattr(item, "precomputed_features"):
+            item.precomputed_features = None
+
     return embedding, special_multimodal_mask
 
 
@@ -558,6 +607,7 @@ def embed_mm_inputs(
     inputs_embeds = input_embedding(input_ids)
 
     # 4. scatter embeddings into input embedding
+    # 🔧 CPU Staging 优化: 使用后立即释放 GPU embedding
     for embedding, mask in zip(embeddings, masks):
         if embedding is None or mask is None:
             continue
@@ -566,6 +616,13 @@ def embed_mm_inputs(
             mask,
             embedding.to(inputs_embeds.device, inputs_embeds.dtype),
         )
+        # 🔧 显式删除 embedding 引用，释放 GPU 显存
+        # embedding 已经被 scatter 到 inputs_embeds 中，不再需要
+        del embedding
+
+    # 🔧 清理临时变量
+    del embeddings, masks
+
     return inputs_embeds
 
 

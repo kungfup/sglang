@@ -405,10 +405,16 @@ class ModelRunner:
                 f"because this is a multimodal model."
             )
             if not self.is_multimodal_chunked_prefill_supported:
+                prev_chunk = server_args.chunked_prefill_size
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
-                    f"{self.model_config.hf_config.model_type}"
+                    f"Automatically turn off chunked prefill for multimodal model {self.model_config.hf_config.model_type}; "
+                    f"original chunked_prefill_size={prev_chunk} -> -1"
+                )
+            else:
+                logger.info(
+                    f"Multimodal chunked prefill is supported for {self.model_config.hf_config.model_type}; "
+                    f"chunked_prefill_size remains {server_args.chunked_prefill_size}"
                 )
 
         if not self.use_mla_backend:

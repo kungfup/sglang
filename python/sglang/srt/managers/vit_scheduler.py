@@ -15,18 +15,21 @@ SGLang while modernising the internals to the stable LightLLM pattern.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import pickle
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import multiprocessing as mp
+import psutil
 import rpyc
 import torch
 import zmq
@@ -42,6 +45,14 @@ from sglang.srt.managers.vit_shm_utils import (
 from rpyc.utils.classic import obtain
 
 logger = logging.getLogger(__name__)
+
+# 🔑 Phase 4: asyncio/uvloop 支持
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    logger.info("[VIT Scheduler] Using uvloop for high-performance async I/O")
+except ImportError:
+    logger.warning("[VIT Scheduler] uvloop not available, using default asyncio event loop")
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -69,6 +80,52 @@ def _compute_request_hash(pixel_values: torch.Tensor, image_grid_thw: torch.Tens
     """Compute deterministic hash for a request (matches LightLLM strategy)."""
     buffer = pixel_values.cpu().numpy().tobytes() + image_grid_thw.cpu().numpy().tobytes()
     return int(hashlib.md5(buffer).hexdigest()[:16], 16)
+
+
+def _worker_process_bootstrap(
+    model_config,
+    worker_id: int,
+    tp_rank: int,
+    tp_size: int,
+    rpc_port: int,
+    cache_rpc_port: int,
+    ready_conn,
+    env_overrides: Optional[Dict[str, str]] = None,
+) -> None:
+    """Spawn helper used for in-process worker restarts."""
+    try:
+        if env_overrides:
+            os.environ.update(env_overrides)
+        os.environ.setdefault("SGLANG_VIT_TP_RANK", str(tp_rank))
+        os.environ.setdefault("SGLANG_VIT_TP_SIZE", str(tp_size))
+        os.environ.setdefault("SGLANG_VIT_WORKER_ID", str(worker_id))
+        # 让每个 Worker 拥有独立的 NCCL 端口，保持与 engine 中的逻辑一致
+        base_tp_port = int(os.environ.get("SGLANG_VIT_TP_PORT", "29500"))
+        os.environ["SGLANG_VIT_TP_PORT"] = str(base_tp_port + worker_id)
+        if ready_conn is not None:
+            ready_conn.send("ready")
+
+        from sglang.srt.managers.vit_worker_rpc import start_vit_worker_process
+
+        start_vit_worker_process(
+            worker_id=worker_id,
+            model_config=model_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            rpc_port=rpc_port,
+            cache_rpc_host="localhost",
+            cache_rpc_port=cache_rpc_port,
+        )
+    except Exception as exc:
+        if ready_conn is not None:
+            try:
+                ready_conn.send(f"error:{exc}")
+            except Exception:
+                pass
+        raise
+    finally:
+        if ready_conn is not None:
+            ready_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +294,7 @@ class VITRequest:
     image_grid_thw_shape: Tuple[int, ...]
     image_grid_thw_dtype: str
     hash_val: Optional[int] = None
+    cache_hit_retry_count: int = 0  # 🔧 Phase 3 补充: 缓存命中回退重试次数
 
 
 @dataclass
@@ -458,14 +516,25 @@ class VITScheduler:
         cache_rpc_port: Optional[int] = None,
         worker_rpc_port_start: Optional[int] = None,  # 🔧 新增: Worker Pool RPC 端口起始
         vit_dp: Optional[int] = None,  # 🔧 新增: ViT DP 大小
+        use_dynamic_batching: bool = False,  # 🔑 Phase 4: 动态批处理开关
     ):
         self.model_config = model_config
         self.device = device
         self.zmq_port = zmq_port
         self.batch_size = max(1, batch_size)
         self.batch_timeout = max(0.001, batch_timeout_ms / 1000.0)
-        self.max_pixel_values = int(os.environ.get("SGLANG_VIT_MAX_PIXEL_VALUES", "10000"))
-        self.max_batch_pixel_tokens = int(os.environ.get("SGLANG_VIT_MAX_BATCH_PIXEL_TOKENS", "0"))
+
+        # 🔑 Phase 4: 动态批处理配置
+        self.use_dynamic_batching = use_dynamic_batching or (os.environ.get("SGLANG_VIT_DYNAMIC_BATCHING", "0") == "1")
+        if self.use_dynamic_batching:
+            # 动态批处理: 初始接收数量
+            self.visual_recv_max_count = int(os.environ.get("SGLANG_VIT_RECV_MAX_COUNT", "64"))
+            logger.info(f"[VIT Scheduler] Dynamic batching enabled, initial recv_max_count={self.visual_recv_max_count}")
+        else:
+            # 固定批处理: 使用 batch_size
+            logger.info(f"[VIT Scheduler] Fixed batching enabled, batch_size={self.batch_size}")
+        self.max_pixel_values = int(os.environ.get("SGLANG_VIT_MAX_PIXEL_VALUES", "400000"))
+        self.max_batch_pixel_tokens = int(os.environ.get("SGLANG_VIT_MAX_BATCH_PIXEL_TOKENS", "800000"))
 
         env_cache_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "2048"))
         if cache_size_mb is None:
@@ -473,6 +542,11 @@ class VITScheduler:
         self.cache_size_bytes = cache_size_mb * 1024 * 1024
 
         self.benchmark_mode = os.environ.get("SGLANG_VIT_BENCHMARK_MODE", "0") == "1"
+
+        # 🔧 缓存禁用开关 (参考 LightLLM)
+        self.cache_enabled = os.environ.get("SGLANG_VIT_DISABLE_CACHE", "0") != "1"
+        if not self.cache_enabled:
+            logger.info("[VIT Scheduler] ViT embedding cache is DISABLED")
 
         self.tp_rank = int(os.environ.get("SGLANG_VIT_TP_RANK", "0"))
         self.tp_size = int(os.environ.get("SGLANG_VIT_TP_SIZE", "1"))
@@ -490,6 +564,26 @@ class VITScheduler:
         self.next_worker_id = 0  # DP 轮询计数器
         self.worker_executor = None  # ThreadPoolExecutor for concurrent RPC calls
         self.worker_rpc_timeout = float(os.environ.get("SGLANG_VIT_WORKER_RPC_TIMEOUT", "120.0"))
+        self.worker_processes: Dict[int, List[mp.Process]] = {}
+        self.worker_proc_ctx = mp.get_context("spawn")
+        self.worker_gpu_high_water_frac = float(
+            os.environ.get("SGLANG_VIT_WORKER_GPU_HIGH_WATER_FRAC", "0.995")
+        )
+        if not (0.0 < self.worker_gpu_high_water_frac < 1.0):
+            # Interpret <=0 or >=1 as disabling high-water throttling (LightLLM-style).
+            self.worker_gpu_high_water_frac = 0.0
+        self.worker_gpu_cooldown_s = float(
+            os.environ.get("SGLANG_VIT_WORKER_GPU_COOLDOWN_S", "1.5")
+        )
+        self.worker_restart_backoff = float(
+            os.environ.get("SGLANG_VIT_WORKER_RESTART_BACKOFF_S", "5.0")
+        )
+        self.worker_gpu_overflow_limit = int(
+            os.environ.get("SGLANG_VIT_WORKER_GPU_OVERFLOW_LIMIT", "3")
+        )
+        if self.worker_gpu_overflow_limit < 1:
+            self.worker_gpu_overflow_limit = 1
+        self.worker_gpu_overflow_count: Dict[int, int] = defaultdict(int)
 
         if self.tp_size > 1:
             self._init_distributed()
@@ -505,7 +599,7 @@ class VITScheduler:
             logger.info("[VIT Scheduler] ZMQ server listening on port %d", zmq_port)
 
         # 🔧 根据架构选择缓存实现
-        if self.use_new_arch:
+        if self.use_new_arch and self.cache_enabled:
             # 连接 CacheServer (RPyC)
             import rpyc
             try:
@@ -519,6 +613,11 @@ class VITScheduler:
             except Exception as e:
                 logger.error(f"[VIT Scheduler] Failed to connect to CacheServer: {e}")
                 raise
+        elif self.use_new_arch and not self.cache_enabled:
+            # 新架构但缓存禁用
+            self.cache_client = None
+            self.cache_server = None
+            logger.info("[VIT Scheduler] CacheServer NOT connected (cache disabled)")
         else:
             # 使用旧的进程内 CacheServer
             self.cache_server = VITCacheServer(self.cache_size_bytes)
@@ -540,6 +639,10 @@ class VITScheduler:
         self._free_queue: "deque[int]" = deque()
         self._free_lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        # 🔑 Phase 4: asyncio 队列（仅在 asyncio 模式下使用）
+        self._request_queue_async: Optional[asyncio.Queue] = None
+        self._free_queue_async: Optional[asyncio.Queue] = None
 
         self.total_requests = 0
         self.cache_hits = 0
@@ -574,11 +677,21 @@ class VITScheduler:
 
         logger.info(f"[VIT Scheduler] Connecting to Worker Pool: vit_dp={self.vit_dp}, port_start={self.worker_rpc_port_start}")
 
-        # 兼容旧版本: 若属性未初始化，补默认值
+        # 🔧 Phase 0: Worker Watchdog 配置
         if not hasattr(self, "worker_last_health_check"):
             self.worker_last_health_check = {}
         if not hasattr(self, "worker_health_check_interval"):
-            self.worker_health_check_interval = 30.0
+            self.worker_health_check_interval = float(os.environ.get("SGLANG_VIT_WORKER_HEALTH_CHECK_INTERVAL", "30.0"))
+        if not hasattr(self, "worker_timeout_threshold"):
+            self.worker_timeout_threshold = float(os.environ.get("SGLANG_VIT_WORKER_TIMEOUT_THRESHOLD", "180.0"))  # 3分钟无响应视为超时
+        if not hasattr(self, "worker_restart_enabled"):
+            self.worker_restart_enabled = (
+                os.environ.get("SGLANG_VIT_WORKER_RESTART_ENABLED", "0") == "1"
+            )
+
+        # Worker 进程引用（用于重启）
+        self.worker_processes = {}
+        self.worker_restart_count = {}
 
         for worker_id in range(self.vit_dp):
             port = self.worker_rpc_port_start + worker_id
@@ -593,6 +706,9 @@ class VITScheduler:
                     },
                 )
                 self.worker_clients.append(client)
+                self.worker_restart_count[worker_id] = 0
+                self.worker_last_health_check[worker_id] = time.time()
+                self.worker_gpu_overflow_count[worker_id] = 0
                 logger.info(f"[VIT Scheduler] Connected to Worker {worker_id} on port {port}")
             except Exception as e:
                 logger.error(f"[VIT Scheduler] Failed to connect to Worker {worker_id} on port {port}: {e}")
@@ -604,14 +720,19 @@ class VITScheduler:
         self.worker_executor = ThreadPoolExecutor(max_workers=self.vit_dp, thread_name_prefix="vit_worker_rpc")
         logger.info(f"[VIT Scheduler] ThreadPoolExecutor initialized with {self.vit_dp} workers")
 
-        # 🔧 Phase 2.B: 初始化健康检查时间戳
+        # 🔧 Phase 0: 初始化健康检查时间戳
         for worker_id in range(self.vit_dp):
             self.worker_last_health_check[worker_id] = time.time()
+
+        logger.info(
+            f"[VIT Scheduler] Worker Watchdog enabled: health_check_interval={self.worker_health_check_interval}s, "
+            f"timeout_threshold={self.worker_timeout_threshold}s, restart_enabled={self.worker_restart_enabled}"
+        )
 
     def _check_worker_health(self, worker_id: int) -> bool:
         """检查 Worker 健康状态
 
-        🔧 Phase 2.B: Worker 健康检查
+        🔧 Phase 0: Worker Watchdog - 心跳检测
 
         Args:
             worker_id: Worker ID
@@ -619,8 +740,12 @@ class VITScheduler:
         Returns:
             bool: True 表示健康，False 表示不健康
         """
+        if worker_id >= len(self.worker_clients):
+            return False
+        client = self.worker_clients[worker_id]
+        if client is None:
+            return False
         try:
-            client = self.worker_clients[worker_id]
             result = client.root.ping()
 
             # 转换 RPyC netref 为本地对象
@@ -641,6 +766,289 @@ class VITScheduler:
         except Exception as e:
             logger.error(f"[VIT Scheduler] Worker {worker_id} health check error: {e}")
             return False
+
+    def _restart_worker(self, worker_id: int) -> bool:
+        """重启 Worker 进程
+
+        🔧 Phase 0: Worker Watchdog - 快速恢复机制
+
+        Args:
+            worker_id: Worker ID
+
+        Returns:
+            bool: True 表示重启成功，False 表示重启失败
+        """
+        if not self.worker_restart_enabled:
+            logger.warning(f"[VIT Scheduler] Worker {worker_id} restart disabled by config")
+            return False
+
+        max_restart_attempts = 3
+        if self.worker_restart_count.get(worker_id, 0) >= max_restart_attempts:
+            logger.error(
+                f"[VIT Scheduler] Worker {worker_id} has been restarted {max_restart_attempts} times, "
+                f"giving up to avoid restart loop"
+            )
+            return False
+
+        logger.warning(f"[VIT Scheduler] Attempting to restart Worker {worker_id}...")
+
+        try:
+            # 1. 关闭旧连接
+            if worker_id < len(self.worker_clients):
+                old_client = self.worker_clients[worker_id]
+                if old_client is not None:
+                    try:
+                        old_client.close()
+                    except Exception as e:
+                        logger.warning(
+                            f"[VIT Scheduler] Failed to close old client for Worker {worker_id}: {e}"
+                        )
+                self.worker_clients[worker_id] = None
+
+            # 2. 终止残留进程
+            self._terminate_worker_processes(worker_id)
+
+            # 3. 启动新的 Worker 进程组
+            if not self._spawn_worker_group(worker_id):
+                logger.error(f"[VIT Scheduler] Worker {worker_id} spawn failed")
+                return False
+
+            time.sleep(self.worker_restart_backoff)
+
+            # 4. 重建连接（最多重试 5 次）
+            port = self.worker_rpc_port_start + worker_id
+            for attempt in range(5):
+                try:
+                    new_client = rpyc.connect(
+                        "localhost",
+                        port,
+                        config={
+                            "allow_public_attrs": True,
+                            "allow_pickle": True,
+                            "sync_request_timeout": 300,
+                        },
+                    )
+                    result = new_client.root.ping()
+                    if hasattr(result, "_getvalue"):
+                        result = result._getvalue()
+                    elif hasattr(result, "value"):
+                        result = result.value
+                    else:
+                        result = obtain(result)
+
+                    if result.get("status") != "ok":
+                        raise RuntimeError(
+                            f"Worker {worker_id} ping failed after restart: {result}"
+                        )
+
+                    self.worker_clients[worker_id] = new_client
+                    self.worker_last_health_check[worker_id] = time.time()
+                    self.worker_restart_count[worker_id] = (
+                        self.worker_restart_count.get(worker_id, 0) + 1
+                    )
+                    logger.info(
+                        "[VIT Scheduler] ✅ Worker %d restarted successfully (restart_count=%d)",
+                        worker_id,
+                        self.worker_restart_count[worker_id],
+                    )
+                    return True
+                except Exception as retry_exc:
+                    logger.warning(
+                        "[VIT Scheduler] Worker %d reconnect attempt %d failed: %s",
+                        worker_id,
+                        attempt + 1,
+                        retry_exc,
+                    )
+                    time.sleep(self.worker_restart_backoff)
+
+            logger.error(f"[VIT Scheduler] Worker {worker_id} failed to reconnect after restart")
+            return False
+        except Exception as e:
+            logger.error(f"[VIT Scheduler] Failed to restart Worker {worker_id}: {e}", exc_info=True)
+            return False
+
+    @staticmethod
+    def _kill_process(proc: mp.Process, timeout: float = 5.0) -> None:
+        """Terminate a multiprocessing.Process safely."""
+        if proc is None:
+            return
+        if not proc.is_alive():
+            proc.close()
+            return
+        proc.terminate()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=timeout)
+        proc.close()
+
+    def _terminate_worker_processes(self, worker_id: int) -> None:
+        """Terminate worker subprocesses started by the scheduler."""
+        processes = self.worker_processes.pop(worker_id, [])
+        for proc in processes:
+            self._kill_process(proc)
+
+        if processes:
+            logger.info("[VIT Scheduler] Terminated tracked worker processes for worker %d", worker_id)
+            return
+
+        # Fallback: inspect system processes by environment variables
+        target_port = str(self.vit_tp_port + worker_id)
+        terminated_pids = []
+        for proc in psutil.process_iter(attrs=["pid", "name"]):
+            try:
+                env = proc.environ()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+            if env.get("SGLANG_VIT_TP_PORT") == target_port:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                terminated_pids.append(proc.pid)
+        if terminated_pids:
+            logger.info(
+                "[VIT Scheduler] Terminated worker %d processes via psutil: %s",
+                worker_id,
+                terminated_pids,
+            )
+
+    def _spawn_worker_group(self, worker_id: int) -> bool:
+        """Spawn a fresh worker group (all TP ranks) for the given worker_id."""
+        if self.tp_size <= 0:
+            return False
+
+        processes: List[Tuple[mp.Process, mp.connection.Connection]] = []
+        rpc_port = self.worker_rpc_port_start + worker_id
+        env_overrides = {"SGLANG_VIT_WORKER_ID": str(worker_id)}
+        try:
+            success = True
+            for tp_rank in range(self.tp_size):
+                parent_conn, child_conn = self.worker_proc_ctx.Pipe(duplex=False)
+                proc = self.worker_proc_ctx.Process(
+                    target=_worker_process_bootstrap,
+                    args=(
+                        self.model_config,
+                        worker_id,
+                        tp_rank,
+                        self.tp_size,
+                        rpc_port,
+                        self.cache_rpc_port,
+                        child_conn,
+                        env_overrides,
+                    ),
+                    daemon=True,
+                )
+                proc.start()
+                processes.append((proc, parent_conn))
+
+            for proc, conn in processes:
+                if not conn.poll(timeout=30):
+                    logger.error(
+                        "[VIT Scheduler] Worker %d TP rank process startup timeout (pid=%s)",
+                        worker_id,
+                        proc.pid,
+                    )
+                    success = False
+                    break
+                message = conn.recv()
+                if isinstance(message, str) and message.startswith("error:"):
+                    logger.error(
+                        "[VIT Scheduler] Worker %d TP rank process failed: %s",
+                        worker_id,
+                        message,
+                    )
+                    success = False
+                    break
+
+            if success:
+                self.worker_processes[worker_id] = [proc for proc, _ in processes]
+            else:
+                for proc, _ in processes:
+                    self._kill_process(proc)
+
+            return success
+        finally:
+            for _, conn in processes:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _is_worker_gpu_saturated(self, worker_id: int) -> Tuple[bool, float]:
+        """Check whether worker GPU usage exceeds configured high-water mark."""
+        if (
+            self.worker_gpu_high_water_frac <= 0.0
+            or self.worker_gpu_high_water_frac >= 1.0
+            or worker_id >= len(self.worker_clients)
+        ):
+            return False, 0.0
+
+        client = self.worker_clients[worker_id]
+        if client is None:
+            return True, 1.0
+
+        try:
+            stats = client.root.get_memory_stats()
+            total = float(stats.get("total", 0.0))
+            used = float(stats.get("used", 0.0))
+            if total <= 0:
+                return False, 0.0
+            usage_ratio = used / total
+            self.worker_last_health_check[worker_id] = time.time()
+            if usage_ratio >= self.worker_gpu_high_water_frac:
+                return True, usage_ratio
+            return False, usage_ratio
+        except Exception as exc:
+            logger.warning(
+                "[VIT Scheduler] Failed to obtain GPU memory stats from worker %d: %s",
+                worker_id,
+                exc,
+            )
+        return False, 0.0
+
+    def _check_and_recover_workers(self) -> None:
+        """检查所有 Worker 的健康状态，必要时重启
+
+        🔧 Phase 0: Worker Watchdog - 主动监控循环
+        """
+        if not self.use_worker_pool:
+            return
+        if not self.worker_restart_enabled:
+            return
+
+        current_time = time.time()
+
+        for worker_id in range(len(self.worker_clients)):
+            if self.worker_clients[worker_id] is None:
+                continue
+            last_check = self.worker_last_health_check.get(worker_id, current_time)
+            time_since_last_check = current_time - last_check
+
+            # 检查是否超时
+            if time_since_last_check > self.worker_timeout_threshold:
+                logger.error(
+                    f"[VIT Scheduler] ❌ Worker {worker_id} timeout detected: "
+                    f"no response for {time_since_last_check:.1f}s (threshold={self.worker_timeout_threshold}s)"
+                )
+
+                # 尝试重启
+                if self._restart_worker(worker_id):
+                    logger.info(f"[VIT Scheduler] Worker {worker_id} recovered after timeout")
+                else:
+                    logger.error(f"[VIT Scheduler] Worker {worker_id} recovery failed, marking as unhealthy")
+
+            # 定期心跳检测
+            elif time_since_last_check > self.worker_health_check_interval:
+                is_healthy = self._check_worker_health(worker_id)
+                if not is_healthy:
+                    logger.warning(
+                        f"[VIT Scheduler] Worker {worker_id} health check failed, "
+                        f"attempting restart..."
+                    )
+                    self._restart_worker(worker_id)
 
     def _health_check_loop(self):
         """健康检查循环
@@ -760,11 +1168,249 @@ class VITScheduler:
         if self.context is not None:
             self.context.term()
 
+    # ------------------------------------------------------------------
+    # Phase 4: asyncio event loop
+    # ------------------------------------------------------------------
+
+    def run_async(self):
+        """asyncio 事件循环入口
+
+        🔑 Phase 4: 新增方法，使用 asyncio/uvloop 事件循环
+        """
+        if self.tp_rank > 0:
+            self._run_tp_worker()
+            return
+
+        # 只在不使用 Worker Pool 时加载模型
+        if not self.use_worker_pool:
+            self.model_runner.load_model()
+
+        # 初始化 asyncio 队列
+        self._request_queue_async = asyncio.Queue()
+        self._free_queue_async = asyncio.Queue()
+
+        # 创建 asyncio 事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        logger.info("[VIT Scheduler] Starting asyncio event loop")
+
+        # 启动协程
+        try:
+            loop.run_until_complete(self._run_event_loop_async())
+        except KeyboardInterrupt:
+            logger.info("[VIT Scheduler] keyboard interrupt, shutting down")
+            self._stop_event.set()
+        finally:
+            loop.close()
+            self.cleanup()
+
+    async def _run_event_loop_async(self):
+        """运行所有异步循环
+
+        🔑 Phase 4: 使用 asyncio.gather 并发运行所有循环
+        """
+        tasks = [
+            self._io_loop_async(),
+            self._compute_loop_async(),
+            self._free_loop_async(),
+            self._monitor_loop_async(),
+        ]
+
+        # 🔧 Phase 2.B: 健康检查循环（仅 Worker Pool 模式）
+        if self.use_worker_pool:
+            tasks.append(self._health_check_loop_async())
+
+        await asyncio.gather(*tasks)
+
+    async def _io_loop_async(self):
+        """异步 I/O 循环 - 接收请求
+
+        🔑 Phase 4: 动态批处理 - 自适应调整接收数量
+        """
+        if self.use_dynamic_batching and not hasattr(self, "visual_recv_max_count"):
+            self.visual_recv_max_count = 64
+
+        while not self._stop_event.is_set():
+            try:
+                pulled = 0
+
+                if self.use_dynamic_batching:
+                    # 🔑 动态批处理: 尝试拉取 visual_recv_max_count 个请求
+                    for _ in range(self.visual_recv_max_count):
+                        try:
+                            data = self.socket.recv(zmq.NOBLOCK)
+                            request = pickle.loads(data)
+                            await self._request_queue_async.put(request)
+                            pulled += 1
+                        except zmq.ZMQError:
+                            break
+
+                    # 🔑 动态调整: 拉满了就增加上限
+                    if pulled == self.visual_recv_max_count:
+                        old_count = self.visual_recv_max_count
+                        self.visual_recv_max_count = min(int(self.visual_recv_max_count * 1.3), 256)
+                        if self.visual_recv_max_count != old_count:
+                            logger.debug(f"[VIT Scheduler] Increased recv_max_count: {old_count} → {self.visual_recv_max_count}")
+                    elif pulled == 0:
+                        # 🔑 队列清空时下调
+                        old_count = self.visual_recv_max_count
+                        self.visual_recv_max_count = max(32, int(self.visual_recv_max_count / 1.3))
+                        if self.visual_recv_max_count != old_count:
+                            logger.debug(f"[VIT Scheduler] Decreased recv_max_count: {old_count} → {self.visual_recv_max_count}")
+                else:
+                    # 🔑 固定批处理: 单次接收
+                    try:
+                        data = self.socket.recv(zmq.NOBLOCK)
+                        request = pickle.loads(data)
+                        await self._request_queue_async.put(request)
+                    except zmq.ZMQError:
+                        pass
+
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] I/O loop error: {e}", exc_info=True)
+
+            await asyncio.sleep(0.01)  # 10ms
+
+    async def _compute_loop_async(self):
+        """异步计算循环 - 批处理 + Worker 调用
+
+        🔑 Phase 4: 立即发送 + 流水线 + 动态批处理
+        """
+        pending = []
+        first_enqueue_time = None
+
+        while not self._stop_event.is_set():
+            # 计算 flush deadline
+            if first_enqueue_time is not None:
+                elapsed = time.time() - first_enqueue_time
+                if elapsed >= self.batch_timeout:
+                    flush_deadline = time.time()
+                else:
+                    flush_deadline = first_enqueue_time + self.batch_timeout
+            else:
+                flush_deadline = time.time() + self.batch_timeout
+
+            # 尝试接收请求
+            timeout = max(0.001, flush_deadline - time.time())
+            try:
+                request = await asyncio.wait_for(
+                    self._request_queue_async.get(),
+                    timeout=timeout
+                )
+
+                # 🔑 Phase 3.1: 立即发送机制 - 检查缓存
+                if self.cache_enabled and self.cache_client is not None:
+                    cache_id = self._check_cache_hit(request)
+                    if cache_id is not None:
+                        # 🔑 cache hit，立即发送
+                        self._send_cache_hit_response(request, cache_id)
+                        logger.info(
+                            f"[VIT Scheduler] ✅ Cache hit, sent immediately: "
+                            f"request_id={request.request_id}, cache_id={cache_id}, hash={request.hash_val}"
+                        )
+                        continue  # 不加入 pending
+
+                # cache miss，加入 pending
+                pending.append(request)
+                if first_enqueue_time is None:
+                    first_enqueue_time = time.time()
+
+            except asyncio.TimeoutError:
+                pass
+
+            # 检查是否需要 flush
+            should_flush = False
+            if len(pending) >= self.batch_size:
+                should_flush = True
+            elif len(pending) > 0 and time.time() >= flush_deadline:
+                should_flush = True
+
+            if should_flush:
+                # 🔑 异步调用 Worker（简化版本：复用同步方法）
+                # TODO: 完整实现 _dispatch_to_workers_async
+                if self.use_worker_pool:
+                    self._dispatch_to_workers(pending)
+                else:
+                    self._process_batch(pending)
+
+                pending.clear()
+                first_enqueue_time = None
+
+            await asyncio.sleep(0.001)  # 1ms
+
+    async def _free_loop_async(self):
+        """异步释放循环 - 缓存释放
+
+        🔑 Phase 4: 转换为 asyncio
+        """
+        while not self._stop_event.is_set():
+            try:
+                request_id = await asyncio.wait_for(
+                    self._free_queue_async.get(),
+                    timeout=0.1
+                )
+
+                # 释放逻辑（复用同步方法）
+                with self._free_lock:
+                    cache_id = self._request_to_cache.pop(request_id, None)
+                    if cache_id is not None and self.cache_client is not None:
+                        try:
+                            self.cache_client.root.release(cache_id)
+                            logger.debug(f"[VIT Scheduler] Released cache: request_id={request_id}, cache_id={cache_id}")
+                        except Exception as e:
+                            logger.error(f"[VIT Scheduler] Failed to release cache: {e}")
+
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.error(f"[VIT Scheduler] Free loop error: {e}", exc_info=True)
+
+            await asyncio.sleep(0.001)
+
+    async def _monitor_loop_async(self):
+        """异步监控循环 - 统计信息
+
+        🔑 Phase 4: 转换为 asyncio
+        """
+        while not self._stop_event.is_set():
+            await asyncio.sleep(30.0)
+
+            # 输出统计信息（复用同步方法的逻辑）
+            if self.total_requests > 0:
+                hit_rate = self.cache_hits / self.total_requests * 100
+                avg_time = self.total_compute_time / self.total_requests * 1000
+                logger.info(
+                    f"[VIT Scheduler] Stats: total={self.total_requests}, "
+                    f"cache_hit_rate={hit_rate:.1f}%, avg_compute_time={avg_time:.1f}ms"
+                )
+
+    async def _health_check_loop_async(self):
+        """异步健康检查循环 - Worker Pool 健康检查
+
+        🔑 Phase 4: 转换为 asyncio
+        """
+        while not self._stop_event.is_set():
+            await asyncio.sleep(self.worker_health_check_interval)
+
+            # 健康检查逻辑（复用同步方法）
+            for worker_id in range(len(self.worker_clients)):
+                try:
+                    # 简单的 ping 检查
+                    self.worker_clients[worker_id].ping(timeout=5.0)
+                    self.worker_last_health_check[worker_id] = time.time()
+                except Exception as e:
+                    logger.warning(f"[VIT Scheduler] Worker {worker_id} health check failed: {e}")
+
         # 🔧 关闭 Worker Pool ThreadPoolExecutor
         if self.worker_executor is not None:
             logger.info("[VIT Scheduler] Shutting down worker executor")
             self.worker_executor.shutdown(wait=False)
             self.worker_executor = None
+
+        if self.worker_processes:
+            for worker_id in list(self.worker_processes.keys()):
+                self._terminate_worker_processes(worker_id)
 
         # 🔧 关闭 Worker Pool RPC 连接
         if self.use_worker_pool and self.worker_clients:
@@ -849,31 +1495,80 @@ class VITScheduler:
 
         - Worker Pool 模式: 调度到 Worker Pool
         - In-Process 模式: 本地计算
+
+        🔧 批处理聚合逻辑:
+        - 达到 batch_size 时立即处理
+        - 超过 batch_timeout 时处理当前批次
+        - 这样可以平衡延迟和吞吐量
+
+        🔧 Phase 0: Worker Watchdog 集成
+        - 定期检查 Worker 健康状态
+        - 超时自动重启
         """
         pending: List[VITRequest] = []
         flush_deadline = time.time() + self.batch_timeout
+        first_enqueue_time = None  # 🔧 记录第一个请求入队时间
+        last_watchdog_check = time.time()  # 🔧 Phase 0: 上次 Watchdog 检查时间
 
         # 🔧 根据模式选择处理函数
         process_fn = self._dispatch_to_workers if self.use_worker_pool else self._process_batch
 
         while not self._stop_event.is_set():
+            # 🔧 Phase 0: Worker Watchdog - 定期检查 Worker 健康状态
+            current_time = time.time()
+            if self.use_worker_pool and (current_time - last_watchdog_check) > self.worker_health_check_interval:
+                self._check_and_recover_workers()
+                last_watchdog_check = current_time
+            # 🔧 达到 batch_size，立即处理
             if len(pending) >= self.batch_size:
+                wait_time = time.time() - first_enqueue_time if first_enqueue_time else 0
+                logger.info(
+                    f"[VIT Scheduler] Batch full: size={len(pending)}, wait_time={wait_time*1000:.1f}ms"
+                )
                 process_fn(pending)
                 pending = []
                 flush_deadline = time.time() + self.batch_timeout
+                first_enqueue_time = None
                 continue
 
             timeout = max(0.0, flush_deadline - time.time())
             try:
                 request = self._request_queue.get(timeout=timeout)
+
+                # 🔑 Phase 3.1: 立即发送机制 - 检查缓存
+                if self.cache_enabled and self.cache_client is not None:
+                    cache_id = self._check_cache_hit(request)
+                    if cache_id is not None:
+                        # 🔑 cache hit，立即发送
+                        self._send_cache_hit_response(request, cache_id)
+                        logger.info(
+                            f"[VIT Scheduler] ✅ Cache hit, sent immediately: "
+                            f"request_id={request.request_id}, cache_id={cache_id}, hash={request.hash_val}"
+                        )
+                        continue  # 不加入 pending
+
+                # cache miss，加入 pending
                 pending.append(request)
+                if first_enqueue_time is None:
+                    first_enqueue_time = time.time()
+                logger.debug(
+                    f"[VIT Scheduler] Request queued: {request.request_id}, pending={len(pending)}/{self.batch_size}"
+                )
             except Empty:
+                # 🔧 超时，处理当前批次
                 if pending:
+                    wait_time = time.time() - first_enqueue_time if first_enqueue_time else 0
+                    logger.info(
+                        f"[VIT Scheduler] Batch timeout: size={len(pending)}, wait_time={wait_time*1000:.1f}ms, timeout={self.batch_timeout*1000:.1f}ms"
+                    )
                     process_fn(pending)
                     pending = []
+                    first_enqueue_time = None
                 flush_deadline = time.time() + self.batch_timeout
 
+        # 🔧 退出时处理剩余请求
         if pending:
+            logger.info(f"[VIT Scheduler] Processing remaining batch: size={len(pending)}")
             process_fn(pending)
 
     def _free_loop(self):
@@ -976,18 +1671,44 @@ class VITScheduler:
         if not requests:
             return
 
+        total_batch = len(requests)
+        logger.info(
+            "[VIT Scheduler] 🚀 Dispatching %d request(s) to worker pool (batch_timeout=%.1fms)",
+            total_batch,
+            self.batch_timeout * 1000,
+        )
+
         # 按 Worker 分组 (DP 轮询)
+        if not self.worker_clients:
+            for request in requests:
+                self._request_queue.put(request)
+            logger.warning("[VIT Scheduler] No worker clients available; re-queued %d request(s)", len(requests))
+            return
+
         tasks_per_worker = [[] for _ in range(len(self.worker_clients))]
         for request in requests:
-            worker_id = self.next_worker_id % len(self.worker_clients)
-            tasks_per_worker[worker_id].append(request)
-            self.next_worker_id += 1
+            assigned = False
+            attempts = 0
+            while attempts < len(self.worker_clients):
+                worker_id = self.next_worker_id % len(self.worker_clients)
+                self.next_worker_id += 1
+                if self.worker_clients[worker_id] is None:
+                    attempts += 1
+                    continue
+                tasks_per_worker[worker_id].append(request)
+                assigned = True
+                break
+            if not assigned:
+                self._request_queue.put(request)
+
 
         # 🔧 并发调用 Worker (使用 ThreadPoolExecutor)
+        # 🔑 Phase 3.2: 流水线发送 - Worker 完成后立即发送结果
         def call_worker(worker_id: int, tasks: List[VITRequest]):
             """调用单个 Worker 的辅助函数
 
             🔧 Phase 2.B: 支持重试逻辑
+            🔑 Phase 3.2: 流水线发送 - 立即处理结果
             """
             if not tasks:
                 return worker_id, []
@@ -1026,7 +1747,14 @@ class VITScheduler:
                         self.worker_retry_count += 1
                         logger.info(f"[VIT Scheduler] Worker {worker_id} succeeded after {attempt} retries")
 
-                    return worker_id, list(zip(tasks, results))
+                    self.worker_last_health_check[worker_id] = time.time()
+
+                    # 🔑 Phase 3.2: 流水线发送 - 立即处理结果，不等待其他 Worker
+                    for task, result in zip(tasks, results):
+                        self._handle_worker_result(task, result)
+
+                    logger.debug(f"[VIT Scheduler] Worker {worker_id} completed and sent {len(tasks)} results")
+                    return worker_id, []  # 已经处理完毕，返回空列表
 
                 except Exception as e:
                     last_error = e
@@ -1037,27 +1765,65 @@ class VITScheduler:
                         logger.error(f"[VIT Scheduler] Worker {worker_id} failed after {max_retries + 1} attempts: {e}", exc_info=True)
                         self.worker_failure_count += 1
 
-            # 所有重试都失败，返回错误结果
-            error_results = [
-                {
-                    "request_id": t.request_id,
-                    "error": True,
-                    "error_message": str(last_error),
-                }
-                for t in tasks
-            ]
-            return worker_id, list(zip(tasks, error_results))
+            # 🔑 Phase 3.2: 所有重试都失败，立即发送错误结果
+            for task in tasks:
+                self._handle_worker_result(
+                    task,
+                    {
+                        "request_id": task.request_id,
+                        "error": True,
+                        "error_message": str(last_error),
+                    }
+                )
+            return worker_id, []  # 已经处理完毕，返回空列表
 
         # 提交所有 Worker 任务
         futures = []
         future_to_tasks: Dict = {}
+        high_water_enabled = 0.0 < self.worker_gpu_high_water_frac < 1.0
         for worker_id, tasks in enumerate(tasks_per_worker):
-            if tasks:
-                future = self.worker_executor.submit(call_worker, worker_id, tasks)
-                futures.append(future)
-                future_to_tasks[future] = (worker_id, tasks)
+            if not tasks:
+                continue
+            if worker_id >= len(self.worker_clients) or self.worker_clients[worker_id] is None:
+                for task in tasks:
+                    self._request_queue.put(task)
+                continue
+            if high_water_enabled:
+                saturated, usage_ratio = self._is_worker_gpu_saturated(worker_id)
+                if saturated:
+                    self.worker_gpu_overflow_count[worker_id] += 1
+                    if self.worker_gpu_overflow_count[worker_id] >= self.worker_gpu_overflow_limit:
+                        logger.warning(
+                            "[VIT Scheduler] Worker %d GPU usage %.2f%% exceeds %.2f%% for %d consecutive checks; cooling down %.1fs",
+                            worker_id,
+                            usage_ratio * 100.0,
+                            self.worker_gpu_high_water_frac * 100.0,
+                            self.worker_gpu_overflow_limit,
+                            self.worker_gpu_cooldown_s,
+                        )
+                        for task in tasks:
+                            self._request_queue.put(task)
+                        self.worker_gpu_overflow_count[worker_id] = 0
+                        time.sleep(self.worker_gpu_cooldown_s)
+                        continue
+                    else:
+                        logger.debug(
+                            "[VIT Scheduler] Worker %d temporarily above GPU high-water mark (%.2f%%); allowing dispatch (count=%d/%d)",
+                            worker_id,
+                            usage_ratio * 100.0,
+                            self.worker_gpu_overflow_count[worker_id],
+                            self.worker_gpu_overflow_limit,
+                        )
+                else:
+                    self.worker_gpu_overflow_count[worker_id] = 0
+            else:
+                self.worker_gpu_overflow_count[worker_id] = 0
 
-        # 等待所有任务完成并处理结果
+            future = self.worker_executor.submit(call_worker, worker_id, tasks)
+            futures.append(future)
+            future_to_tasks[future] = (worker_id, tasks)
+
+        # 🔑 Phase 3.2: 流水线发送 - 等待所有任务完成（结果已在 call_worker 中处理）
         if not futures:
             return
 
@@ -1065,8 +1831,9 @@ class VITScheduler:
             for future in as_completed(futures, timeout=self.worker_rpc_timeout):
                 try:
                     worker_id, task_results = future.result()
-                    for task, result in task_results:
-                        self._handle_worker_result(task, result)
+                    # 🔑 Phase 3.2: task_results 已经是空列表（结果已在 call_worker 中处理）
+                    if task_results:
+                        logger.warning(f"[VIT Scheduler] Unexpected task_results from worker {worker_id}: {len(task_results)}")
                 except Exception as e:
                     logger.error(f"[VIT Scheduler] Failed to get worker result: {e}", exc_info=True)
         except FuturesTimeoutError:
@@ -1080,6 +1847,7 @@ class VITScheduler:
                 if not future.done():
                     worker_id, tasks = future_to_tasks.get(future, (None, []))
                     future.cancel()
+                    # 🔑 Phase 3.2: 立即发送超时错误
                     for task in tasks:
                         self._handle_worker_result(
                             task,
@@ -1093,7 +1861,10 @@ class VITScheduler:
                         )
 
     def _handle_worker_result(self, request: VITRequest, result: Dict) -> None:
-        """处理 Worker 返回的结果"""
+        """处理 Worker 返回的结果
+
+        🔧 缓存禁用时，cache_id=None 是正常的，Worker 会直接通过 SHM 返回 embedding
+        """
         if result.get("error", False):
             # 错误结果
             self._send_error_response(
@@ -1107,8 +1878,8 @@ class VITScheduler:
             from_cache = result.get("from_cache", False)
             compute_time = result.get("compute_time", 0.0)
 
-            # 读取缓存中的 embedding
-            if cache_id is not None:
+            # 🔧 缓存启用时，从缓存读取 embedding
+            if cache_id is not None and self.cache_enabled:
                 shm_key = self.cache_client.root.get_shm_key(cache_id)
                 from sglang.srt.managers.vit_shm_utils import read_embedding_from_shm_raw
 
@@ -1130,8 +1901,21 @@ class VITScheduler:
                         self._send_error_response(request, cache_id, "Failed to write embedding to SHM")
                 else:
                     self._send_error_response(request, cache_id, "Failed to read embedding from cache")
+            elif cache_id is None and not self.cache_enabled:
+                # 🔧 缓存禁用时，Worker 直接通过请求级 SHM 返回 embedding
+                # 直接从请求级 SHM 读取（Worker 已经写入）
+                from sglang.srt.managers.vit_shm_utils import read_embedding_from_shm
+
+                embedding = read_embedding_from_shm(request.request_id)
+                if embedding is not None:
+                    self._send_embedding(
+                        request, embedding, None, from_cache, compute_time
+                    )
+                else:
+                    self._send_error_response(request, None, "Failed to read embedding from request SHM")
             else:
-                self._send_error_response(request, None, "Worker returned no cache_id")
+                # 🔧 其他情况：cache_id=None 但缓存启用，或 cache_id!=None 但缓存禁用
+                self._send_error_response(request, cache_id, f"Invalid state: cache_id={cache_id}, cache_enabled={self.cache_enabled}")
 
     def _process_batch(self, requests: List[VITRequest]) -> None:
         if not requests:
@@ -1191,7 +1975,7 @@ class VITScheduler:
 
             # 🔧 根据架构选择缓存检查方式
             cache_contains = False
-            if not self.benchmark_mode:
+            if not self.benchmark_mode and self.cache_enabled:
                 if self.use_new_arch:
                     if self.cache_client is not None:
                         try:
@@ -1292,17 +2076,38 @@ class VITScheduler:
         self,
         misses: List[Tuple[VITRequest, torch.Tensor, torch.Tensor, int]],
     ) -> None:
+        """处理缓存未命中的请求 (批量计算)
+
+        🔧 批处理优化:
+        - 将多个请求的 pixel_values 和 image_grid 聚合
+        - 一次性调用 model_runner.compute_batch
+        - 提高 GPU 利用率
+        """
         pixel_values_list = [item[1] for item in misses]
         image_grid_list = [item[2] for item in misses]
+
+        # 🔧 批处理日志
+        total_pixels = sum(pv.shape[0] for pv in pixel_values_list)
+        logger.info(
+            f"[VIT Scheduler] 🚀 Starting batch forward: "
+            f"batch_size={len(misses)}, total_pixels={total_pixels}"
+        )
 
         compute_start = time.time()
         embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_list)
         compute_time = time.time() - compute_start
 
+        # 🔧 批处理性能日志
+        logger.info(
+            f"[VIT Scheduler] ✅ Batch forward completed: "
+            f"batch_size={len(misses)}, compute_time={compute_time*1000:.1f}ms, "
+            f"avg_time_per_request={compute_time/len(misses)*1000:.1f}ms"
+        )
+
         for (request, _pv, _grid, hash_val), embedding in zip(misses, embeddings):
             cache_id = None
 
-            if not self.benchmark_mode:
+            if not self.benchmark_mode and self.cache_enabled:
                 # 🔧 根据架构选择缓存写入方式
                 if self.use_new_arch:
                     # 新架构: 通过 CacheServer RPC 写入
@@ -1345,6 +2150,132 @@ class VITScheduler:
                 compute_time=compute_time / max(len(misses), 1),
             )
 
+    def _check_cache_hit(self, request: VITRequest) -> Optional[int]:
+        """检查缓存是否命中
+
+        🔑 Phase 3.1: 新增方法，用于 Scheduler 端检查缓存
+        🔧 Phase 3 补充: 优化哈希计算，直接使用 request.hash_val
+
+        Returns:
+            cache_id: 如果命中返回 cache_id，否则返回 None
+        """
+        try:
+            # 🔧 优化: 直接使用 request.hash_val，避免重复读取 SHM
+            content_hash = request.hash_val
+            if content_hash is None:
+                # 回退: 如果 hash_val 未设置，才计算
+                logger.debug(f"[VIT Scheduler] request.hash_val is None, computing hash: {request.request_id}")
+                pixel_values = _load_tensor_from_shared_memory(
+                    request.pixel_values_shm_name,
+                    request.pixel_values_shape,
+                    request.pixel_values_dtype,
+                )
+                image_grid_thw = _load_tensor_from_shared_memory(
+                    request.image_grid_thw_shm_name,
+                    request.image_grid_thw_shape,
+                    request.image_grid_thw_dtype,
+                )
+                content_hash = _compute_request_hash(pixel_values, image_grid_thw)
+
+            # 🔑 RPC 调用 CacheServer 检查缓存
+            cache_id = self.cache_client.root.get_cache_id(content_hash)
+
+            return cache_id
+        except Exception as e:
+            logger.warning(f"[VIT Scheduler] Failed to check cache: {e}")
+            return None
+
+    def _send_cache_hit_response(self, request: VITRequest, cache_id: int):
+        """立即发送 cache hit 响应
+
+        🔑 Phase 3.1: 新增方法，用于立即发送 cache hit 响应
+        🔧 Phase 3 补充: 添加重试次数限制，防止回旋
+        """
+        # 🔧 Phase 3 补充: 检查重试次数
+        MAX_CACHE_HIT_RETRY = 2
+        if request.cache_hit_retry_count >= MAX_CACHE_HIT_RETRY:
+            logger.warning(
+                f"[VIT Scheduler] Cache hit fallback: request {request.request_id} exceeded retry limit ({MAX_CACHE_HIT_RETRY}), "
+                f"forcing compute as cache miss"
+            )
+            # 强制走 miss 流程
+            request.hash_val = None  # 清空 hash_val，强制重新计算
+            request.cache_hit_retry_count = 0  # 重置计数
+            self._request_queue.put(request)
+            return
+
+        try:
+            # 🔑 从 CacheServer 读取 embedding
+            shm_key = self.cache_client.root.get_shm_key(cache_id)
+            if shm_key is None:
+                logger.error(
+                    f"[VIT Scheduler] ❌ Cache hit fallback: SHM key not found - "
+                    f"request_id={request.request_id}, cache_id={cache_id}, retry={request.cache_hit_retry_count + 1}/{MAX_CACHE_HIT_RETRY}"
+                )
+                # 回退到正常流程，增加重试计数
+                request.cache_hit_retry_count += 1
+                self._request_queue.put(request)
+                return
+
+            embedding = read_embedding_from_shm_raw(shm_key)
+            if embedding is None:
+                logger.error(
+                    f"[VIT Scheduler] ❌ Cache hit fallback: failed to read embedding - "
+                    f"request_id={request.request_id}, cache_id={cache_id}, shm_key={shm_key}, "
+                    f"retry={request.cache_hit_retry_count + 1}/{MAX_CACHE_HIT_RETRY}"
+                )
+                # 回退到正常流程，增加重试计数
+                request.cache_hit_retry_count += 1
+                self._request_queue.put(request)
+                # 释放引用计数
+                self.cache_client.root.release(cache_id)
+                return
+
+            # 🔑 写入请求级 SHM
+            from sglang.srt.managers.vit_shm_utils import cleanup_embedding_shm
+            cleanup_embedding_shm(request.request_id)
+
+            success = write_embedding_to_shm(request.request_id, embedding)
+            if not success:
+                logger.error(f"[VIT Scheduler] Failed to write cache hit embedding to SHM: {request.request_id}")
+                # 回退到正常流程
+                self._request_queue.put(request)
+                # 释放引用计数
+                self.cache_client.root.release(cache_id)
+                return
+
+            # 🔑 发送响应
+            response = VITResponse(
+                request_id=request.request_id,
+                embedding_ipc_handle=([], 0),
+                embedding_shape=tuple(embedding.shape),
+                embedding_dtype=str(embedding.dtype).replace("torch.", ""),
+                embedding_device="cpu",
+                image_hash=0,  # 旧架构兼容性
+                cache_id=cache_id,
+                compute_time=0.0,
+                from_cache=True,
+                error=False,
+                error_message="",
+                vit_compute_start_time=time.time(),
+                vit_compute_end_time=time.time(),
+            )
+            self._send_response(response)
+
+            # 统计
+            self.cache_hits += 1
+
+            logger.debug(f"[VIT Scheduler] Cache hit response sent: {request.request_id}, cache_id={cache_id}")
+        except Exception as e:
+            logger.error(f"[VIT Scheduler] Failed to send cache hit response: {e}", exc_info=True)
+            # 失败时回退到正常流程
+            self._request_queue.put(request)
+            # 释放引用计数
+            try:
+                self.cache_client.root.release(cache_id)
+            except:
+                pass
+
     def _send_embedding(
         self,
         request: VITRequest,
@@ -1353,8 +2284,25 @@ class VITScheduler:
         from_cache: bool,
         compute_time: float,
     ) -> None:
+        """发送 embedding 到 Client (通过 SHM)
+
+        🔧 CPU Staging: 确保 embedding 在 CPU 上，对齐 LightLLM
+        - ViT 计算后立即 to(cpu)
+        - 写入 SHM (CPU)
+        - Client 读取后保持在 CPU
+        - 只在 LLM Prefill 时搬到 GPU
+        """
+        # 🔧 CPU Staging: 确保 embedding 在 CPU
         if embedding.is_cuda:
+            logger.debug(
+                f"[VIT Scheduler] Moving embedding to CPU for staging: {request.request_id}, device={embedding.device}"
+            )
             embedding = embedding.cpu()
+
+        logger.debug(
+            f"[VIT Scheduler] Embedding ready for SHM write: {request.request_id}, "
+            f"shape={tuple(embedding.shape)}, dtype={embedding.dtype}, device={embedding.device}"
+        )
 
         from sglang.srt.managers.vit_shm_utils import cleanup_embedding_shm
 

@@ -220,7 +220,12 @@ class VITSchedulerClient:
         self._results: Dict[str, torch.Tensor] = {}
         self._results_lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._worker_thread = threading.Thread(target=self._worker_main, name="VITClientWorker", daemon=True)
+        self._disable_drop = os.environ.get(
+            "SGLANG_VIT_CLIENT_DISABLE_DROP", "0"
+        ) == "1"
+        self._worker_thread = threading.Thread(
+            target=self._worker_main, name="VITClientWorker", daemon=True
+        )
         self._worker_thread.start()
         logger.info(f"[VIT Client] ✅ Worker thread started. client_id={id(self)}, socket_id={id(self.socket)}")
 
@@ -263,14 +268,40 @@ class VITSchedulerClient:
 
         return tensor
 
-    def _cleanup_shm(self, shm_name: str):
-        """清理共享内存"""
-        if shm_name in self.shm_objects:
-            shm = self.shm_objects.pop(shm_name)
-            shm.close()
-            shm.unlink()
-        elif shm_name:
-            cleanup_shared_memory(shm_name)
+    def _cleanup_shm(self, shm_name: str, reason: str = "unspecified"):
+        """清理共享内存，并输出来源日志"""
+        if not shm_name:
+            return
+        try:
+            if shm_name in self.shm_objects:
+                shm = self.shm_objects.pop(shm_name)
+                shm.close()
+                shm.unlink()
+                logger.debug(
+                    "[VIT Client] 🧹 cleaned SHM %s (cached handle, reason=%s)",
+                    shm_name,
+                    reason,
+                )
+            else:
+                cleanup_shared_memory(shm_name)
+                logger.debug(
+                    "[VIT Client] 🧹 cleaned SHM %s (no cached handle, reason=%s)",
+                    shm_name,
+                    reason,
+                )
+        except FileNotFoundError:
+            logger.debug(
+                "[VIT Client] 🧹 SHM %s already gone when cleaning (reason=%s)",
+                shm_name,
+                reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[VIT Client] ⚠️ Failed to cleanup SHM %s (reason=%s): %s",
+                shm_name,
+                reason,
+                exc,
+            )
 
     def _read_embedding_from_shm(
         self,
@@ -360,8 +391,8 @@ class VITSchedulerClient:
 
             # 清理共享内存
             try:
-                self._cleanup_shm(f"vit_pv_{request_id}")
-                self._cleanup_shm(f"vit_grid_{request_id}")
+                self._cleanup_shm(f"vit_pv_{request_id}", reason="submit_failed")
+                self._cleanup_shm(f"vit_grid_{request_id}", reason="submit_failed")
             except:
                 pass
 
@@ -421,8 +452,8 @@ class VITSchedulerClient:
 
             # 清理共享内存
             req_info = self.pending_requests.pop(request_id)
-            self._cleanup_shm(req_info['pixel_values_shm_name'])
-            self._cleanup_shm(req_info['image_grid_thw_shm_name'])
+            self._cleanup_shm(req_info['pixel_values_shm_name'], reason="recv_success")
+            self._cleanup_shm(req_info['image_grid_thw_shm_name'], reason="recv_success")
 
             return embedding
 
@@ -525,10 +556,21 @@ class VITSchedulerClient:
                     to_drop.append(rid)
 
             for rid in to_drop:
+                if self._disable_drop:
+                    info = self.pending_requests.get(rid)
+                    logger.warning(
+                        "[VIT Client] ⏱️ Drop suppressed for request %s (retry=%s, elapsed=%.1fs)",
+                        rid,
+                        info.get('retry', 0) if info else "n/a",
+                        now - info.get('submit_time', now) if info else -1.0,
+                    )
+                    if info:
+                        info['submit_time'] = now
+                    continue
                 info = self.pending_requests.pop(rid, None)
                 if info:
-                    self._cleanup_shm(info.get('pixel_values_shm_name', ''))
-                    self._cleanup_shm(info.get('image_grid_thw_shm_name', ''))
+                    self._cleanup_shm(info.get('pixel_values_shm_name', ''), reason="drop_timeout")
+                    self._cleanup_shm(info.get('image_grid_thw_shm_name', ''), reason="drop_timeout")
                     self.timeout_count += 1
                     logger.error(f"[VIT Client] ⏱️ Drop pending request {rid} after retries={info.get('retry',0)}, elapsed={now - info.get('submit_time', now):.1f}s; cleaned SHM and marked timeout")
         return out
@@ -677,16 +719,32 @@ class VITSchedulerClient:
                     else:
                         logger.info(
                             f"[VIT Client] ✅ Loaded embedding is valid: "
-                            f"shape={emb.shape}, min={emb.min().item():.4f}, "
-                            f"max={emb.max().item():.4f}"
+                            f"shape={emb.shape}, device={emb.device}, "
+                            f"min={emb.min().item():.4f}, max={emb.max().item():.4f}"
                         )
+
+                    # ✅ CPU Staging: 确保 embedding 留在 CPU，对齐 LightLLM
+                    # LightLLM 在 ViT worker 中将嵌入 to(cpu)，只有在准备拼文本时才拷贝回 GPU
+                    if emb.device.type != 'cpu':
+                        logger.warning(
+                            f"[VIT Client] ⚠️ Embedding on GPU, moving to CPU for staging: "
+                            f"{resp.request_id}, device={emb.device}"
+                        )
+                        emb = emb.cpu()
+                        logger.info(f"[VIT Client] ✅ Moved embedding to CPU: {resp.request_id}")
 
                     # 🔧 CUDA IPC: 清理输入共享内存（pixel_values 和 image_grid_thw）
                     # 注意：不再需要清理 embedding 共享内存（因为使用 CUDA IPC）
                     info = self.pending_requests.pop(resp.request_id, None)
                     if info is not None:
-                        self._cleanup_shm(info.get('pixel_values_shm_name', ''))
-                        self._cleanup_shm(info.get('image_grid_thw_shm_name', ''))
+                        self._cleanup_shm(
+                            info.get('pixel_values_shm_name', ''),
+                            reason="recv_result",
+                        )
+                        self._cleanup_shm(
+                            info.get('image_grid_thw_shm_name', ''),
+                            reason="recv_result",
+                        )
 
                     # 🔧 关键修改: 存储 VITResult（包含 embedding、cache_id 和错误信息）
                     vit_result = VITResult(
@@ -800,7 +858,7 @@ class VITSchedulerClient:
         # 清理所有共享内存
         for shm_name in list(self.shm_objects.keys()):
             try:
-                self._cleanup_shm(shm_name)
+                self._cleanup_shm(shm_name, reason="client_cleanup")
             except Exception as e:
                 logger.warning(f"[VIT Client] Error cleaning up {shm_name}: {e}")
 
