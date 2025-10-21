@@ -1100,6 +1100,24 @@ class VITScheduler:
     # ------------------------------------------------------------------
 
     def run(self):
+        """运行 VIT Scheduler
+
+        🔑 Phase 4: 根据环境变量选择 threading 或 asyncio
+        """
+        use_asyncio = os.environ.get("SGLANG_VIT_USE_ASYNCIO", "0") == "1"
+
+        if use_asyncio:
+            logger.info("[VIT Scheduler] Using asyncio event loop")
+            self.run_async()
+        else:
+            logger.info("[VIT Scheduler] Using threading model")
+            self.run_sync()
+
+    def run_sync(self):
+        """同步运行模式（原 run() 方法）
+
+        🔑 Phase 4: 重命名为 run_sync()，保留原有 threading 实现
+        """
         if self.tp_rank > 0:
             self._run_tp_worker()
             return
