@@ -4,6 +4,8 @@ import gc
 import logging
 import os
 import threading
+import torch
+
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -11,6 +13,16 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+
+# 导入InstanceRole枚举
+try:
+    from sglang.srt.managers.scheduler import InstanceRole
+except ImportError:
+    # 如果无法导入，定义一个简单的枚举
+    from enum import Enum
+    class InstanceRole(Enum):
+        PREFILL = "PREFILL"
+        DECODE = "DECODE"
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -22,8 +34,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 添加调试日志控制
-DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_DISABLE_DEBUG_LOGS", "0").lower() not in ("1", "true", "yes")
+# 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
+DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
 
 DEFAULT_FORCE_STREAM_INTERVAL = 128
 
@@ -65,10 +77,11 @@ class SchedulerOutputProcessorMixin:
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
-                # Move next_token_ids and logprobs to cpu
-                # Semi-PD
-                if not isinstance(next_token_ids, list):
+                # 常规处理
+                if next_token_ids is not None and not isinstance(next_token_ids, list):
                     next_token_ids = next_token_ids.tolist()
+
+                # 处理logprobs
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
                         logits_output.next_token_logprobs = (
@@ -125,17 +138,28 @@ class SchedulerOutputProcessorMixin:
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .cpu()
-                            .clone()
-                            .tolist()
-                        )
+                        # Avoid heavy CPU tolist() in the hot path.
+                        # Optionally use pinned D2H and defer Python list conversion.
+                        _hs_slice = logits_output.hidden_states[
+                            hidden_state_offset : (
+                                hidden_state_offset := hidden_state_offset + len(req.origin_input_ids)
+                            )
+                        ].detach()
+                        try:
+                            defer = os.environ.get("SGLANG_DEFER_HS_TOLIST", "1").lower() in ("1","true","yes")
+                            pin_d2h = os.environ.get("SGLANG_PIN_D2H", "1").lower() in ("1","true","yes")
+                        except Exception:
+                            defer = True; pin_d2h = True
+                        if pin_d2h and _hs_slice.is_cuda:
+                            _cpu_buf = torch.empty_like(_hs_slice, device="cpu", pin_memory=True)
+                            _cpu_buf.copy_(_hs_slice, non_blocking=True)
+                        else:
+                            _cpu_buf = _hs_slice.to("cpu", non_blocking=True)
+                        if defer:
+                            # Store CPU tensor; convert to list at stream_output time if needed
+                            req.hidden_states.append(_cpu_buf)
+                        else:
+                            req.hidden_states.append(_cpu_buf.tolist())
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
@@ -169,6 +193,16 @@ class SchedulerOutputProcessorMixin:
 
             self.set_next_batch_sampling_info_done(batch)
 
+            # Semi-PD + PP: Mark first EXTEND completion on DECODE instance,
+            # so next iteration can switch to DECODE safely.
+            try:
+                if getattr(self, 'server_args', None) and getattr(self.server_args, 'enable_semi_pd', False):
+                    if hasattr(self, 'instance_role') and self.instance_role.name == 'DECODE':
+                        if getattr(batch, 'forward_mode', None) is not None and batch.forward_mode.is_extend():
+                            setattr(batch, 'first_extend_done', True)
+            except Exception:
+                pass
+
         else:  # embedding or reward model
             embeddings, bid = result.embeddings, result.bid
             embeddings = embeddings.tolist()
@@ -192,7 +226,11 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        # 检查是否需要跳过stream_output（Pipeline并行的非最后PP stage）
+        if hasattr(self, 'skip_stream_for_pp') and self.skip_stream_for_pp:
+            logger.info(f"🔧 [PP_PREFILL] 跳过stream_output，这是非最后PP stage的PREFILL")
+        else:
+            self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -270,9 +308,22 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                # Avoid blocking .tolist() here; copy to pinned CPU and optionally defer conversion.
+                _hs = logits_output.hidden_states[i].detach()
+                try:
+                    defer = os.environ.get("SGLANG_DEFER_HS_TOLIST", "1").lower() in ("1","true","yes")
+                    pin_d2h = os.environ.get("SGLANG_PIN_D2H", "1").lower() in ("1","true","yes")
+                except Exception:
+                    defer = True; pin_d2h = True
+                if pin_d2h and _hs.is_cuda:
+                    _cpu_buf = torch.empty_like(_hs, device="cpu", pin_memory=True)
+                    _cpu_buf.copy_(_hs, non_blocking=True)
+                else:
+                    _cpu_buf = _hs.to("cpu", non_blocking=True)
+                if defer:
+                    req.hidden_states.append(_cpu_buf)
+                else:
+                    req.hidden_states.append(_cpu_buf.tolist())
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 req.grammar.accept_token(next_token_id)
@@ -472,6 +523,26 @@ class SchedulerOutputProcessorMixin:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
+        # PP 流式来源守卫（可配置）：默认仅允许 PP stage-0 + attn_tp_rank==0 输出
+        try:
+            if getattr(self.server_args, 'enable_semi_pd', False):
+                if getattr(self, 'attn_tp_rank', 0) != 0:
+                    return
+                pp_group = getattr(self, 'pp_group', None)
+                src_mode = os.environ.get("SGLANG_PP_STREAM_SOURCE", "stage0").lower()
+                if pp_group is not None:
+                    if src_mode in ("stage0", "first"):
+                        if not getattr(pp_group, 'is_first_rank', False):
+                            return
+                    elif src_mode in ("lastrank", "last"):
+                        if not getattr(pp_group, 'is_last_rank', False):
+                            return
+                    else:
+                        # 默认回退到 stage0
+                        if not getattr(pp_group, 'is_first_rank', False):
+                            return
+        except Exception:
+            pass
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -521,21 +592,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen and req.to_abort:
                 continue
 
-            # Semi-PD: disable streaming for multimodal responses (align with native behavior)
-            if self.model_config.is_multimodal_gen and req.stream:
-                req.stream = False
-
             if req.finished():
-                if self.model_config.is_multimodal_gen:
-                    try:
-                        req.decoded_text = self.tokenizer.decode(
-                            req.output_ids,
-                            skip_special_tokens=req.sampling_params.skip_special_tokens,
-                            spaces_between_special_tokens=req.sampling_params.spaces_between_special_tokens,
-                        )
-                    except Exception:
-                        pass
-
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
@@ -570,60 +627,46 @@ class SchedulerOutputProcessorMixin:
                 # DEBUG: scheduler sending decode ids (truncate for log)
                 try:
                     _rid = getattr(req, "rid", "NA")
-                    _send_off_before = getattr(req, "send_decode_id_offset", 0)
-                    _last_full_len = getattr(req, "last_full_decode_len", None)
+                    _send_off = getattr(req, "send_decode_id_offset", 0)
                     if self.model_config.is_multimodal_gen:
-                        _to_send = req.origin_input_ids_unpadded + req.output_ids
+                        _to_send = decode_ids
                     else:
-                        _to_send = decode_ids[_send_off_before:]
+                        _to_send = decode_ids[_send_off:]
                     _head = _to_send[:10] if isinstance(_to_send, list) else []
                     if DEBUG_LOGS_ENABLED:
-                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off_before={_send_off_before} read_off={read_offset} send_len={len(_to_send)} head={_head} last_full_len={_last_full_len} output_ids_len={len(req.output_ids)}")
+                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
                 except Exception:
                     pass
 
-                # 🔧 MULTIMODAL FIX: Proper detokenizer protocol for multimodal requests
-                # Migrated from semipd_tp_pp to fix repeated output bug
-                # SGLANG_MM_DETOKENIZER_MODE: off(default)/incremental/full
-                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "full").lower()
-                is_off_mode = mm_mode in ("off", "0", "false")
-                is_full_mode = mm_mode in ("full",)
+                # 多模态/文本 detokenizer 协议（通过开关控制）：
+                # SGLANG_MM_DETOKENIZER_MODE: incremental(默认)/off/full
+                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
                 if self.model_config.is_multimodal_gen:
-                    if is_off_mode:
-                        rids.pop()
-                        finished_reasons.pop()
-                        decoded_texts.pop()
+                    if mm_mode in ("off", "0", "false"):
+                        # 原生语义：多模态不经 detokenizer，跳过发送
+                        # 回到 for 循环，处理下一个 req
+                        rids.pop(); finished_reasons.pop(); decoded_texts.pop()
                         continue
-                    elif is_full_mode:
+                    elif mm_mode == "full":
+                        # 全量+绝对窗口（兼容/调试）
                         full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
                         prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
                         decode_ids_list.append(full_decode_ids)
                         read_offset_to_send = prev_full_len
                         req.last_full_decode_len = len(full_decode_ids)
-                        new_send_decode_offset = len(full_decode_ids)
                     else:
+                        # 增量模式
                         decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                         read_offset_to_send = read_offset
-                        new_send_decode_offset = len(decode_ids)
                 else:
-                    # Text-only: always use incremental protocol
+                    # 文本：保持增量协议
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                     read_offset_to_send = read_offset
-                    new_send_decode_offset = len(decode_ids)
 
                 # Update baselines for next round
-                _old_send_off = req.send_decode_id_offset
-                req.send_decode_id_offset = new_send_decode_offset
+                req.send_decode_id_offset = len(decode_ids)
                 req.last_full_decode_len = len(req.origin_input_ids_unpadded + req.output_ids)
                 read_offsets.append(read_offset_to_send)
-
-                # DEBUG: track offset updates
-                if DEBUG_LOGS_ENABLED:
-                    try:
-                        _rid = getattr(req, "rid", "NA")
-                        logger.info(f"[DBG_SCHEDULER_UPDATE] rid={str(_rid)[:8]} send_off: {_old_send_off} -> {req.send_decode_id_offset} (delta={req.send_decode_id_offset - _old_send_off}) last_full_len={req.last_full_decode_len}")
-                    except Exception:
-                        pass
                 if self.skip_tokenizer_init:
                     output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)
@@ -710,7 +753,27 @@ class SchedulerOutputProcessorMixin:
                 if req.return_hidden_states:
                     if output_hidden_states is None:
                         output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
+                    try:
+                        hs_mode = os.environ.get("SGLANG_STREAM_HS_MODE", "final").lower()
+                    except Exception:
+                        hs_mode = "final"
+                    if hs_mode in ("stream", "1", "true"):
+                        hs_obj = req.hidden_states
+                    else:
+                        if req.finished():
+                            _hs_list = []
+                            for _h in (req.hidden_states or []):
+                                if hasattr(_h, "tolist"):
+                                    try:
+                                        _hs_list.append(_h.tolist())
+                                    except Exception:
+                                        _hs_list.append(None)
+                                else:
+                                    _hs_list.append(_h)
+                            hs_obj = _hs_list
+                        else:
+                            hs_obj = None
+                    output_hidden_states.append(hs_obj)
 
             if (
                 req.finished()

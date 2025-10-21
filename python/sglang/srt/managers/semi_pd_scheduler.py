@@ -498,18 +498,18 @@ def run_scheduler_process(
 
     # IPC info already received above for Prefill instances
 
-    # 🔧 默认开启多模态增量detokenizer，除非用户已显式指定
+    # 🔧 默认开启多模态全量 detokenizer（与原生一致）
     try:
         if not os.environ.get("SGLANG_MM_DETOKENIZER_MODE"):
             model_config = ModelConfig.from_server_args(server_args)
             if getattr(model_config, "is_multimodal_gen", False):
-                os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "incremental"
+                os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "full"
                 logger.info(
-                    f"🔧 [SEMI_PD] TP{tp_rank}: 自动设置 SGLANG_MM_DETOKENIZER_MODE=incremental，避免多模态重复输出"
+                    f"🔧 [SEMI_PD] TP{tp_rank}: 自动设置 SGLANG_MM_DETOKENIZER_MODE=full，使用全量 detokenizer 裁剪 Prompt"
                 )
     except Exception:
         logger.exception(
-            f"⚠️ [SEMI_PD] TP{tp_rank}: 初始化多模态 detokenizer 模式失败，请手动设置 SGLANG_MM_DETOKENIZER_MODE=incremental"
+            f"⚠️ [SEMI_PD] TP{tp_rank}: 初始化多模态 detokenizer 模式失败，请手动设置 SGLANG_MM_DETOKENIZER_MODE"
         )
 
     # Create a scheduler and run the event loop

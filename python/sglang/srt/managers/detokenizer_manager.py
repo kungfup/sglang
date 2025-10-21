@@ -178,7 +178,7 @@ class DetokenizerManager:
 
         # Initialize decode status
         read_ids, surr_ids = [], []
-        mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
+        mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "full").lower()
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
