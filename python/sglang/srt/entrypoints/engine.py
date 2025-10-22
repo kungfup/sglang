@@ -683,7 +683,7 @@ def _launch_subprocesses(
                 os.environ["SGLANG_VIT_DISABLE_CACHE"] = "0"
 
             # 🔧 新架构: 启动 CacheServer 进程 (仅当缓存启用时)
-            use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+            use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "1") == "1"
             if use_new_arch and not server_args.disable_vit_cache:
                 from sglang.srt.managers.vit_cache_server import start_cache_server
 
@@ -720,7 +720,7 @@ def _launch_subprocesses(
             if (
                 use_new_arch
                 and "SGLANG_VIT_USE_WORKER_POOL" not in os.environ
-                and os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+                and os.environ.get("SGLANG_VIT_NEW_ARCH", "1") == "1"
             ):
                 os.environ["SGLANG_VIT_USE_WORKER_POOL"] = "1"
                 logger.info("[WORKER POOL] Default enable SGLANG_VIT_USE_WORKER_POOL=1 for batched ViT processing")
@@ -1050,7 +1050,7 @@ def run_vit_scheduler_process(server_args: ServerArgs, pipe_writer, env_vars: di
 
         # 🔧 新架构: 获取 cache_rpc_port
         cache_rpc_port = None
-        use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+        use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "1") == "1"
         if use_new_arch:
             cache_rpc_port = int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
 

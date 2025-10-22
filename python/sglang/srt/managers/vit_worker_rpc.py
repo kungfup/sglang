@@ -339,6 +339,11 @@ class VITWorkerService(rpyc.Service):
                         "compute_time": 0.0,
                         "error": False,
                         "error_message": "",
+                        # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
+                        "input_shm_names": [
+                            pixel_values_shm_keys[idx],
+                            image_grid_thw_shm_keys[idx],
+                        ],
                     }
                 )
                 self.total_cache_hits += 1
@@ -354,7 +359,12 @@ class VITWorkerService(rpyc.Service):
 
             # 处理缓存未命中 (需要计算)
             if cache_misses:
-                miss_results = self._compute_embeddings(cache_misses, request_ids)
+                miss_results = self._compute_embeddings(
+                    cache_misses,
+                    request_ids,
+                    pixel_values_shm_keys=pixel_values_shm_keys,  # 🔑 传递 SHM 名称
+                    image_grid_thw_shm_keys=image_grid_thw_shm_keys,
+                )
                 results.extend(miss_results)
                 self.total_cache_misses += len(cache_misses)
 
@@ -380,8 +390,13 @@ class VITWorkerService(rpyc.Service):
                     "compute_time": 0.0,
                     "error": True,
                     "error_message": str(e),
+                    # 🔑 方案 1: 即使失败也要返回 input_shm_names
+                    "input_shm_names": [
+                        pixel_values_shm_keys[i],
+                        image_grid_thw_shm_keys[i],
+                    ],
                 }
-                for req_id in request_ids
+                for i, req_id in enumerate(request_ids)
             ]
 
     def exposed_ping(self) -> Dict:
@@ -602,13 +617,20 @@ class VITWorkerService(rpyc.Service):
             )
             raise
 
-    def _compute_embeddings(self, cache_misses: List[Tuple], request_ids: List[str]) -> List[Dict]:
+    def _compute_embeddings(
+        self,
+        cache_misses: List[Tuple],
+        request_ids: List[str],
+        pixel_values_shm_keys: List[str] = None,
+        image_grid_thw_shm_keys: List[str] = None,
+    ) -> List[Dict]:
         """计算 embeddings (所有 TP rank 都参与)
 
         🔧 Phase 2.C: rank0 通过 broadcast_tensor_dict 通知其他 rank 参与计算
         🔧 修复: 所有 rank 都执行 forward，只有 rank0 写缓存和返回结果
         🔧 修复: 复用 _check_cache 返回的 cache_id，避免重复分配
         🔧 显存池: 估算显存需求，不满足则拒绝请求 (backpressure)
+        🔑 方案 1: 接收 SHM 名称列表，用于返回 input_shm_names
         """
         from sglang.srt.managers.vit_shm_utils import write_embedding_to_shm_raw
         from sglang.srt.distributed.communication_op import broadcast_tensor_dict
@@ -784,7 +806,10 @@ class VITWorkerService(rpyc.Service):
                             # 确保旧的缓存块被清理，避免 FileExistsError
                             cleanup_shared_memory(shm_key)
 
-                            success = write_embedding_to_shm_raw(shm_key, embedding.cpu())
+                            # 🔧 关键修复: 保持原始 dtype (bf16/fp8)，不强制转换
+                            # vit_shm_utils._tensor_to_bytes() 会自动搬到 CPU 并保留 dtype
+                            # 参考: sglang/python/sglang/srt/managers/vit_shm_utils.py L37-45
+                            success = write_embedding_to_shm_raw(shm_key, embedding)
                             if not success:
                                 logger.error(
                                     f"[Worker {self.worker_id}] Failed to write embedding to cache"
@@ -806,7 +831,10 @@ class VITWorkerService(rpyc.Service):
 
                     request_id = request_ids[idx]
                     cleanup_embedding_shm(request_id)
-                    success = write_embedding_to_shm(request_id, embedding.cpu())
+
+                    # 🔧 关键修复: 保持原始 dtype (bf16/fp8)，不强制转换
+                    # vit_shm_utils._tensor_to_bytes() 会自动搬到 CPU 并保留 dtype
+                    success = write_embedding_to_shm(request_id, embedding)
                     if not success:
                         logger.error(
                             f"[Worker {self.worker_id}] Failed to write embedding to request SHM: {request_id}"
@@ -832,6 +860,11 @@ class VITWorkerService(rpyc.Service):
                         "compute_time": compute_time / len(cache_misses),  # 平均时间
                         "error": False,
                         "error_message": "",
+                        # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
+                        "input_shm_names": [
+                            pixel_values_shm_keys[idx] if pixel_values_shm_keys else None,
+                            image_grid_thw_shm_keys[idx] if image_grid_thw_shm_keys else None,
+                        ] if pixel_values_shm_keys and image_grid_thw_shm_keys else None,
                     }
                 )
 
@@ -854,6 +887,11 @@ class VITWorkerService(rpyc.Service):
                         "compute_time": 0.0,
                         "error": True,
                         "error_message": str(e),
+                        # 🔑 方案 1: 即使失败也要返回 input_shm_names
+                        "input_shm_names": [
+                            pixel_values_shm_keys[idx] if pixel_values_shm_keys else None,
+                            image_grid_thw_shm_keys[idx] if image_grid_thw_shm_keys else None,
+                        ] if pixel_values_shm_keys and image_grid_thw_shm_keys else None,
                     }
                 )
 

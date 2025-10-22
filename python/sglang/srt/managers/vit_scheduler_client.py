@@ -39,7 +39,7 @@ class VITRequest:
     image_grid_thw_shm_name: str
     image_grid_thw_shape: Tuple[int, ...]
     image_grid_thw_dtype: str
-    hash_val: Optional[int] = None
+    hash_val: Optional[int] = None  # 🔑 在 submit_async 时计算，避免重复读 SHM
 
 
 @dataclass
@@ -80,6 +80,8 @@ class VITResponse:
     # 🔧 新增: 时间戳（用于并行性分析和缓存生命周期跟踪）
     vit_compute_start_time: float = 0.0
     vit_compute_end_time: float = 0.0
+    # 🔑 方案 1: 引用计数 + 完成通知
+    input_shm_names: Optional[List[str]] = None  # Worker 返回输入 SHM 名称，用于 PP0 release
 
 
 @dataclass
@@ -342,6 +344,32 @@ class VITSchedulerClient:
             self._create_shm_for_tensor(pixel_values, pixel_values_shm_name)
             self._create_shm_for_tensor(image_grid_thw, image_grid_thw_shm_name)
 
+            # 🔑 修复 4: 计算完整 hash (pixel_values + image_grid_thw)
+            import hashlib
+            hash_val = None
+            try:
+                # 🔑 修复 4: 包含 pixel_values 和 image_grid_thw，对齐 LightLLM
+                pixel_values_cpu = pixel_values.cpu() if pixel_values.is_cuda else pixel_values
+                image_grid_thw_cpu = image_grid_thw.cpu() if image_grid_thw.is_cuda else image_grid_thw
+
+                # 拼接两个 tensor 的字节流
+                buffer = pixel_values_cpu.numpy().tobytes() + image_grid_thw_cpu.numpy().tobytes()
+
+                # 计算 MD5 hash（取前 16 位，对齐 _compute_request_hash）
+                hash_val = int(hashlib.md5(buffer).hexdigest()[:16], 16)
+                logger.debug(f"[VIT Client] Computed hash_val for {request_id}: {hash_val:x}")
+            except Exception as e:
+                logger.warning(f"[VIT Client] Failed to compute hash_val for {request_id}: {e}")
+
+            # 🔑 方案 1: Acquire SHM 引用计数
+            from sglang.srt.managers.vit_shm_manager import get_global_shm_manager
+            shm_manager = get_global_shm_manager()
+            shm_manager.acquire(pixel_values_shm_name)
+            shm_manager.acquire(image_grid_thw_shm_name)
+            logger.debug(
+                f"[VIT Client] Acquired SHM: {pixel_values_shm_name}, {image_grid_thw_shm_name}"
+            )
+
             # 构造请求
             request = VITRequest(
                 request_id=request_id,
@@ -351,6 +379,7 @@ class VITSchedulerClient:
                 image_grid_thw_shm_name=image_grid_thw_shm_name,
                 image_grid_thw_shape=tuple(image_grid_thw.shape),
                 image_grid_thw_dtype=str(image_grid_thw.dtype).replace('torch.', ''),
+                hash_val=hash_val,  # 🔑 携带 hash_val
             )
 
             # 将请求投递到后台线程发送（避免跨线程触碰 ZMQ socket）
@@ -389,12 +418,23 @@ class VITSchedulerClient:
         except Exception as e:
             logger.error(f"[VIT Client] Error submitting request {request_id}: {e}", exc_info=True)
 
-            # 清理共享内存
+            # 🔑 修复 2: 统一使用 shm_manager.release() 清理
             try:
-                self._cleanup_shm(f"vit_pv_{request_id}", reason="submit_failed")
-                self._cleanup_shm(f"vit_grid_{request_id}", reason="submit_failed")
-            except:
-                pass
+                from sglang.srt.managers.vit_shm_manager import get_global_shm_manager
+                shm_manager = get_global_shm_manager()
+
+                pixel_values_shm_name = f"vit_pv_{request_id}"
+                image_grid_thw_shm_name = f"vit_grid_{request_id}"
+
+                # Release 引用计数
+                if shm_manager.release(pixel_values_shm_name):
+                    shm_manager.cleanup_if_zero(pixel_values_shm_name)
+                if shm_manager.release(image_grid_thw_shm_name):
+                    shm_manager.cleanup_if_zero(image_grid_thw_shm_name)
+
+                logger.debug(f"[VIT Client] Released SHM after submit failure: {request_id}")
+            except Exception as cleanup_error:
+                logger.warning(f"[VIT Client] Failed to release SHM after submit failure: {cleanup_error}")
 
             return False
 
@@ -733,18 +773,42 @@ class VITSchedulerClient:
                         emb = emb.cpu()
                         logger.info(f"[VIT Client] ✅ Moved embedding to CPU: {resp.request_id}")
 
-                    # 🔧 CUDA IPC: 清理输入共享内存（pixel_values 和 image_grid_thw）
-                    # 注意：不再需要清理 embedding 共享内存（因为使用 CUDA IPC）
-                    info = self.pending_requests.pop(resp.request_id, None)
-                    if info is not None:
-                        self._cleanup_shm(
-                            info.get('pixel_values_shm_name', ''),
-                            reason="recv_result",
-                        )
-                        self._cleanup_shm(
-                            info.get('image_grid_thw_shm_name', ''),
-                            reason="recv_result",
-                        )
+                    # 🔑 方案 1: Release SHM 引用计数，引用计数为 0 时清理
+                    # 优先使用 Worker 返回的 input_shm_names（更可靠）
+                    from sglang.srt.managers.vit_shm_manager import get_global_shm_manager
+                    shm_manager = get_global_shm_manager()
+
+                    input_shm_names = getattr(resp, 'input_shm_names', None)
+                    if input_shm_names:
+                        # Worker 返回了 input_shm_names，使用它们
+                        for shm_name in input_shm_names:
+                            if shm_name and shm_manager.release(shm_name):
+                                # 引用计数为 0，清理 SHM
+                                shm_manager.cleanup_if_zero(shm_name)
+                                logger.debug(
+                                    f"[VIT Client] Released and cleaned SHM: {shm_name} (from worker)"
+                                )
+                    else:
+                        # 兼容旧版本：从 pending_requests 获取 SHM 名称
+                        info = self.pending_requests.get(resp.request_id)
+                        if info:
+                            pixel_values_shm_name = info.get('pixel_values_shm_name', '')
+                            image_grid_thw_shm_name = info.get('image_grid_thw_shm_name', '')
+
+                            if pixel_values_shm_name and shm_manager.release(pixel_values_shm_name):
+                                shm_manager.cleanup_if_zero(pixel_values_shm_name)
+                                logger.debug(
+                                    f"[VIT Client] Released and cleaned SHM: {pixel_values_shm_name} (from pending)"
+                                )
+
+                            if image_grid_thw_shm_name and shm_manager.release(image_grid_thw_shm_name):
+                                shm_manager.cleanup_if_zero(image_grid_thw_shm_name)
+                                logger.debug(
+                                    f"[VIT Client] Released and cleaned SHM: {image_grid_thw_shm_name} (from pending)"
+                                )
+
+                    # 从 pending_requests 移除
+                    self.pending_requests.pop(resp.request_id, None)
 
                     # 🔧 关键修改: 存储 VITResult（包含 embedding、cache_id 和错误信息）
                     vit_result = VITResult(

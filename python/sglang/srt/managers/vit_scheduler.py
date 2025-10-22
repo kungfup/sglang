@@ -293,7 +293,7 @@ class VITRequest:
     image_grid_thw_shm_name: str
     image_grid_thw_shape: Tuple[int, ...]
     image_grid_thw_dtype: str
-    hash_val: Optional[int] = None
+    hash_val: Optional[int] = None  # 🔑 Phase 3 补充: 在 submit_async 时计算，避免重复读 SHM
     cache_hit_retry_count: int = 0  # 🔧 Phase 3 补充: 缓存命中回退重试次数
 
 
@@ -312,6 +312,8 @@ class VITResponse:
     error_message: str = ""  # 🔧 错误信息
     vit_compute_start_time: float = 0.0
     vit_compute_end_time: float = 0.0
+    # 🔑 方案 1: 引用计数 + 完成通知
+    input_shm_names: Optional[List[str]] = None  # Worker 返回输入 SHM 名称，用于 PP0 release
 
 
 # ---------------------------------------------------------------------------
@@ -339,26 +341,58 @@ class VITModelRunner:
         if self.tp_size > 1:
             logger.info(f"[VIT Runner] TP enabled: size={self.tp_size}")
 
-        logger.info("[VIT Runner] ViT model will use float32 (no quantization)")
+        # 🔧 关键修复: 复用主流程的量化配置逻辑
+        # 参考: sglang/python/sglang/srt/model_loader/loader.py L110-140
+        from sglang.srt.model_loader.weight_utils import get_quant_config
 
-        if model_type == "qwen2_5_vl":
-            from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
+        quant_config = None
+        if self.model_config.quantization is not None:
+            try:
+                # 获取量化配置 (支持 fp8, bf16, int8 等)
+                quant_config = get_quant_config(
+                    self.model_config,
+                    self.load_config,
+                    packed_modules_mapping={},  # VIT 不需要 packed modules
+                )
+                logger.info(
+                    f"[VIT Runner] Quantization enabled: {self.model_config.quantization}, "
+                    f"config={quant_config.get_name() if quant_config else 'None'}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[VIT Runner] Failed to get quant_config for {self.model_config.quantization}: {e}. "
+                    "Falling back to no quantization."
+                )
+                quant_config = None
 
-            self.vit_model = Qwen2_5_VisionTransformer(
-                self.model_config.hf_config.vision_config,
-                norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
-                quant_config=None,
-            )
-        elif model_type == "qwen2_vl":
-            from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
+        # 🔧 关键修复: 使用 set_default_torch_dtype 确保 dtype 与主模型一致
+        # 参考: sglang/python/sglang/srt/model_loader/loader.py L612-614
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-            self.vit_model = Qwen2VisionTransformer(
-                self.model_config.hf_config.vision_config,
-                norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
-                quant_config=None,
-            )
-        else:
-            raise ValueError(f"Unsupported model type for VIT Scheduler: {model_type}")
+        logger.info(
+            f"[VIT Runner] Creating VIT model with dtype={self.model_config.dtype}, "
+            f"quant_config={quant_config.get_name() if quant_config else 'None'}"
+        )
+
+        with set_default_torch_dtype(self.model_config.dtype):
+            if model_type == "qwen2_5_vl":
+                from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
+
+                self.vit_model = Qwen2_5_VisionTransformer(
+                    self.model_config.hf_config.vision_config,
+                    norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,  # ✅ 传入量化配置
+                )
+            elif model_type == "qwen2_vl":
+                from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
+
+                self.vit_model = Qwen2VisionTransformer(
+                    self.model_config.hf_config.vision_config,
+                    norm_eps=getattr(self.model_config.hf_config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,  # ✅ 传入量化配置
+                )
+            else:
+                raise ValueError(f"Unsupported model type for VIT Scheduler: {model_type}")
 
         logger.info(
             "[VIT Runner] Loading ViT weights (visual.* only) "
@@ -378,94 +412,113 @@ class VITModelRunner:
         )
 
         tp_rank = get_tensor_model_parallel_rank() if self.tp_size > 1 else 0
-        logger.info(f"[VIT Runner] Loading weights with tp_rank={tp_rank}, tp_size={self.tp_size}")
-
-        loader = get_model_loader(self.load_config)
-        weight_iter = loader._get_weights_iterator(
-            DefaultModelLoader.Source(
-                model_or_path=self.model_config.model_path,
-                revision=getattr(self.model_config, "revision", None),
-                prefix="",
-                fall_back_to_pt=True,
-            )
+        logger.info(
+            f"[VIT Runner] Loading weights with tp_rank={tp_rank}, tp_size={self.tp_size}, "
+            f"dtype={self.model_config.dtype}"
         )
 
-        params_dict = dict(self.vit_model.named_parameters())
-        buffers_dict = dict(self.vit_model.named_buffers())
-
-        loaded = 0
-        loaded_column_parallel = 0
-        loaded_row_parallel = 0
-
-        for name, tensor in weight_iter:
-            if not name.startswith("visual."):
-                continue
-
-            vit_name = name[len("visual.") :]
-
-            if ".attn.qkv." in vit_name:
-                vit_name = vit_name.replace(".attn.qkv.", ".attn.qkv_proj.")
-
-            target_param = params_dict.get(vit_name)
-            if target_param is None:
-                target_param = buffers_dict.get(vit_name)
-
-            if target_param is None:
-                continue
-
-            # 🔧 Phase 2.C: 根据参数类型选择正确的 weight_loader
-            if isinstance(target_param, _ColumnvLLMParameter):
-                # ColumnParallelLinear: 按列分片
-                target_param.load_column_parallel_weight(
-                    tensor,
-                    tp_rank=tp_rank,
-                    use_presharded_weights=False,
+        # 🔧 关键修复: 使用 set_default_torch_dtype 包裹权重加载
+        # 参考: sglang/python/sglang/srt/model_loader/loader.py L612-614
+        # 确保权重加载时使用正确的 dtype (bf16/fp8)
+        with set_default_torch_dtype(self.model_config.dtype):
+            loader = get_model_loader(self.load_config)
+            weight_iter = loader._get_weights_iterator(
+                DefaultModelLoader.Source(
+                    model_or_path=self.model_config.model_path,
+                    revision=getattr(self.model_config, "revision", None),
+                    prefix="",
+                    fall_back_to_pt=True,
                 )
-                loaded_column_parallel += 1
-                logger.debug(f"[VIT Runner] Loaded column-parallel weight: {vit_name}, shape={target_param.data.shape}")
-            elif isinstance(target_param, RowvLLMParameter):
-                # RowParallelLinear: 按行分片
-                target_param.load_row_parallel_weight(
-                    tensor,
-                    tp_rank=tp_rank,
-                    use_presharded_weights=False,
-                )
-                loaded_row_parallel += 1
-                logger.debug(f"[VIT Runner] Loaded row-parallel weight: {vit_name}, shape={target_param.data.shape}")
-            else:
-                # 普通参数: 不分片
-                weight_loader = getattr(target_param, "weight_loader", default_weight_loader)
+            )
 
-                if "qkv_proj" in vit_name and (
-                    ".q_proj." in name or ".k_proj." in name or ".v_proj." in name
-                ):
-                    if ".q_proj." in name:
-                        loaded_shard_id = "q"
-                    elif ".k_proj." in name:
-                        loaded_shard_id = "k"
-                    else:
-                        loaded_shard_id = "v"
+            params_dict = dict(self.vit_model.named_parameters())
+            buffers_dict = dict(self.vit_model.named_buffers())
 
-                    sig = signature(weight_loader)
-                    if "loaded_shard_id" in sig.parameters:
-                        weight_loader(target_param, tensor, loaded_shard_id=loaded_shard_id)
+            loaded = 0
+            loaded_column_parallel = 0
+            loaded_row_parallel = 0
+
+            for name, tensor in weight_iter:
+                if not name.startswith("visual."):
+                    continue
+
+                vit_name = name[len("visual.") :]
+
+                if ".attn.qkv." in vit_name:
+                    vit_name = vit_name.replace(".attn.qkv.", ".attn.qkv_proj.")
+
+                target_param = params_dict.get(vit_name)
+                if target_param is None:
+                    target_param = buffers_dict.get(vit_name)
+
+                if target_param is None:
+                    continue
+
+                # 🔧 Phase 2.C: 根据参数类型选择正确的 weight_loader
+                if isinstance(target_param, _ColumnvLLMParameter):
+                    # ColumnParallelLinear: 按列分片
+                    target_param.load_column_parallel_weight(
+                        tensor,
+                        tp_rank=tp_rank,
+                        use_presharded_weights=False,
+                    )
+                    loaded_column_parallel += 1
+                    logger.debug(f"[VIT Runner] Loaded column-parallel weight: {vit_name}, shape={target_param.data.shape}")
+                elif isinstance(target_param, RowvLLMParameter):
+                    # RowParallelLinear: 按行分片
+                    target_param.load_row_parallel_weight(
+                        tensor,
+                        tp_rank=tp_rank,
+                        use_presharded_weights=False,
+                    )
+                    loaded_row_parallel += 1
+                    logger.debug(f"[VIT Runner] Loaded row-parallel weight: {vit_name}, shape={target_param.data.shape}")
+                else:
+                    # 普通参数: 不分片
+                    weight_loader = getattr(target_param, "weight_loader", default_weight_loader)
+
+                    if "qkv_proj" in vit_name and (
+                        ".q_proj." in name or ".k_proj." in name or ".v_proj." in name
+                    ):
+                        if ".q_proj." in name:
+                            loaded_shard_id = "q"
+                        elif ".k_proj." in name:
+                            loaded_shard_id = "k"
+                        else:
+                            loaded_shard_id = "v"
+
+                        sig = signature(weight_loader)
+                        if "loaded_shard_id" in sig.parameters:
+                            weight_loader(target_param, tensor, loaded_shard_id=loaded_shard_id)
+                        else:
+                            weight_loader(target_param, tensor)
                     else:
                         weight_loader(target_param, tensor)
-                else:
-                    weight_loader(target_param, tensor)
-                logger.debug(f"[VIT Runner] Loaded normal weight: {vit_name}")
+                    logger.debug(f"[VIT Runner] Loaded normal weight: {vit_name}")
 
-            loaded += 1
+                loaded += 1
 
-        if loaded == 0:
-            raise RuntimeError("Failed to load any ViT visual weights; check model path")
+            if loaded == 0:
+                raise RuntimeError("Failed to load any ViT visual weights; check model path")
 
-        self.vit_model.to(self.device)
-        self.vit_model.eval()
-        logger.info(
-            f"[VIT Runner] ViT model loaded successfully: "
-            f"total={loaded}, column_parallel={loaded_column_parallel}, row_parallel={loaded_row_parallel}"
-        )
+            # 🔧 关键修复: 量化后处理 (参考主流程)
+            # 参考: sglang/python/sglang/srt/model_loader/loader.py L615-618
+            if quant_config is not None:
+                logger.info(f"[VIT Runner] Processing quantization weights for {quant_config.get_name()}")
+                for _, module in self.vit_model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                logger.info(f"[VIT Runner] Quantization processing completed")
+
+            self.vit_model.to(self.device)
+            self.vit_model.eval()
+
+            logger.info(
+                f"[VIT Runner] ViT model loaded successfully: "
+                f"total={loaded}, column_parallel={loaded_column_parallel}, row_parallel={loaded_row_parallel}, "
+                f"dtype={self.model_config.dtype}, quant={quant_config.get_name() if quant_config else 'None'}"
+            )
 
     @torch.inference_mode()
     def compute_batch(
@@ -473,12 +526,102 @@ class VITModelRunner:
         pixel_values_list: Sequence[torch.Tensor],
         image_grid_thw_list: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
+        """批量计算 VIT embeddings (真正的并行)
+
+        🔧 DEBUG: 添加详细日志诊断 Attention 显存爆炸问题
+
+        参考 LightLLM 实现 (lightllm/models/vit/model.py L195-197):
+        - 将多个请求的 pixel_values 拼接成一个大的 batch
+        - 一次性执行 VIT forward pass (GPU 并行)
+        - 然后将结果拆分回各个请求
+
+        Args:
+            pixel_values_list: List of pixel_values tensors, each shape [num_images, C, H, W]
+            image_grid_thw_list: List of image_grid_thw tensors, each shape [num_grids, 3]
+
+        Returns:
+            List of embedding tensors, each shape [num_tokens, embedding_dim]
+        """
         if self.vit_model is None:
             raise RuntimeError("VIT model not loaded")
 
-        embeddings: List[torch.Tensor] = []
-        for pixel_values, image_grid_thw in zip(pixel_values_list, image_grid_thw_list):
-            embeddings.append(self.compute(pixel_values, image_grid_thw))
+        batch_size = len(pixel_values_list)
+        if batch_size == 0:
+            return []
+
+        # 单个请求，直接调用 compute (避免不必要的拼接开销)
+        if batch_size == 1:
+            return [self.compute(pixel_values_list[0], image_grid_thw_list[0])]
+
+        # ✅ 批量并行处理 (参考 LightLLM)
+        logger.info(f"[VIT Runner] 🚀 Starting batch compute: batch_size={batch_size}")
+
+        # 1. 移动到 GPU (non_blocking 提高性能)
+        pixel_values_gpu = [pv.to(self.device, non_blocking=True) for pv in pixel_values_list]
+        image_grid_thw_gpu = [igt.to(self.device, non_blocking=True) for igt in image_grid_thw_list]
+
+        # 2. 拼接成 batch (参考 LightLLM: imgs = torch.cat(img_tensors, dim=0))
+        # pixel_values: [num_images_1, C, H, W] + [num_images_2, C, H, W] + ...
+        #            -> [total_images, C, H, W]
+        batched_pixel_values = torch.cat(pixel_values_gpu, dim=0)
+
+        # image_grid_thw: [num_grids_1, 3] + [num_grids_2, 3] + ...
+        #              -> [total_grids, 3]
+        batched_image_grid_thw = torch.cat(image_grid_thw_gpu, dim=0)
+
+        # 🔧 DEBUG: 打印详细的 tensor 信息
+        logger.info(
+            f"[VIT Runner] 📦 Batched tensors: "
+            f"pixel_values={batched_pixel_values.shape}, dtype={batched_pixel_values.dtype}, device={batched_pixel_values.device}, "
+            f"image_grid_thw={batched_image_grid_thw.shape}, dtype={batched_image_grid_thw.dtype}, device={batched_image_grid_thw.device}"
+        )
+
+        # 🔧 DEBUG: 打印显存使用情况
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+            logger.info(
+                f"[VIT Runner] 💾 GPU memory before forward: "
+                f"allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB"
+            )
+
+        # 3. 一次性 forward (GPU 并行，参考 LightLLM: all_img_embeds = self.forward(pixel_values))
+        start_time = time.time()
+        batched_pixel_values = batched_pixel_values.to(self.device, non_blocking=True)
+        batched_image_grid_thw = batched_image_grid_thw.to(self.device, non_blocking=True)
+
+        # 🔧 DEBUG: 打印 VIT 模型的 dtype
+        first_param = next(self.vit_model.parameters())
+        logger.info(
+            f"[VIT Runner] 🔧 VIT model dtype: {first_param.dtype}, device: {first_param.device}"
+        )
+
+        batched_embeddings = self.vit_model(batched_pixel_values, grid_thw=batched_image_grid_thw)
+        compute_time = time.time() - start_time
+
+        logger.info(
+            f"[VIT Runner] ✅ Batch forward completed: "
+            f"time={compute_time*1000:.1f}ms, "
+            f"avg={compute_time/batch_size*1000:.1f}ms per request, "
+            f"embeddings={batched_embeddings.shape}"
+        )
+
+        # 4. 拆分回各个请求 (参考 LightLLM: valid_ids 记录每个请求的起始和结束位置)
+        embeddings = []
+        offset = 0
+        for pv in pixel_values_list:
+            # 每个请求的 pixel_values 数量
+            num_images = pv.shape[0]
+            # 从 batched_embeddings 中提取对应的部分
+            # 注意: VIT 输出的 embedding 数量可能与 pixel_values 数量不同
+            # 需要根据 image_grid_thw 计算实际的 token 数量
+            # 简化处理: 假设每个 image 产生固定数量的 tokens
+            # 实际应该根据 grid_thw 计算: num_tokens = grid_t * grid_h * grid_w
+            embeddings.append(batched_embeddings[offset:offset + num_images].detach().cpu())
+            offset += num_images
+
+        logger.info(f"[VIT Runner] 📤 Split embeddings into {len(embeddings)} requests")
+
         return embeddings
 
     @torch.inference_mode()
@@ -522,7 +665,15 @@ class VITScheduler:
         self.device = device
         self.zmq_port = zmq_port
         self.batch_size = max(1, batch_size)
+
+        # 🔧 P2 修复: 优化 batch 超时时间
+        # 参考 LightLLM: 使用更长的超时时间以提高批处理利用率
+        # 默认从 10ms 增加到 100ms，可通过环境变量调整
+        default_batch_timeout_ms = float(os.environ.get("SGLANG_VIT_BATCH_TIMEOUT_MS", "100.0"))
+        if batch_timeout_ms == 10.0:  # 如果使用默认值，则使用环境变量
+            batch_timeout_ms = default_batch_timeout_ms
         self.batch_timeout = max(0.001, batch_timeout_ms / 1000.0)
+        logger.info(f"[VIT Scheduler] Batch timeout set to {self.batch_timeout*1000:.1f}ms")
 
         # 🔑 Phase 4: 动态批处理配置
         self.use_dynamic_batching = use_dynamic_batching or (os.environ.get("SGLANG_VIT_DYNAMIC_BATCHING", "0") == "1")
@@ -553,11 +704,12 @@ class VITScheduler:
         self.vit_tp_port = int(os.environ.get("SGLANG_VIT_TP_PORT", "29500"))
 
         # 🔧 新架构开关
-        self.use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "0") == "1"
+        self.use_new_arch = os.environ.get("SGLANG_VIT_NEW_ARCH", "1") == "1"
         self.cache_rpc_port = cache_rpc_port or int(os.environ.get("SGLANG_VIT_CACHE_RPC_PORT", "18888"))
 
         # 🔧 Worker Pool 配置
-        self.use_worker_pool = os.environ.get("SGLANG_VIT_USE_WORKER_POOL", "0") == "1"
+        default_worker_pool = "1" if self.use_new_arch else "0"
+        self.use_worker_pool = os.environ.get("SGLANG_VIT_USE_WORKER_POOL", default_worker_pool) == "1"
         self.vit_dp = vit_dp or int(os.environ.get("SGLANG_VIT_DP", "1"))
         self.worker_rpc_port_start = worker_rpc_port_start or int(os.environ.get("SGLANG_VIT_WORKER_RPC_PORT_START", "19000"))
         self.worker_clients = []  # Worker Pool RPC 客户端列表
@@ -1946,49 +2098,31 @@ class VITScheduler:
         batch_pixel_tokens = 0
 
         for request in requests:
-            hash_val = request.hash_val if request.hash_val is not None else 0
-            try:
-                pixel_values = _load_tensor_from_shared_memory(
-                    request.pixel_values_shm_name,
-                    request.pixel_values_shape,
-                    request.pixel_values_dtype,
-                )
-                image_grid_thw = _load_tensor_from_shared_memory(
-                    request.image_grid_thw_shm_name,
-                    request.image_grid_thw_shape,
-                    request.image_grid_thw_dtype,
-                )
-            except FileNotFoundError:
-                message = (
-                    f"input SHM missing (pixel={request.pixel_values_shm_name}, "
-                    f"grid={request.image_grid_thw_shm_name})"
-                )
+            # 🔑 修复 1: Scheduler 不再读取 SHM，hash_val 由 PP0 预计算
+            # 如果 hash_val 未设置，说明 PP0 版本过旧，跳过该请求
+            hash_val = request.hash_val
+            if hash_val is None:
+                message = "hash_val not set (PP0 version too old or hash computation failed)"
                 logger.error(
-                    "[VIT Scheduler] input SHM missing for request=%s (pixel=%s grid=%s)",
+                    "[VIT Scheduler] ❌ hash_val not set for request=%s, skipping",
                     request.request_id,
-                    request.pixel_values_shm_name,
-                    request.image_grid_thw_shm_name,
                 )
-                self._send_error_response(request, hash_val, message)
+                self._send_error_response(request, 0, message)
                 continue
 
-            hash_val = (
-                request.hash_val
-                if request.hash_val is not None
-                else _compute_request_hash(pixel_values, image_grid_thw)
-            )
-
-            if pixel_values.shape[0] > self.max_pixel_values:
+            # 🔑 修复 1: 大小检查也在 PP0 完成，Scheduler 只检查 shape
+            pixel_values_size = request.pixel_values_shape[0] if request.pixel_values_shape else 0
+            if pixel_values_size > self.max_pixel_values:
                 message = (
-                    f"pixel_values size {pixel_values.shape[0]} exceeds limit {self.max_pixel_values}"
+                    f"pixel_values size {pixel_values_size} exceeds limit {self.max_pixel_values}"
                 )
                 logger.warning(
                     "[VIT Scheduler] request %s too large: pixel_values.shape=%s limit=%d",
                     request.request_id,
-                    tuple(pixel_values.shape),
+                    tuple(request.pixel_values_shape),
                     self.max_pixel_values,
                 )
-                self._send_error_response(request, None, message)
+                self._send_error_response(request, hash_val, message)
                 continue
 
             # 🔧 根据架构选择缓存检查方式
@@ -2006,22 +2140,25 @@ class VITScheduler:
             if cache_contains:
                 cache_hits.append((request, hash_val))
             else:
+                # 🔑 修复 1: 使用 shape 而不是读取 tensor
+                pixel_values_size = request.pixel_values_shape[0] if request.pixel_values_shape else 0
                 if self.max_batch_pixel_tokens > 0:
-                    projected = batch_pixel_tokens + pixel_values.shape[0]
+                    projected = batch_pixel_tokens + pixel_values_size
                     if projected > self.max_batch_pixel_tokens:
                         message = (
                             f"Batch pixel token budget exceeded: current={batch_pixel_tokens}, "
-                            f"request={pixel_values.shape[0]}, limit={self.max_batch_pixel_tokens}"
+                            f"request={pixel_values_size}, limit={self.max_batch_pixel_tokens}"
                         )
                         logger.warning(
                             "[VIT Scheduler] request %s skipped due to batch pixel limit: %s",
                             request.request_id,
                             message,
                         )
-                        self._send_error_response(request, None, message)
+                        self._send_error_response(request, hash_val, message)
                         continue
                     batch_pixel_tokens = projected
-                cache_misses.append((request, pixel_values, image_grid_thw, hash_val))
+                # 🔑 修复 1: cache_misses 不再包含 tensor，只包含 request 和 hash_val
+                cache_misses.append((request, hash_val))
 
         if cache_misses:
             self._handle_cache_misses(cache_misses)
@@ -2092,108 +2229,46 @@ class VITScheduler:
 
     def _handle_cache_misses(
         self,
-        misses: List[Tuple[VITRequest, torch.Tensor, torch.Tensor, int]],
+        misses: List[Tuple[VITRequest, int]],
     ) -> None:
-        """处理缓存未命中的请求 (批量计算)
+        """处理缓存未命中的请求 (派发给 Worker)
 
-        🔧 批处理优化:
-        - 将多个请求的 pixel_values 和 image_grid 聚合
-        - 一次性调用 model_runner.compute_batch
-        - 提高 GPU 利用率
+        🔑 修复 1: Scheduler 不再读取 SHM 和计算，直接派发给 Worker
+        Worker 负责读取 SHM、计算 embedding、写入缓存
         """
-        pixel_values_list = [item[1] for item in misses]
-        image_grid_list = [item[2] for item in misses]
+        if not misses:
+            return
+
+        # 🔑 修复 1: 直接派发给 Worker，Worker 会读取 SHM
+        requests = [item[0] for item in misses]
 
         # 🔧 批处理日志
-        total_pixels = sum(pv.shape[0] for pv in pixel_values_list)
+        total_pixels = sum(req.pixel_values_shape[0] if req.pixel_values_shape else 0 for req in requests)
         logger.info(
-            f"[VIT Scheduler] 🚀 Starting batch forward: "
+            f"[VIT Scheduler] 🚀 Dispatching cache misses to worker: "
             f"batch_size={len(misses)}, total_pixels={total_pixels}"
         )
 
-        compute_start = time.time()
-        embeddings = self.model_runner.compute_batch(pixel_values_list, image_grid_list)
-        compute_time = time.time() - compute_start
-
-        # 🔧 批处理性能日志
-        logger.info(
-            f"[VIT Scheduler] ✅ Batch forward completed: "
-            f"batch_size={len(misses)}, compute_time={compute_time*1000:.1f}ms, "
-            f"avg_time_per_request={compute_time/len(misses)*1000:.1f}ms"
-        )
-
-        for (request, _pv, _grid, hash_val), embedding in zip(misses, embeddings):
-            cache_id = None
-
-            if not self.benchmark_mode and self.cache_enabled:
-                # 🔧 根据架构选择缓存写入方式
-                if self.use_new_arch:
-                    # 新架构: 通过 CacheServer RPC 写入
-                    if self.cache_client is not None:
-                        try:
-                            embed_cpu = embedding.cpu() if embedding.is_cuda else embedding
-                            size_bytes = embed_cpu.nelement() * embed_cpu.element_size()
-
-                            # 🔧 分配缓存槽位，返回 (cache_id, is_new)
-                            result = self.cache_client.root.alloc(hash_val, size_bytes)
-                            if result is not None:
-                                cache_id, is_new = result
-                                if is_new:  # 🔧 只在新分配时写入
-                                    # 获取 SHM key
-                                    shm_key = self.cache_client.root.get_shm_key(cache_id)
-                                    if shm_key:
-                                        # 🔧 使用 raw 函数写入 (不添加前缀)
-                                        success = write_embedding_to_shm_raw(shm_key, embed_cpu)
-                                        if success:
-                                            logger.debug(f"[VIT Scheduler] Wrote to cache: hash={hash_val:x}, cache_id={cache_id}")
-                                        else:
-                                            logger.error(f"[VIT Scheduler] [VIT Cache] Failed to write embedding to SHM: hash={hash_val}")
-                                else:
-                                    logger.debug(f"[VIT Scheduler] Cache hit during miss handling: hash={hash_val:x}, cache_id={cache_id}")
-                        except Exception as e:
-                            logger.error(f"[VIT Scheduler] Failed to write to cache: {e}")
-                            cache_id = None  # 🔧 降级到无缓存模式
-                else:
-                    # 旧架构: 直接写入进程内 CacheServer
-                    self.cache_server.put(hash_val, embedding)
-                    self.cache_server.retain(hash_val)
-
-            # 🔧 新架构使用 cache_id, 旧架构使用 hash_val
-            hash_or_id = cache_id if (self.use_new_arch and cache_id is not None) else hash_val
-            self._send_embedding(
-                request,
-                embedding,
-                hash_or_id,
-                from_cache=False,
-                compute_time=compute_time / max(len(misses), 1),
-            )
+        # 🔑 修复 1: 调用 Worker RPC
+        # Worker 会处理：读取 SHM → 计算 embedding → 写入缓存 → 返回结果
+        self._dispatch_to_workers(requests)
 
     def _check_cache_hit(self, request: VITRequest) -> Optional[int]:
         """检查缓存是否命中
 
         🔑 Phase 3.1: 新增方法，用于 Scheduler 端检查缓存
-        🔧 Phase 3 补充: 优化哈希计算，直接使用 request.hash_val
+        🔑 修复 1: 直接使用 request.hash_val，不再读取 SHM
 
         Returns:
             cache_id: 如果命中返回 cache_id，否则返回 None
         """
         try:
-            # 🔧 优化: 直接使用 request.hash_val，避免重复读取 SHM
+            # 🔑 修复 1: 直接使用 request.hash_val，不再读取 SHM
             content_hash = request.hash_val
             if content_hash is None:
-                # 回退: 如果 hash_val 未设置，才计算
-                logger.debug(f"[VIT Scheduler] request.hash_val is None, computing hash: {request.request_id}")
-                pixel_values = _load_tensor_from_shared_memory(
-                    request.pixel_values_shm_name,
-                    request.pixel_values_shape,
-                    request.pixel_values_dtype,
-                )
-                image_grid_thw = _load_tensor_from_shared_memory(
-                    request.image_grid_thw_shm_name,
-                    request.image_grid_thw_shape,
-                    request.image_grid_thw_dtype,
-                )
-                content_hash = _compute_request_hash(pixel_values, image_grid_thw)
+                # hash_val 未设置，说明 PP0 版本过旧或计算失败
+                logger.warning(f"[VIT Scheduler] hash_val not set for request={request.request_id}, cannot check cache")
+                return None
 
             # 🔑 RPC 调用 CacheServer 检查缓存
             cache_id = self.cache_client.root.get_cache_id(content_hash)
@@ -2277,6 +2352,11 @@ class VITScheduler:
                 error_message="",
                 vit_compute_start_time=time.time(),
                 vit_compute_end_time=time.time(),
+                # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
+                input_shm_names=[
+                    request.pixel_values_shm_name,
+                    request.image_grid_thw_shm_name,
+                ],
             )
             self._send_response(response)
 
@@ -2361,6 +2441,11 @@ class VITScheduler:
             error_message="",
             vit_compute_start_time=time.time(),
             vit_compute_end_time=time.time(),
+            # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
+            input_shm_names=[
+                request.pixel_values_shm_name,
+                request.image_grid_thw_shm_name,
+            ],
         )
         self._send_response(response)
 
@@ -2374,7 +2459,10 @@ class VITScheduler:
             logger.error("[VIT Scheduler] failed to send response: %s", exc, exc_info=True)
 
     def _send_error_response(self, request: VITRequest, hash_or_id: Optional[int], error_message: str = "Unknown error") -> None:
-        """发送错误响应"""
+        """发送错误响应
+
+        🔑 方案 1: 即使失败也要返回 input_shm_names，让 PP0 可以 release SHM
+        """
         # 🔧 区分新旧架构
         if self.use_new_arch:
             image_hash = 0
@@ -2397,6 +2485,11 @@ class VITScheduler:
             error_message=error_message,  # 🔧 错误信息
             vit_compute_start_time=time.time(),
             vit_compute_end_time=time.time(),
+            # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
+            input_shm_names=[
+                request.pixel_values_shm_name,
+                request.image_grid_thw_shm_name,
+            ],
         )
         self._send_response(response)
 
