@@ -183,28 +183,9 @@ class VisionSdpaAttention(nn.Module):
             if self.softmax_in_single_precision:
                 raise RuntimeError("Empty attention mask")
         else:
-            # 🔧 DEBUG: 打印 attention_mask 的详细信息
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"[Vision Attention] 🔧 DEBUG: attention_mask before .to(): "
-                f"shape={attention_mask.shape}, dtype={attention_mask.dtype}, device={attention_mask.device}"
-            )
             attention_mask = attention_mask.to(device=q.device)
-            logger.info(
-                f"[Vision Attention] 🔧 DEBUG: attention_mask after .to(): "
-                f"shape={attention_mask.shape}, dtype={attention_mask.dtype}, device={attention_mask.device}"
-            )
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
-
-        # 🔧 DEBUG: 打印 q, k, v 的详细信息
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(
-            f"[Vision Attention] 🔧 DEBUG: q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}, "
-            f"q.dtype={q.dtype}, bsz={bsz}"
-        )
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -226,26 +207,6 @@ class VisionSdpaAttention(nn.Module):
         else:
             # SDPA
             # [b, h, s, head_size]
-            # 🔧 DEBUG: 打印 SDPA 输入的详细信息
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(
-                f"[Vision Attention] 🔧 DEBUG: Before SDPA: "
-                f"q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}, "
-                f"attention_mask.shape={attention_mask.shape if attention_mask is not None else None}, "
-                f"q.dtype={q.dtype}, q.device={q.device}"
-            )
-
-            # 🔧 DEBUG: 计算预期的显存占用
-            # SDPA 需要的显存约为: batch_size * num_heads * seq_len * seq_len * dtype_size
-            if attention_mask is not None:
-                b, h, s, d = q.shape
-                expected_mem_gb = (b * h * s * s * 2) / 1024**3  # 2 bytes for bfloat16
-                logger.info(
-                    f"[Vision Attention] 🔧 DEBUG: Expected SDPA memory: "
-                    f"b={b}, h={h}, s={s}, d={d}, expected_mem={expected_mem_gb:.2f} GiB"
-                )
-
             output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -253,12 +214,6 @@ class VisionSdpaAttention(nn.Module):
                 attn_mask=attention_mask,
                 dropout_p=self.dropout,
                 is_causal=False,
-            )
-
-            # 🔧 DEBUG: 打印 SDPA 输出的详细信息
-            logger.info(
-                f"[Vision Attention] 🔧 DEBUG: After SDPA: "
-                f"output.shape={output.shape}, output.dtype={output.dtype}"
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]

@@ -381,7 +381,18 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
+        precomputed_window_index: Optional[torch.Tensor] = None,
+        precomputed_cu_window_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            x: pixel_values tensor
+            grid_thw: image grid tensor
+            precomputed_window_index: Optional pre-computed window index for batched processing
+            precomputed_cu_window_seqlens: Optional pre-computed cu_window_seqlens for batched processing
+
+        🔧 P1 修复: 支持预计算的 window_index，实现真·窗口拼批
+        """
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -389,13 +400,19 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
-        cu_window_seqlens = torch.tensor(
-            cu_window_seqlens,
-            device=x.device,
-            dtype=torch.int32,
-        )
-        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        # 🔧 P1 修复: 如果提供了预计算的 window_index，直接使用
+        # 否则调用原生 get_window_index() 计算
+        if precomputed_window_index is not None and precomputed_cu_window_seqlens is not None:
+            window_index = precomputed_window_index
+            cu_window_seqlens = precomputed_cu_window_seqlens
+        else:
+            window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+            cu_window_seqlens = torch.tensor(
+                cu_window_seqlens,
+                device=x.device,
+                dtype=torch.int32,
+            )
+            cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
         seq_len, _ = x.size()
 

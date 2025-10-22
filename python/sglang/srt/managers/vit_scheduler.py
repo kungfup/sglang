@@ -526,14 +526,20 @@ class VITModelRunner:
         pixel_values_list: Sequence[torch.Tensor],
         image_grid_thw_list: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """批量计算 VIT embeddings (真正的并行)
+        """批量计算 VIT embeddings
 
-        🔧 DEBUG: 添加详细日志诊断 Attention 显存爆炸问题
+        🔧 P0 修复: 直接复用 SGLang 原生 Qwen2_5_VisionTransformer.forward()
 
-        参考 LightLLM 实现 (lightllm/models/vit/model.py L195-197):
-        - 将多个请求的 pixel_values 拼接成一个大的 batch
-        - 一次性执行 VIT forward pass (GPU 并行)
-        - 然后将结果拆分回各个请求
+        关键发现:
+        1. SGLang 的 Qwen2_5_VisionTransformer 已经实现了完整的窗口化注意力
+        2. get_window_index() 会自动处理多张图的窗口索引
+        3. forward() 内部已经正确处理 window_index 和 reverse_indices
+        4. 我们之前的 torch.cat() 破坏了窗口语义，导致 OOM
+
+        修复方案 (P0 止血版):
+        - 按图循环调用 self.vit_model.forward()
+        - 让原生代码自己处理窗口化注意力
+        - 避免手动拼接破坏窗口语义
 
         Args:
             pixel_values_list: List of pixel_values tensors, each shape [num_images, C, H, W]
@@ -549,78 +555,46 @@ class VITModelRunner:
         if batch_size == 0:
             return []
 
-        # 单个请求，直接调用 compute (避免不必要的拼接开销)
-        if batch_size == 1:
-            return [self.compute(pixel_values_list[0], image_grid_thw_list[0])]
+        # ✅ P0 修复: 按图循环，直接复用 SGLang 原生 forward()
+        # 这样可以保证窗口化注意力正确工作，避免 OOM
+        logger.debug(f"[VIT Runner] Starting batch compute (per-image): batch_size={batch_size}")
 
-        # ✅ 批量并行处理 (参考 LightLLM)
-        logger.info(f"[VIT Runner] 🚀 Starting batch compute: batch_size={batch_size}")
+        embeddings = []
+        total_time = 0.0
 
-        # 1. 移动到 GPU (non_blocking 提高性能)
-        pixel_values_gpu = [pv.to(self.device, non_blocking=True) for pv in pixel_values_list]
-        image_grid_thw_gpu = [igt.to(self.device, non_blocking=True) for igt in image_grid_thw_list]
+        for i, (pixel_values, image_grid_thw) in enumerate(zip(pixel_values_list, image_grid_thw_list)):
+            start_time = time.time()
 
-        # 2. 拼接成 batch (参考 LightLLM: imgs = torch.cat(img_tensors, dim=0))
-        # pixel_values: [num_images_1, C, H, W] + [num_images_2, C, H, W] + ...
-        #            -> [total_images, C, H, W]
-        batched_pixel_values = torch.cat(pixel_values_gpu, dim=0)
+            # 🔧 关键修复 1: 先迁移到 GPU (non_blocking 提高性能)
+            # 避免模型内部隐式搬运，保证性能和正确性
+            pixel_values = pixel_values.to(self.device, non_blocking=True)
+            image_grid_thw = image_grid_thw.to(self.device, non_blocking=True)
 
-        # image_grid_thw: [num_grids_1, 3] + [num_grids_2, 3] + ...
-        #              -> [total_grids, 3]
-        batched_image_grid_thw = torch.cat(image_grid_thw_gpu, dim=0)
+            # 直接调用 SGLang 原生 forward()
+            # 内部会自动处理:
+            # 1. get_window_index(grid_thw) - 计算窗口索引
+            # 2. 窗口化注意力 - 避免 O(N²) 显存爆炸
+            # 3. reverse_indices - 恢复原始顺序
+            embedding = self.vit_model(pixel_values, grid_thw=image_grid_thw)
 
-        # 🔧 DEBUG: 打印详细的 tensor 信息
-        logger.info(
-            f"[VIT Runner] 📦 Batched tensors: "
-            f"pixel_values={batched_pixel_values.shape}, dtype={batched_pixel_values.dtype}, device={batched_pixel_values.device}, "
-            f"image_grid_thw={batched_image_grid_thw.shape}, dtype={batched_image_grid_thw.dtype}, device={batched_image_grid_thw.device}"
-        )
+            compute_time = time.time() - start_time
+            total_time += compute_time
 
-        # 🔧 DEBUG: 打印显存使用情况
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(self.device) / 1024**3
-            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
-            logger.info(
-                f"[VIT Runner] 💾 GPU memory before forward: "
-                f"allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB"
+            logger.debug(
+                f"[VIT Runner] Image {i+1}/{batch_size} completed: "
+                f"time={compute_time*1000:.1f}ms, embedding={embedding.shape}"
             )
 
-        # 3. 一次性 forward (GPU 并行，参考 LightLLM: all_img_embeds = self.forward(pixel_values))
-        start_time = time.time()
-        batched_pixel_values = batched_pixel_values.to(self.device, non_blocking=True)
-        batched_image_grid_thw = batched_image_grid_thw.to(self.device, non_blocking=True)
+            # 🔧 关键修复 2: 迁移到 CPU 再返回
+            # 避免 GPU tensor 写 SHM 出错，减少 GPU 显存占用
+            embeddings.append(embedding.detach().cpu())
 
-        # 🔧 DEBUG: 打印 VIT 模型的 dtype
-        first_param = next(self.vit_model.parameters())
+        avg_time = total_time / batch_size
         logger.info(
-            f"[VIT Runner] 🔧 VIT model dtype: {first_param.dtype}, device: {first_param.device}"
+            f"[VIT Runner] Batch compute completed: "
+            f"batch_size={batch_size}, total_time={total_time*1000:.1f}ms, "
+            f"avg_time={avg_time*1000:.1f}ms per image"
         )
-
-        batched_embeddings = self.vit_model(batched_pixel_values, grid_thw=batched_image_grid_thw)
-        compute_time = time.time() - start_time
-
-        logger.info(
-            f"[VIT Runner] ✅ Batch forward completed: "
-            f"time={compute_time*1000:.1f}ms, "
-            f"avg={compute_time/batch_size*1000:.1f}ms per request, "
-            f"embeddings={batched_embeddings.shape}"
-        )
-
-        # 4. 拆分回各个请求 (参考 LightLLM: valid_ids 记录每个请求的起始和结束位置)
-        embeddings = []
-        offset = 0
-        for pv in pixel_values_list:
-            # 每个请求的 pixel_values 数量
-            num_images = pv.shape[0]
-            # 从 batched_embeddings 中提取对应的部分
-            # 注意: VIT 输出的 embedding 数量可能与 pixel_values 数量不同
-            # 需要根据 image_grid_thw 计算实际的 token 数量
-            # 简化处理: 假设每个 image 产生固定数量的 tokens
-            # 实际应该根据 grid_thw 计算: num_tokens = grid_t * grid_h * grid_w
-            embeddings.append(batched_embeddings[offset:offset + num_images].detach().cpu())
-            offset += num_images
-
-        logger.info(f"[VIT Runner] 📤 Split embeddings into {len(embeddings)} requests")
 
         return embeddings
 
