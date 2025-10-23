@@ -9,6 +9,7 @@ from typing import Optional
 
 import psutil
 import setproctitle
+import torch
 
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.configs.model_config import ModelConfig
@@ -418,6 +419,18 @@ def run_standalone_scheduler_process(
         ipc_info = scheduler.get_ipc_info()
         p_ipc_info_queue.put(ipc_info)
         d_ipc_info_queue.put(ipc_info)
+        try:
+            if server_args.device == "cuda":
+                mem_mb = torch.cuda.memory_allocated(gpu_id) / (1024**2)
+                logger.info(
+                    "[SEMI-PD][MEM] Standalone scheduler GPU%s allocated %.2f MB after model load",
+                    gpu_id,
+                    mem_mb,
+                )
+        except Exception as e:
+            logger.warning(
+                "[SEMI-PD][MEM] Failed to query standalone scheduler memory: %s", e
+            )
 
         pipe_writer.send(
             {
@@ -549,6 +562,21 @@ def run_scheduler_process(
         if bypass_load_weight:
             scheduler.share_params_from_ipc(ipc_info)
             logger.info("✅ Successfully shared parameters via IPC (zero-copy)!")
+            try:
+                if scheduler.server_args.device == "cuda":
+                    mem_mb = torch.cuda.memory_allocated(gpu_id) / (1024**2)
+                    logger.info(
+                        "[SEMI-PD][MEM] %s instance GPU%s memory_allocated after IPC share: %.2f MB",
+                        instance_role.name,
+                        gpu_id,
+                        mem_mb,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[SEMI-PD][MEM] Failed to query %s memory usage: %s",
+                    instance_role.name,
+                    e,
+                )
 
 
 

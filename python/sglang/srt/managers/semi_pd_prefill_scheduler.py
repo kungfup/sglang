@@ -124,6 +124,27 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                 req_pool_idx, :pre_len
             ]
             r.fill_ids = r.origin_input_ids[: pre_len + r.extend_input_len]
+            prefix_ptr = (
+                r.prefix_indices.data_ptr()
+                if hasattr(r.prefix_indices, "data_ptr")
+                else None
+            )
+            pool_ptr = (
+                self.req_to_token_pool.req_to_token.data_ptr()
+                if hasattr(self.req_to_token_pool.req_to_token, "data_ptr")
+                else None
+            )
+            logger.info(
+                "[PREFILL][KV] req=%s req_pool_idx=%s prefix_len=%s extend_len=%s "
+                "prefix_ptr=%s stride=%s pool_ptr=%s",
+                r.rid,
+                req_pool_idx,
+                pre_len,
+                r.extend_input_len,
+                prefix_ptr,
+                r.prefix_indices.stride() if hasattr(r.prefix_indices, "stride") else None,
+                pool_ptr,
+            )
 
         # 🔧 MIGRATION: 原版Semi-PD的ScheduleBatch创建
         # P-Scheduler有资源引用，但通过pre_allocated_req_pool_indices控制分配行为

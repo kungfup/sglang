@@ -661,6 +661,20 @@ class ModelRunner:
                 f"Unsupported token to kv pool type: {type(self.token_to_kv_pool)}"
             )
 
+        try:
+            first_k_ptr = (
+                self.token_to_kv_pool.k_buffer[0].data_ptr()
+                if hasattr(self.token_to_kv_pool, "k_buffer")
+                else self.token_to_kv_pool.kv_buffer[0].data_ptr()
+            )
+            first_v_ptr = (
+                self.token_to_kv_pool.v_buffer[0].data_ptr()
+                if hasattr(self.token_to_kv_pool, "v_buffer")
+                else None
+            )
+        except Exception:
+            first_k_ptr = first_v_ptr = None
+
         # Get ReqToToken Handles
         req_to_token_tensor = self.req_to_token_pool.req_to_token
         req_to_token_handles = [get_ipc_handle(req_to_token_tensor)]
@@ -669,6 +683,28 @@ class ModelRunner:
             "req_to_token_dtype": req_to_token_tensor.dtype,
             "req_to_token_device": req_to_token_tensor.device,
         }
+
+        try:
+            decode_mem_alloc = torch.cuda.memory_allocated(self.gpu_id)
+            logger.info(
+                "[SEMI-PD][IPC] Export handles: mem_allocated=%.2f MB, "
+                "mem_fraction_static=%.3f, max_total_tokens=%s, "
+                "req_to_token_ptr=%s, kv_k_ptr=%s, kv_v_ptr=%s",
+                decode_mem_alloc / (1024**2),
+                self.mem_fraction_static,
+                getattr(self, "max_total_num_tokens", "N/A"),
+                req_to_token_tensor.data_ptr(),
+                first_k_ptr,
+                first_v_ptr,
+            )
+        except Exception:
+            logger.info(
+                "[SEMI-PD][IPC] Export handles: mem_fraction_static=%.3f, "
+                "max_total_tokens=%s, req_to_token_ptr=%s",
+                self.mem_fraction_static,
+                getattr(self, "max_total_num_tokens", "N/A"),
+                req_to_token_tensor.data_ptr(),
+            )
 
         # Collect extra attribute tensors for FP8 metadata or workspaces that are not
         # registered as parameters/buffers (e.g., workspace for marlin/MoE).
@@ -734,6 +770,23 @@ class ModelRunner:
     def share_params_from_ipc(self, ipc_info: IPCInfo):
         # Reconstruct parameters from IPC handles
         logger.info("🔍 [ORIGINAL SEMI-PD] Starting parameter sharing from IPC...")
+
+        prev_req_tensor = getattr(self.req_to_token_pool, "req_to_token", None)
+        prev_req_ptr = (
+            prev_req_tensor.data_ptr() if prev_req_tensor is not None else None
+        )
+        try:
+            pre_share_mem = torch.cuda.memory_allocated(self.gpu_id)
+        except Exception:
+            pre_share_mem = None
+        logger.info(
+            "[SEMI-PD][IPC] req_to_token pointer before sharing: %s", prev_req_ptr
+        )
+        if pre_share_mem is not None:
+            logger.info(
+                "[SEMI-PD][IPC] memory_allocated before share: %.2f MB",
+                pre_share_mem / (1024**2),
+            )
 
         # 1) Map all parameters that exist locally
         for name, _ in self.model.named_parameters():
@@ -963,6 +1016,22 @@ class ModelRunner:
         ).view(req_to_token_shape)
 
         self.req_to_token_pool.req_to_token = req_to_token_tensor
+        logger.info(
+            "[SEMI-PD][IPC] req_to_token pointer after sharing: %s",
+            self.req_to_token_pool.req_to_token.data_ptr(),
+        )
+        try:
+            post_share_mem = torch.cuda.memory_allocated(self.gpu_id)
+            logger.info(
+                "[SEMI-PD][IPC] memory_allocated after share: %.2f MB "
+                "(delta %.2f MB)",
+                post_share_mem / (1024**2),
+                (post_share_mem - pre_share_mem) / (1024**2)
+                if pre_share_mem is not None
+                else float("nan"),
+            )
+        except Exception:
+            pass
 
         logger.info("🔍 [ORIGINAL SEMI-PD] Parameter sharing from IPC completed")
 

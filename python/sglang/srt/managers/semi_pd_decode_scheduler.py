@@ -396,6 +396,19 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
             extend_input_lens = [r.extend_input_len for r in batch.reqs]
 
+            total_prefill_tokens = sum(
+                prefix_len + extend_len
+                for prefix_len, extend_len in zip(prefix_lens, extend_input_lens)
+            )
+            logger.info(
+                "[DECODE][KV] Approved prefill requests: rids=%s, req_pool_indices=%s, "
+                "total_prefill_tokens=%s, pool_available=%s",
+                approved_rids,
+                req_pool_indices,
+                total_prefill_tokens,
+                self.req_to_token_pool.available_size(),
+            )
+
             logger.debug(f"[DECODE] 🧠 Resource allocation - req_pool_indices: {req_pool_indices}, prefix_lens: {prefix_lens}, extend_input_lens: {extend_input_lens}")
 
             self.bridge_socket.send_pyobj(
