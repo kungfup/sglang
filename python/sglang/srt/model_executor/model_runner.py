@@ -1313,6 +1313,14 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
+        bypass_prefill_buffers = (
+            self.bypass_load_weight and self.instance_role == InstanceRole.PREFILL
+        )
+        if bypass_prefill_buffers:
+            logger.info(
+                "[SEMI-PD][PREFILL] Bypass creating local KV/req buffers; waiting for IPC handles."
+            )
+
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -1407,6 +1415,7 @@ class ModelRunner:
                     max_context_len=self.model_config.context_len + 4,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    bypass_create_buffers=bypass_prefill_buffers,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -1426,6 +1435,7 @@ class ModelRunner:
                 ),  # PP is not compatible with mla backend
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                bypass_create_buffers=bypass_prefill_buffers,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
@@ -1453,6 +1463,7 @@ class ModelRunner:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                bypass_create_buffers=bypass_prefill_buffers,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
@@ -1476,10 +1487,15 @@ class ModelRunner:
         else:
             assert self.is_draft_worker
 
-        logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        if bypass_prefill_buffers:
+            logger.info(
+                "[SEMI-PD][PREFILL] Memory pool placeholders ready; buffers will be attached via IPC."
+            )
+        else:
+            logger.info(
+                f"Memory pool end. "
+                f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
