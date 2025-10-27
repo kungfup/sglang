@@ -894,9 +894,45 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
-            # 🔧 DEBUG: Log sending to detokenizer for Semi-PD + PP debugging
+            # 🔧 CRITICAL FIX: In Semi-PD + PP mode, only DECODE-PP0 (first_rank) should send to detokenizer
+            # This prevents duplicate token streams that cause character repetition and garbled output
+            #
+            # Root cause: Both PREFILL-PP1 and DECODE-PP0 were sending tokens to the same detokenizer,
+            # causing the detokenizer to receive duplicate token streams and produce corrupted output.
+            #
+            # Solution: Only allow DECODE instance at first_rank (PP0) to send tokens to detokenizer.
+            # PREFILL instances should NEVER send to detokenizer in Semi-PD mode.
             if getattr(self.server_args, 'enable_semi_pd', False) and self.pp_size > 1:
-                logger.info(f"[STREAM_OUTPUT] PP{self.pp_rank} Sending {len(rids)} requests to detokenizer: rids={rids[:3]}")
+                from sglang.semi_pd.utils import InstanceRole
+                instance_role = getattr(self, 'instance_role', None)
+                pp_rank = getattr(self, 'pp_rank', 0)
+
+                # PREFILL instances should never send to detokenizer in Semi-PD mode
+                if instance_role == InstanceRole.PREFILL:
+                    if _so_log:
+                        logger.info(f"[STREAM_OUTPUT] PP{pp_rank} PREFILL: Skipping detokenizer send (PREFILL never sends to detokenizer in Semi-PD)")
+                    return
+
+                # DECODE instances: only first_rank (PP0) sends to detokenizer
+                if instance_role == InstanceRole.DECODE:
+                    pp_group = getattr(self, 'pp_group', None)
+                    if pp_group is not None:
+                        is_first = getattr(pp_group, 'is_first_rank', False)
+                        if not is_first:
+                            if _so_log:
+                                logger.info(f"[STREAM_OUTPUT] PP{pp_rank} DECODE: Skipping detokenizer send (only PP0 sends to detokenizer)")
+                            return
+                        else:
+                            if _so_log:
+                                logger.info(f"[STREAM_OUTPUT] PP{pp_rank} DECODE: ✅ Sending {len(rids)} requests to detokenizer: rids={rids[:3]}")
+                    else:
+                        # No pp_group, single PP stage, allow sending
+                        if _so_log:
+                            logger.info(f"[STREAM_OUTPUT] PP{pp_rank} DECODE: ✅ Sending {len(rids)} requests to detokenizer (no pp_group): rids={rids[:3]}")
+            else:
+                # Non-Semi-PD or non-PP mode: use standard behavior
+                if getattr(self.server_args, 'enable_semi_pd', False) and _so_log:
+                    logger.info(f"[STREAM_OUTPUT] Non-PP mode: Sending {len(rids)} requests to detokenizer")
 
             # CRITICAL FIX: Don't skip detokenizer for multimodal models
             # The original code skipped detokenizer for VL models, causing content=None

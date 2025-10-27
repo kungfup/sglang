@@ -2925,6 +2925,31 @@ class Scheduler(
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_abort = True
 
+        # In Semi-PD + PP，DECODE-PP0 接收到 AbortReq 后需要通知后续 PP stage
+        # 否则下游 PP 仍会持续生成 token，导致队列无法收敛
+        try:
+            if (
+                getattr(self.server_args, "enable_semi_pd", False)
+                and getattr(self, "instance_role", None) == InstanceRole.DECODE
+                and getattr(self, "pp_size", 1) > 1
+                and getattr(self, "pp_rank", 0) < getattr(self, "pp_size", 1) - 1
+                and self.attn_tp_rank == 0
+            ):
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                src = self.pp_rank * self.tp_size + dp_offset
+                dst = (self.pp_rank + 1) * self.tp_size + dp_offset
+                point_to_point_pyobj(
+                    [recv_req],
+                    src,
+                    self.world_group.cpu_group,
+                    src,
+                    dst,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[AbortReq] Failed to forward abort to downstream PP stage: %s", exc
+            )
+
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
