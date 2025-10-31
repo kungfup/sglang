@@ -42,7 +42,6 @@ from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
     get_exception_traceback,
-    trim_overlap,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +65,7 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
+    sent_offset: int = 0
 
 
 class DetokenizerManager:
@@ -185,11 +185,13 @@ class DetokenizerManager:
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 # 默认按照“增量+相对 read_offset”的契约初始化
+                initial_decoded = recv_obj.decoded_texts[i] or ""
                 s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
+                    decoded_text=initial_decoded,
                     decode_ids=recv_obj.decode_ids[i],
                     surr_offset=0,
                     read_offset=int(recv_obj.read_offsets[i]),
+                    sent_offset=len(initial_decoded),
                 )
                 self.decode_status[rid] = s
             else:
@@ -202,6 +204,7 @@ class DetokenizerManager:
                         s.read_offset = int(recv_obj.read_offsets[i])
                     except Exception:
                         pass
+                    s.sent_offset = min(s.sent_offset, len(s.decoded_text))
                 else:
                     # 增量：在已有 decode_ids 后追加
                     try:
@@ -211,6 +214,7 @@ class DetokenizerManager:
                         s.decode_ids = recv_obj.decode_ids[i]
                         s.surr_offset = 0
                         s.read_offset = int(recv_obj.read_offsets[i])
+                        s.sent_offset = min(s.sent_offset, len(s.decoded_text))
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -279,43 +283,36 @@ class DetokenizerManager:
             if recv_obj.finished_reasons[i] is None:
                 # Streaming step
                 if len(new_text) > 0 and not new_text.endswith("�"):
-                    # Flushable chunk: commit offsets and return the delta only
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    output_chunk = new_text
+                    new_text = ""
                 else:
-                    # Not flushable yet: only return the non-overlapping printable delta
-                    cand = find_printable_text(new_text)
-                    # Remove any overlap with what has already been sent to avoid duplicates
-                    output_chunk = trim_overlap(s.decoded_text, cand)
-                    if len(output_chunk) > 0:
-                        # Remember what we actually sent this round
-                        s.decoded_text = s.decoded_text + output_chunk
+                    new_text = find_printable_text(new_text)
             else:
-                # Finished step: trim stop on the final full text, then return only the final delta
-                final_full = self.trim_matched_stop(
-                    s.decoded_text + new_text,
-                    recv_obj.finished_reasons[i],
-                    recv_obj.no_stop_trim[i],
-                )
                 if DETOK_DEBUG_LOGS_ENABLED:
                     try:
-                        _h = final_full[:80]
-                        _t = final_full[-80:]
+                        final_preview = (s.decoded_text + new_text)[:80]
                         logger.info(
-                            f"[DBG_DETOKENIZER_FINAL] rid={str(recv_obj.rids[i])[:8]} len={len(final_full)} head={_h!r} tail={_t!r}"
+                            f"[DBG_DETOKENIZER_FINAL] rid={str(recv_obj.rids[i])[:8]} preview={final_preview!r}"
                         )
                     except Exception:
                         pass
-                # Delta relative to accumulated decoded_text
-                output_chunk = final_full[len(s.decoded_text) :]
-                # Commit state to final
-                s.decoded_text = final_full
+
+            output_str = self.trim_matched_stop(
+                s.decoded_text + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
+            )
+            incremental_output = output_str[s.sent_offset :]
+            s.sent_offset = len(output_str)
+
+            if recv_obj.finished_reasons[i] is not None:
+                s.decoded_text = output_str
                 s.surr_offset = s.read_offset
                 s.read_offset = len(s.decode_ids)
 
-            output_strs.append(output_chunk)
+            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,

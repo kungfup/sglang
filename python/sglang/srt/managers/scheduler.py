@@ -1183,9 +1183,12 @@ class Scheduler(
                             self._vit_ready_reqs = []
 
                         if reqs_to_forward:
-                            logger.info(
-                                f"[PP{self.pp_rank}] 📤 Forwarding {len(reqs_to_forward)} TokenizedGenerateReqInput to PP{self.pp_rank+1}"
-                            )
+                            # Throttle noisy forwarding log; emit first event then every 10K.
+                            self._forward_log_count = getattr(self, "_forward_log_count", 0) + 1
+                            if self._forward_log_count == 1 or self._forward_log_count % 10000 == 0:
+                                logger.info(
+                                    f"[PP{self.pp_rank}] 📤 Forwarding {len(reqs_to_forward)} TokenizedGenerateReqInput to PP{self.pp_rank+1}"
+                                )
                         elif DEBUG_LOGS_ENABLED:
                             self._forward_zero_log_count = getattr(
                                 self, "_forward_zero_log_count", 0

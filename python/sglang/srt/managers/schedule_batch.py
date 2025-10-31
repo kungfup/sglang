@@ -94,6 +94,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "ep_dispatch_algorithm",
     "deepep_config",
     "ep_num_redundant_experts",
+    "enable_semi_pd",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
     "max_micro_batch_size",
@@ -1351,40 +1352,48 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        # Place multimodal pixel_values according to policy
-        lazy_h2d = os.environ.get("SGLANG_MM_LAZY_H2D", "0").lower() in ("1", "true", "yes")
         self.multimodal_inputs = multimodal_inputs
-        # Only the first PP stage needs pixel_values on device; later stages only consume hidden_states.
-        is_pp_first = True
-        try:
-            from sglang.srt.distributed import get_pp_group
-            is_pp_first = get_pp_group().is_first_rank
-        except Exception:
-            pass
-        if is_pp_first and (not lazy_h2d) and (self.multimodal_inputs is not None):
+        semi_pd_enabled = bool(global_server_args_dict.get("enable_semi_pd", False))
+        stage_pixels = (
+            semi_pd_enabled
+            and os.environ.get("SGLANG_MM_STAGE_PIXELS", "0").lower() in ("1", "true", "yes")
+            and self.multimodal_inputs is not None
+        )
+        if stage_pixels:
+            is_pp_first = True
             try:
-                # Origin-compatible: stage pixel_values to current stage device now
-                for item in getattr(self.multimodal_inputs, "mm_items", []) or []:
-                    pv = getattr(item, "pixel_values", None)
-                    if isinstance(pv, torch.Tensor) and pv.numel() > 0:
-                        if pv.device.type == "cpu":
-                            # Pin to speed up H2D if configured
-                            if os.environ.get("SGLANG_MM_PIN_CPU", "1").lower() in ("1", "true", "yes"):
+                from sglang.srt.distributed import get_pp_group
+
+                is_pp_first = get_pp_group().is_first_rank
+            except Exception:
+                pass
+
+            if is_pp_first:
+                pin_cpu = os.environ.get("SGLANG_MM_PIN_CPU", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                try:
+                    for item in getattr(self.multimodal_inputs, "mm_items", []) or []:
+                        pv = getattr(item, "pixel_values", None)
+                        if isinstance(pv, torch.Tensor) and pv.numel() > 0:
+                            if pv.device.type == "cpu" and pin_cpu:
                                 try:
                                     pv = pv.pin_memory()
                                 except Exception:
                                     pass
-                        if pv.device != self.device:
-                            pv = pv.to(self.device, non_blocking=True)
-                        item.pixel_values = pv
-            except Exception as e:
-                logger.warning(f"[MM_PREPROC] Failed to stage pixel_values to device: {e}")
-        elif (not is_pp_first) and (not lazy_h2d):
-            # Non-first PP stage: explicitly skip staging images to avoid delaying PP recv
-            try:
-                logger.info("[MM_PREPROC] Skip staging pixel_values on non-first PP stage to minimize prefill stall")
-            except Exception:
-                pass
+                            if pv.device != self.device:
+                                pv = pv.to(self.device, non_blocking=True)
+                            item.pixel_values = pv
+                except Exception as e:
+                    logger.warning(
+                        f"[MM_PREPROC] Failed to stage pixel_values to device: {e}"
+                    )
+            else:
+                logger.debug(
+                    "[MM_PREPROC] Skip staging pixel_values on non-first PP stage"
+                )
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 

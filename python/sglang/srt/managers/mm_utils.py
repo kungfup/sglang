@@ -19,10 +19,18 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_bool_env_var,
+    print_warning_once,
+)
 from sglang.semi_pd.utils import InstanceRole
 
 from sglang.utils import logger
+
+ALLOW_MM_LEN_TRUNCATION = get_bool_env_var(
+    "SGLANG_ALLOW_MM_LEN_TRUNCATION", default="0"
+)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -390,13 +398,8 @@ def _adjust_embedding_length(
     """
     Make the number of multimodal embedding tokens match the number of placeholder
     positions found in input_ids (encoded in `mask`).
-
-    Policy:
-    - If we have MORE embeddings than placeholders: trim embedding from the tail to match
-      mask count (existing behavior, keeps most-recent chunk alignment).
-    - If we have FEWER embeddings than placeholders: trim the mask to keep only the
-      last K=True positions so that K == num_mm_tokens_in_embedding. This avoids a
-      hard crash and aligns with the tail-extraction policy for the opposite case.
+    默认行为与原生 SGLang 一致：如果占位符多于可用嵌入则直接报错，避免静默丢失图像特征。
+    若设置环境变量 `SGLANG_ALLOW_MM_LEN_TRUNCATION=1`，则退回到掩码裁剪的容错逻辑（可能导致输出质量下降）。
     """
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
@@ -405,35 +408,47 @@ def _adjust_embedding_length(
         return embedding
 
     logger.warning(
-        "[MM_LEN_MISMATCH] text_mm_tokens=%d embed_tokens=%d — will reconcile via tail-trim",
+        "[MM_LEN_MISMATCH] text_mm_tokens=%d embed_tokens=%d",
         num_mm_tokens_in_input_ids,
         num_mm_tokens_in_embedding,
     )
 
     if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-        # More embeddings than placeholder positions: trim embedding tail to match mask
+        # More embeddings than placeholders: extract from the TAIL to align with original SGLang behavior.
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
         if chunked_prefill_size != -1:
             logger.warning(
                 "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
             )
-        # Extract from the beginning to align with mrope_positions slicing
-        # In chunked prefill, both embedding and mrope_positions are sliced from the start
         if embedding.dim() == 2:
-            embedding = embedding[:num_mm_tokens_in_input_ids, :]
+            embedding = embedding[-num_mm_tokens_in_input_ids:, :]
         else:
             num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-            embedding = embedding[:num_multimodal, :]
+            embedding = embedding[-num_multimodal:, :]
         return embedding
 
-    # Otherwise: more placeholders than embeddings — trim the mask to keep only the last K
+    # Fewer embeddings than placeholders: default to strict mode (raise), unless env flag enables fallback.
+    if not ALLOW_MM_LEN_TRUNCATION:
+        chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+        if chunked_prefill_size != -1:
+            logger.warning(
+                "Chunked prefill is enabled and the image placeholder tokens exceed the available "
+                "multimodal embeddings. Consider increasing `chunked_prefill_size` or disabling "
+                "chunked prefill for multimodal requests."
+            )
+        raise RuntimeError(
+            "Insufficient multimodal embedding length: "
+            f"text_mm_tokens={num_mm_tokens_in_input_ids} vs embed_tokens={num_mm_tokens_in_embedding}. "
+            "This mismatch can corrupt outputs. Set SGLANG_ALLOW_MM_LEN_TRUNCATION=1 to enable "
+            "fallback trimming (may degrade response quality)."
+        )
+
+    # Fallback path: trim mask to keep only the last K placeholders.
     try:
-        # mask shape: [T, 1] (bool). Flatten to indices of True positions.
         flat = mask.view(-1)
         true_idx = torch.nonzero(flat, as_tuple=False).squeeze(-1)
         k = int(num_mm_tokens_in_embedding)
         if k <= 0 or true_idx.numel() == 0:
-            # No visual tokens available: clear mask to avoid masked_scatter assert
             flat.zero_()
             logger.warning(
                 "[MM_MASK_CLEARED] embed len is 0; cleared %d placeholder positions",
@@ -441,17 +456,15 @@ def _adjust_embedding_length(
             )
             return embedding
         keep = true_idx[-k:]
-        # Zero mask and set only the last k positions to True
         flat.zero_()
         flat[keep] = True
         logger.warning(
-            "[MM_MASK_TRIMMED] kept_last=%d of %d placeholders to match embed len",
+            "[MM_MASK_TRIMMED] kept_last=%d of %d placeholders to match embed len (env bypass)",
             k,
             num_mm_tokens_in_input_ids,
         )
     except Exception as e:
         logger.error(f"Failed to trim multimodal mask: {e}")
-        # As a last resort, keep original mask to avoid silent misalignment
     return embedding
 
 

@@ -445,18 +445,26 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
                     self.server_args.enable_custom_logit_processor,
                 )
                 new_batch.prepare_for_extend()
-                # Chunked-Prefill: 从第二个chunk开始，避免重复计算多模态（仅对该rid清空mm_inputs）
-                try:
-                    if (
-                        self.chunked_req is not None
-                        and getattr(self.chunked_req, "is_chunked", 0) > 1
-                        and new_batch.multimodal_inputs is not None
-                    ):
-                        for i, req in enumerate(new_batch.reqs):
-                            if req.rid == self.chunked_req.rid:
-                                new_batch.multimodal_inputs[i] = None
-                except Exception:
-                    pass
+
+                # 🔧 FIX: Remove incorrect multimodal_inputs clearing logic
+                # VLM models need multimodal_inputs (especially mrope_positions) in all chunks
+                # Clearing multimodal_inputs causes generation to fail or produce incorrect output
+                # Original SGLang does not have this logic - this was incorrectly added
+                #
+                # REMOVED (行 448-459):
+                # # Chunked-Prefill: 从第二个chunk开始，避免重复计算多模态（仅对该rid清空mm_inputs）
+                # try:
+                #     if (
+                #         self.chunked_req is not None
+                #         and getattr(self.chunked_req, "is_chunked", 0) > 1
+                #         and new_batch.multimodal_inputs is not None
+                #     ):
+                #         for i, req in enumerate(new_batch.reqs):
+                #             if req.rid == self.chunked_req.rid:
+                #                 new_batch.multimodal_inputs[i] = None
+                # except Exception:
+                #     pass
+
                 return new_batch
         except Exception:
             pass

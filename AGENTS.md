@@ -1,31 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Core Python package: `python/sglang` (runtime, frontend language, configs). Tests live in `python/sglang/test/`. 
-- GPU kernels: `sgl-kernel/` (C++/CUDA, CMake, Python wrapper). 
-- Router & load balancer: `sgl-router/` (Rust crate with Python wrapper). 
-- Additional dirs: `examples/` (usage), `benchmark/` (perf), `docs/` (Sphinx), `scripts/`, `docker/`, `.github/`.
+Core runtime code lives in `python/sglang/`, including the `semi_pd` pipeline, API entrypoints, and CLI helpers; unit tests for those modules sit in `python/sglang/test/`. Kernel operators are in `sgl-kernel/`, while request routing and load-balancing logic are in `sgl-router/` and `sgl-pdlb/`. Integration assets such as IPC shims (`semi-pd-ipc/`), benchmarking harnesses (`benchmark/`), runnable examples (`examples/`), and repo-level smoke tests (`test/`) keep parity across environments. Visual assets, diagrams, and long-form docs belong in `assets/` and `docs/`.
 
 ## Build, Test, and Development Commands
-- Python (editable dev install): `pip install -e "python[dev]"`  (or select extras: `dev_cpu`, `dev_hip`, `dev_hpu`, `dev_xpu`).
-- Format changed Python files: `make format` (runs isort + black on modified files).
-- Run pre-commit checks locally: `pre-commit install && pre-commit run -a`.
-- Python tests (unit/smoke): `pytest -q python/sglang/test` (or `python -m pytest ...`). Many tests require GPUs/models; prefer small tests first.
-- Kernel tests: `cd sgl-kernel && make test` (build helpers in `sgl-kernel/Makefile`).
-- Router tests: `cd sgl-router && cargo test`.
-- Version bump helper: `make update 0.x.y` (updates coordinated version strings).
+Set up a dev environment with `pip install -e "python[dev]"` (swap `dev_cpu`, `dev_hip`, etc. to match hardware). Format staged Python edits using `make format`, rebuild GEMM kernels through `python/sglang/compile_deep_gemm.py`, and sync version metadata via `make update <version>`. Run focused runtime checks with `pytest -q python/sglang/test`, repo smoke tests with `pytest -q test`, GPU kernel suites inside `sgl-kernel` using `make test`, and router validation from `sgl-router` via `cargo test`.
 
 ## Coding Style & Naming Conventions
-- Indentation: spaces, 4-wide (`.editorconfig`). JSON/YAML use 2. 
-- Python: black + isort (profile=black), ruff on selected dirs. Use snake_case for funcs/vars, PascalCase for classes, module-private helpers prefixed with `_`. Group imports (stdlib, third-party, first-party).
-- C++/CUDA: clang-format with repo style. 
-- Rust: `cargo fmt` and `cargo clippy -D warnings` before committing.
+Python code follows `black` + `isort --profile=black`, 4-space indentation, and descriptive snake_case identifiers; reserve PascalCase for classes and prefix internal helpers with `_`. Ensure CUDA/C++ sources pass `clang-format`, Rust crates run `cargo fmt` and `cargo clippy -D warnings`, and keep comments focused on intent rather than mechanics.
 
 ## Testing Guidelines
-- Place tests under the corresponding component (`python/sglang/test`, `sgl-kernel/tests`, `sgl-router/tests`). Use `test_*.py`/`*_test.rs` naming.
-- Keep GPU-heavy tests optional; add small CPU smoke tests where possible. Useful envs: `SGLANG_IS_IN_CI=1`, `CUDA_VISIBLE_DEVICES=...`.
+Place new tests beside the code they guard: Python in `python/sglang/test`, cross-component scenarios in `test/`, kernel specs in `sgl-kernel/tests`, and routing checks in `sgl-router/tests`. Use `test_*` naming, parametrize boundary cases, gate heavyweight GPU suites with markers, and record expected logs in `test/lang` when extending language features.
 
 ## Commit & Pull Request Guidelines
-- Commits: concise, imperative subject (<=72 chars), explain “what/why”. Group logically; avoid noisy reformat-only commits unless intentional.
-- PRs: include a clear description, linked issues, how to test (commands), expected perf impact, and screenshots/logs when UI/metrics change. Update docs/examples when behavior changes.
+Write commits around a single change and use imperative, present-tense subjects (e.g., `Tighten semi_pd admission control`); add bodies that state motivation or fallbacks. PRs should list test commands, performance or accuracy impact, linked issues, and screenshots or logs whenever behavior shifts; request reviewers noted in `docs/` for shared kernels or router updates.
 
+## Security & Configuration Tips
+Avoid checking in credentials or large model artifacts—existing `.gitignore` patterns cover common cases; add new exclusions when needed. Validate CUDA/ROCm prerequisites with `python/sglang/check_env.py`, document newly required environment variables in `docs/start/install.md`, and pin port ranges (`SGLANG_PORT`, `PORT_BASE`) during distributed experiments to keep shared runners stable.
