@@ -481,6 +481,24 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         except Exception:
             pass
 
+        self.vit_async_enabled = (
+            os.environ.get("SGLANG_VIT_ASYNC_DISABLED", "0") != "1"
+            and torch.cuda.is_available()
+        )
+        self.vit_stream = None
+        if self.vit_async_enabled and self.pp_group.is_first_rank:
+            try:
+                self.vit_stream = torch.cuda.Stream()
+                logger.info("[ViT Async] Enabled ViT asynchronous computation with dedicated CUDA stream")
+            except Exception as exc:
+                logger.warning(
+                    "[ViT Async] Failed to initialize CUDA stream, fallback to synchronous vision execution: %s",
+                    str(exc),
+                )
+                self.vit_async_enabled = False
+        else:
+            self.vit_async_enabled = False
+
         if self.pp_group.is_first_rank:
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
@@ -693,7 +711,41 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 )
         except Exception:
             pass
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if use_copy_stream:
+            try:
+                if isinstance(tgt_dev, torch.device) and tgt_dev.type == "cuda":
+                    torch.cuda.current_stream(device=tgt_dev).wait_stream(copy_stream)
+            except Exception:
+                pass
+
+        vision_async_ready = (
+            self.vit_async_enabled
+            and self.vit_stream is not None
+            and isinstance(tgt_dev, torch.device)
+            and tgt_dev.type == "cuda"
+        )
+
+        if vision_async_ready:
+            vit_stream = self.vit_stream
+            stream_device = getattr(vit_stream, "device", None)
+            try:
+                if stream_device is not None and torch.device(stream_device) != tgt_dev:
+                    vit_stream = torch.cuda.Stream(device=tgt_dev)
+                    self.vit_stream = vit_stream
+                    logger.info("[ViT Async] Recreated CUDA stream for device %s", str(tgt_dev))
+            except Exception:
+                pass
+
+            current_stream = torch.cuda.current_stream(device=tgt_dev)
+            vit_stream.wait_stream(current_stream)
+            with torch.cuda.stream(vit_stream):
+                image_embeds_local = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds_local = image_embeds_local.contiguous()
+            current_stream.wait_stream(vit_stream)
+            image_embeds = image_embeds_local
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+            image_embeds = image_embeds.contiguous()
         try:
             if os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes"):
                 _dev = pixel_values.device
@@ -709,7 +761,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 )
         except Exception:
             pass
-        return image_embeds.contiguous()
+        return image_embeds
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)

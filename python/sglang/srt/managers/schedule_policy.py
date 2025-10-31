@@ -482,10 +482,11 @@ class PrefillAdder:
             trunc_len = self.rem_chunk_tokens
 
             req.extend_input_len = trunc_len
-            req.fill_ids = req.fill_ids[:trunc_len]
+            prefix_len = len(req.prefix_indices)
+            req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
 
