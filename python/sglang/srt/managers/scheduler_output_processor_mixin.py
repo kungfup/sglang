@@ -589,7 +589,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_abort:
+            if getattr(self.model_config, "is_multimodal", False) and req.to_abort:
                 continue
 
             if req.finished():
@@ -606,10 +606,10 @@ class SchedulerOutputProcessorMixin:
                     )
                     should_output = len(req.output_ids) % stream_interval == 0
                 else:
-                    should_output = (
-                        len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        and not self.model_config.is_multimodal_gen
-                    )
+                    if getattr(self.model_config, "is_multimodal", False):
+                        should_output = False
+                    else:
+                        should_output = len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
 
             if should_output:
 
@@ -628,7 +628,7 @@ class SchedulerOutputProcessorMixin:
                 try:
                     _rid = getattr(req, "rid", "NA")
                     _send_off = getattr(req, "send_decode_id_offset", 0)
-                    if self.model_config.is_multimodal_gen:
+                    if getattr(self.model_config, "is_multimodal", False):
                         _to_send = decode_ids
                     else:
                         _to_send = decode_ids[_send_off:]
@@ -638,27 +638,29 @@ class SchedulerOutputProcessorMixin:
                 except Exception:
                     pass
 
-                # 多模态/文本 detokenizer 协议（通过开关控制）：
-                # SGLANG_MM_DETOKENIZER_MODE: incremental(默认)/off/full
-                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
-                if self.model_config.is_multimodal_gen:
-                    if mm_mode in ("off", "0", "false"):
-                        # 原生语义：多模态不经 detokenizer，跳过发送
-                        # 回到 for 循环，处理下一个 req
-                        rids.pop(); finished_reasons.pop(); decoded_texts.pop()
-                        continue
-                    elif mm_mode == "full":
-                        # 全量+绝对窗口（兼容/调试）
-                        full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
-                        prev_full_len = getattr(req, 'last_full_decode_len', len(req.origin_input_ids_unpadded))
-                        decode_ids_list.append(full_decode_ids)
-                        read_offset_to_send = prev_full_len
-                        req.last_full_decode_len = len(full_decode_ids)
-                    else:
-                        # 增量模式
-                        decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-                        read_offset_to_send = read_offset
+                # 多模态/文本 detokenizer 协议：
+                # 多模态强制使用 full，文本默认保持增量协议
+                is_multimodal = getattr(self.model_config, "is_multimodal", False)
+                if is_multimodal:
+                    mm_mode = "full"
                 else:
+                    mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "full").lower()
+                if is_multimodal:
+                    # 全量+绝对窗口
+                    full_decode_ids = req.origin_input_ids_unpadded + req.output_ids
+                    prev_full_len = getattr(
+                        req, "last_full_decode_len", len(req.origin_input_ids_unpadded)
+                    )
+                    decode_ids_list.append(full_decode_ids)
+                    read_offset_to_send = prev_full_len
+                    req.last_full_decode_len = len(full_decode_ids)
+                else:
+                    if mm_mode in ("off", "0", "false"):
+                        # 原生语义：文本关闭 detokenizer（仅供调试）
+                        rids.pop()
+                        finished_reasons.pop()
+                        decoded_texts.pop()
+                        continue
                     # 文本：保持增量协议
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                     read_offset_to_send = read_offset

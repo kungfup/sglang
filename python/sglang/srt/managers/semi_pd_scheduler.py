@@ -513,12 +513,13 @@ def run_scheduler_process(
 
     # 🔧 默认开启多模态全量 detokenizer（与原生一致）
     try:
-        if not os.environ.get("SGLANG_MM_DETOKENIZER_MODE"):
-            model_config = ModelConfig.from_server_args(server_args)
-            if getattr(model_config, "is_multimodal_gen", False):
-                os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "full"
+        model_config = ModelConfig.from_server_args(server_args)
+        if getattr(model_config, "is_multimodal", False):
+            prev = os.environ.get("SGLANG_MM_DETOKENIZER_MODE")
+            os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "full"
+            if prev != "full":
                 logger.info(
-                    f"🔧 [SEMI_PD] TP{tp_rank}: 自动设置 SGLANG_MM_DETOKENIZER_MODE=full，使用全量 detokenizer 裁剪 Prompt"
+                    f"🔧 [SEMI_PD] TP{tp_rank}: 强制设置 SGLANG_MM_DETOKENIZER_MODE=full（原值={prev!r}）以启用多模态全量 detokenizer"
                 )
     except Exception:
         logger.exception(
