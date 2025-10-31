@@ -65,6 +65,8 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
+    # Offset that's sent to tokenizer for incremental update (align with origin)
+    sent_offset: int = 0
 
 
 class DetokenizerManager:
@@ -175,13 +177,11 @@ class DetokenizerManager:
 
         bs = len(recv_obj.rids)
 
-        # Initialize decode status
+        # Initialize decode status (align with origin: always incremental extend)
         read_ids, surr_ids = [], []
-        mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "off").lower()
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
-                # 默认按照“增量+相对 read_offset”的契约初始化
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],
@@ -191,23 +191,13 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                if mm_mode == "full":
-                    # “全量+绝对”窗口模式（仅用于兼容调试），用新的窗口替换状态
+                try:
+                    s.decode_ids.extend(recv_obj.decode_ids[i])
+                except Exception:
+                    # Fallback: replace if extend fails
                     s.decode_ids = recv_obj.decode_ids[i]
                     s.surr_offset = 0
-                    try:
-                        s.read_offset = int(recv_obj.read_offsets[i])
-                    except Exception:
-                        pass
-                else:
-                    # 增量：在已有 decode_ids 后追加
-                    try:
-                        s.decode_ids.extend(recv_obj.decode_ids[i])
-                    except Exception:
-                        # 防御：异常时退化为替换
-                        s.decode_ids = recv_obj.decode_ids[i]
-                        s.surr_offset = 0
-                        s.read_offset = int(recv_obj.read_offsets[i])
+                    s.read_offset = int(recv_obj.read_offsets[i])
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -253,9 +243,7 @@ class DetokenizerManager:
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
 
-        # Incremental decoding
-        # IMPORTANT: Detokenizer should return the delta chunk only.
-        # TokenizerManager is responsible for accumulating full text (`state.text += chunk`).
+        # Incremental decoding (origin behavior)
         output_strs = []
         for i in range(bs):
             try:
@@ -270,40 +258,26 @@ class DetokenizerManager:
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
 
-            # New text w.r.t. the current surr window
             new_text = read_texts[i][len(surr_texts[i]) :]
-
             if recv_obj.finished_reasons[i] is None:
-                # Streaming step
+                # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
-                    # Flushable chunk: commit offsets and return the delta only
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    output_chunk = new_text
+                    new_text = ""
                 else:
-                    # Not flushable yet: only return the non-overlapping printable delta
-                    cand = find_printable_text(new_text)
-                    # Remove any overlap with what has already been sent to avoid duplicates
-                    output_chunk = trim_overlap(s.decoded_text, cand)
-                    if len(output_chunk) > 0:
-                        # Remember what we actually sent this round
-                        s.decoded_text = s.decoded_text + output_chunk
-            else:
-                # Finished step: trim stop on the final full text, then return only the final delta
-                final_full = self.trim_matched_stop(
-                    s.decoded_text + new_text,
-                    recv_obj.finished_reasons[i],
-                    recv_obj.no_stop_trim[i],
-                )
-                # Delta relative to accumulated decoded_text
-                output_chunk = final_full[len(s.decoded_text) :]
-                # Commit state to final
-                s.decoded_text = final_full
-                s.surr_offset = s.read_offset
-                s.read_offset = len(s.decode_ids)
+                    new_text = find_printable_text(new_text)
 
-            output_strs.append(output_chunk)
+            output_str = self.trim_matched_stop(
+                s.decoded_text + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
+            )
+            # Incrementally send text using sent_offset
+            incremental_output = output_str[s.sent_offset :]
+            s.sent_offset = len(output_str)
+            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,

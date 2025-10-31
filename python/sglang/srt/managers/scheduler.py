@@ -1189,10 +1189,16 @@ class Scheduler(
                             except Exception:
                                 pass
                         # Send token packet with explicit tag
+                        # Attach rids to ensure PP1->PP0 alignment (Semi-PD + PP)
+                        try:
+                            _rids_for_send = [r.rid for r in self.cur_batch.reqs] if self.cur_batch and self.cur_batch.reqs else []
+                        except Exception:
+                            _rids_for_send = []
                         if self.cur_batch.return_logprob:
                             send_tok = (
                                 {
                                     "next_token_ids": next_token_ids,
+                                    "rids": _rids_for_send,
                                     "extend_input_len_per_req": result.extend_input_len_per_req,
                                     "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
                                 }
@@ -1207,7 +1213,7 @@ class Scheduler(
                                 )
                             )
                         else:
-                            send_tok = {"next_token_ids": next_token_ids}
+                            send_tok = {"next_token_ids": next_token_ids, "rids": _rids_for_send}
                         self.pp_group.send_tensor_dict(
                             send_tok,
                             all_gather_group=self.attn_tp_group,
@@ -1232,6 +1238,8 @@ class Scheduler(
                     should_recv = mbs[next_mb_id] is not None and not is_next_idle
 
                 if should_recv:
+                    # Guard to prevent double-processing the same recv packet within one loop
+                    _processed_recv_tokens = False
                     # 🔧 DEBUG: Log before recv to detect blocking
                     if getattr(self, 'instance_role', None) == InstanceRole.PREFILL:
                         if not hasattr(self, '_prefill_recv_count'):
@@ -1261,8 +1269,29 @@ class Scheduler(
                     )
 
                     if is_semi_pd_decode_first and "next_token_ids" in next_pp_outputs.tensors:
-                        # Update batch with received tokens
-                        mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                        # Update batch with received tokens (do NOT mutate req.output_ids here; PP0 append happens later)
+                        # Validate and align rids to prevent cross-request token mix
+                        recv_rids = next_pp_outputs.tensors.get("rids")
+                        if recv_rids and mbs[next_mb_id] is not None and mbs[next_mb_id].reqs:
+                            local_rids = [r.rid for r in mbs[next_mb_id].reqs]
+                            if len(recv_rids) == len(local_rids) and recv_rids != local_rids:
+                                try:
+                                    # Build mapping from rid to token for alignment
+                                    tokens = next_pp_outputs["next_token_ids"]
+                                    # tokens may be tensor-like or list
+                                    try:
+                                        tok_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+                                    except Exception:
+                                        tok_list = list(tokens)
+                                    rid_to_tok = {rid: tok for rid, tok in zip(recv_rids, tok_list)}
+                                    aligned = [rid_to_tok.get(rid, tok_list[i]) for i, rid in enumerate(local_rids)]
+                                    next_token_ids_aligned = aligned
+                                except Exception:
+                                    next_token_ids_aligned = next_pp_outputs["next_token_ids"]
+                            else:
+                                next_token_ids_aligned = next_pp_outputs["next_token_ids"]
+                        else:
+                            next_token_ids_aligned = next_pp_outputs["next_token_ids"]
 
                         # Extract logits_output if present
                         logits_output_args = {
@@ -1279,7 +1308,7 @@ class Scheduler(
                         output_result = GenerationBatchResult(
                             logits_output=logits_output,
                             pp_hidden_states_proxy_tensors=None,
-                            next_token_ids=next_pp_outputs["next_token_ids"],
+                            next_token_ids=next_token_ids_aligned,
                             extend_input_len_per_req=next_pp_outputs.tensors.get(
                                 "extend_input_len_per_req", None
                             ),
@@ -1298,12 +1327,13 @@ class Scheduler(
                                 _th(
                                     logger,
                                     key=f"pp{self.pp_rank}.recv_tokens",
-                                    msg=f"[DECODE-PP{self.pp_rank}] Processing received tokens from PP1: next_mb_id={next_mb_id}, batch.reqs={len(mbs[next_mb_id].reqs)}, next_token_ids.shape={next_pp_outputs['next_token_ids'].shape}",
+                                    msg=f"[DECODE-PP{self.pp_rank}] Processing received tokens from PP1: next_mb_id={next_mb_id}, batch.reqs={len(mbs[next_mb_id].reqs)}, next_token_ids.shape={getattr(next_token_ids_aligned,'shape',type(next_token_ids_aligned))}",
                                     interval_ms=2000,
                                 )
                             except Exception:
                                 pass
                             self.process_batch_result(mbs[next_mb_id], output_result)
+                            _processed_recv_tokens = True
                             last_mbs[next_mb_id] = mbs[next_mb_id]
                         except Exception:
                             logger.exception("[SEMI_PD_PP] DECODE-PP0 processing received tokens failed; continue loop")
@@ -1379,7 +1409,32 @@ class Scheduler(
                     # Process received tensors (always, not just in TRACE mode!)
                     # 🔧 CRITICAL FIX: Only process as tokens if 'next_token_ids' is present
                     # PP0 receives tokens from PP1, other stages receive hidden states
-                    if next_pp_outputs is not None and "next_token_ids" in next_pp_outputs.tensors:
+                    if (
+                        next_pp_outputs is not None
+                        and "next_token_ids" in next_pp_outputs.tensors
+                        and not is_semi_pd_decode_first
+                        and not _processed_recv_tokens
+                    ):
+                        # Align rids if provided to prevent cross-request mixup
+                        recv_rids = next_pp_outputs.tensors.get("rids")
+                        if recv_rids and mbs[next_mb_id] is not None and mbs[next_mb_id].reqs:
+                            local_rids = [r.rid for r in mbs[next_mb_id].reqs]
+                            if len(recv_rids) == len(local_rids) and recv_rids != local_rids:
+                                try:
+                                    tokens = next_pp_outputs["next_token_ids"]
+                                    try:
+                                        tok_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+                                    except Exception:
+                                        tok_list = list(tokens)
+                                    rid_to_tok = {rid: tok for rid, tok in zip(recv_rids, tok_list)}
+                                    next_token_ids_aligned = [rid_to_tok.get(rid, tok_list[i]) for i, rid in enumerate(local_rids)]
+                                except Exception:
+                                    next_token_ids_aligned = next_pp_outputs["next_token_ids"]
+                            else:
+                                next_token_ids_aligned = next_pp_outputs["next_token_ids"]
+                        else:
+                            next_token_ids_aligned = next_pp_outputs["next_token_ids"]
+
                         logits_output_args = {
                             k[len("logits_output.") :]: v
                             for k, v in next_pp_outputs.tensors.items()
@@ -1398,7 +1453,7 @@ class Scheduler(
                         output_result = GenerationBatchResult(
                             logits_output=logits_output,
                             pp_hidden_states_proxy_tensors=None,
-                            next_token_ids=next_pp_outputs["next_token_ids"],
+                            next_token_ids=next_token_ids_aligned,
                             extend_input_len_per_req=next_pp_outputs.tensors.get(
                                 "extend_input_len_per_req", None
                             ),
@@ -1409,6 +1464,7 @@ class Scheduler(
                             can_run_cuda_graph=can_run_cuda_graph,
                         )
                         self.process_batch_result(mbs[next_mb_id], output_result)
+                        _processed_recv_tokens = True
                         last_mbs[next_mb_id] = mbs[next_mb_id]
 
                         # 🔧 方案 1：PREFILL-PP0 在转发 token 后清空 batch

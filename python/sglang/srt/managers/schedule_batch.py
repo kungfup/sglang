@@ -529,6 +529,7 @@ class Req:
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        self.is_multimodal: bool = False
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -653,6 +654,7 @@ class Req:
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+        self.is_multimodal = True
 
     def finished(self) -> bool:
         # Whether request reached finished condition

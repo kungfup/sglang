@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOut,
+    BatchTokenIDOut,
+)
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     FINISH_LENGTH,
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 # 调试日志：默认关闭，通过 SGLANG_ENABLE_DEBUG_LOGS 显式开启
 DEBUG_LOGS_ENABLED = os.environ.get("SGLANG_ENABLE_DEBUG_LOGS", "0").lower() in ("1", "true", "yes")
+SEMIPD_TRACE_ENABLED = os.environ.get("SGLANG_SEMIPD_TRACE", "0").lower() in ("1", "true", "yes")
 
 DEFAULT_FORCE_STREAM_INTERVAL = 128
 
@@ -245,11 +249,10 @@ class SchedulerOutputProcessorMixin:
         self._process_decode_log_counter += 1
         current_batch_reqs = len(batch.reqs)
 
-        # Log if: (1) every 500 iterations, (2) state change, or (3) non-empty batch
-        should_log = (
-            self._process_decode_log_counter % 500 == 1 or
-            current_batch_reqs != self._last_batch_reqs_count or
-            current_batch_reqs > 0
+        # Log only when显式开启 Semi-PD trace，并满足采样条件
+        should_log = SEMIPD_TRACE_ENABLED and (
+            self._process_decode_log_counter % 500 == 1
+            or current_batch_reqs != self._last_batch_reqs_count
         )
 
         if should_log:
@@ -280,10 +283,11 @@ class SchedulerOutputProcessorMixin:
             current_result_key = (id(result), getattr(result, "bid", None))
             last_result_key = getattr(self, "_last_processed_generation_result", None)
             if last_result_key == current_result_key:
-                logger.info(
-                    f"[{instance_role}-PP{pp_rank}] 🔁 Detected duplicate GenerationBatchResult "
-                    f"(id={current_result_key[0]}, bid={current_result_key[1]}), skip re-processing."
-                )
+                if SEMIPD_TRACE_ENABLED:
+                    logger.info(
+                        f"[{instance_role}-PP{pp_rank}] 🔁 Detected duplicate GenerationBatchResult "
+                        f"(id={current_result_key[0]}, bid={current_result_key[1]}), skip re-processing."
+                    )
                 # 🔧 FIX V27+: MUST return here to prevent duplicate token append!
                 # Previously, we only set next_token_ids=[], but the function continued
                 # and next_token_ids was overwritten by result.next_token_ids.tolist()
@@ -314,20 +318,24 @@ class SchedulerOutputProcessorMixin:
             logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 About to process {len(batch.reqs)} requests with {len(next_token_ids)} tokens")
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             # 🔍 DEBUG V24: Log request state before processing
-            logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Processing req[{i}]={req.rid[:8]}: is_retracted={req.is_retracted}, len(output_ids)={len(req.output_ids)}, next_token_id={next_token_id}")
+            if SEMIPD_TRACE_ENABLED and should_log:
+                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Processing req[{i}]={req.rid[:8]}: is_retracted={req.is_retracted}, len(output_ids)={len(req.output_ids)}, next_token_id={next_token_id}")
 
             if req.is_retracted:
-                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping retracted req[{i}]={req.rid[:8]}")
+                if SEMIPD_TRACE_ENABLED and should_log:
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping retracted req[{i}]={req.rid[:8]}")
                 continue
 
             # 🔧 FIX V25 (问题 1): Skip already finished requests to prevent duplicate token append in IDLE batch
             if req.finished():
-                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping already finished req[{i}]={req.rid[:8]}, finished_reason={req.finished_reason}")
+                if SEMIPD_TRACE_ENABLED and should_log:
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Skipping already finished req[{i}]={req.rid[:8]}, finished_reason={req.finished_reason}")
                 continue
 
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
-                logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Req[{i}]={req.rid[:8]} already finished (overlap mode)")
+                if SEMIPD_TRACE_ENABLED and should_log:
+                    logger.info(f"[{instance_role}-PP{pp_rank}] 🔍 Req[{i}]={req.rid[:8]} already finished (overlap mode)")
                 if self.page_size == 1:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
                 else:
@@ -718,8 +726,22 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
 
+            is_multimodal_req = (
+                self.model_config.is_multimodal_gen
+                or getattr(req, "is_multimodal", False)
+                or getattr(req, "multimodal_inputs", None) is not None
+            )
+            if SEMIPD_TRACE_ENABLED:
+                logger.info(
+                    f"[STREAM_OUTPUT] PP{getattr(self,'pp_rank', '?')} req[{req.rid[:8]}] "
+                    f"is_multimodal_gen={self.model_config.is_multimodal_gen} "
+                    f"flag_is_multimodal={getattr(req, 'is_multimodal', False)} "
+                    f"has_mm_inputs={getattr(req, 'multimodal_inputs', None) is not None} "
+                    f"is_multimodal_req={is_multimodal_req}"
+                )
+
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_abort:
+            if is_multimodal_req and req.to_abort:
                 continue
 
             if req.finished():
@@ -738,7 +760,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        and not self.model_config.is_multimodal_gen
+                        and not is_multimodal_req
                     )
 
             if should_output:
@@ -752,26 +774,12 @@ class SchedulerOutputProcessorMixin:
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
                 decoded_texts.append(req.decoded_text)
-                decode_ids, read_offset = req.init_incremental_detokenize()
-
-                # DEBUG: scheduler sending decode ids (truncate for log)
-                try:
-                    _rid = getattr(req, "rid", "NA")
-                    _send_off = getattr(req, "send_decode_id_offset", 0)
-                    if self.model_config.is_multimodal_gen:
-                        _to_send = decode_ids
-                    else:
-                        _to_send = decode_ids[_send_off:]
-                    _head = _to_send[:10] if isinstance(_to_send, list) else []
-                    if DEBUG_LOGS_ENABLED:
-                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset} send_len={len(_to_send)} head={_head}")
-                except Exception:
-                    pass
 
                 # 多模态/文本 detokenizer 协议（通过开关控制）：
-                # SGLANG_MM_DETOKENIZER_MODE: off(默认)/incremental/full
-                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "off").lower()
-                if self.model_config.is_multimodal_gen:
+                # SGLANG_MM_DETOKENIZER_MODE: incremental(默认)/full/off
+                mm_mode = os.environ.get("SGLANG_MM_DETOKENIZER_MODE", "incremental").lower()
+                decode_ids_for_log = None
+                if is_multimodal_req:
                     if mm_mode in ("off", "0", "false"):
                         # 原生语义：多模态不经 detokenizer，跳过发送
                         # 回到 for 循环，处理下一个 req
@@ -784,17 +792,41 @@ class SchedulerOutputProcessorMixin:
                         decode_ids_list.append(full_decode_ids)
                         read_offset_to_send = prev_full_len
                         req.last_full_decode_len = len(full_decode_ids)
+                        decode_ids_for_log = full_decode_ids
                     else:
+                        decode_ids, read_offset = req.init_incremental_detokenize()
                         # 增量模式
                         decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                         read_offset_to_send = read_offset
+                        decode_ids_for_log = decode_ids
                 else:
                     # 文本：保持增量协议
+                    decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
                     read_offset_to_send = read_offset
+                    decode_ids_for_log = decode_ids
+
+                # DEBUG: scheduler sending decode ids (truncate for log)
+                try:
+                    _rid = getattr(req, "rid", "NA")
+                    _send_off = getattr(req, "send_decode_id_offset", 0)
+                    if is_multimodal_req and mm_mode == "full":
+                        _to_send = decode_ids_for_log
+                    elif decode_ids_for_log is not None:
+                        _to_send = decode_ids_for_log[_send_off:]
+                    else:
+                        _to_send = []
+                    _head = _to_send[:10] if isinstance(_to_send, list) else []
+                    if DEBUG_LOGS_ENABLED:
+                        logger.info(f"[DBG_SCHEDULER] rid={str(_rid)[:8]} send_off={_send_off} read_off={read_offset_to_send} send_len={len(_to_send)} head={_head}")
+                except Exception:
+                    pass
 
                 # Update baselines for next round
-                req.send_decode_id_offset = len(decode_ids)
+                if is_multimodal_req and mm_mode == "full":
+                    req.send_decode_id_offset = 0
+                elif decode_ids_for_log is not None:
+                    req.send_decode_id_offset = len(decode_ids_for_log)
                 req.last_full_decode_len = len(req.origin_input_ids_unpadded + req.output_ids)
                 read_offsets.append(read_offset_to_send)
                 if self.skip_tokenizer_init:
@@ -933,12 +965,6 @@ class SchedulerOutputProcessorMixin:
                 # Non-Semi-PD or non-PP mode: use standard behavior
                 if getattr(self.server_args, 'enable_semi_pd', False) and _so_log:
                     logger.info(f"[STREAM_OUTPUT] Non-PP mode: Sending {len(rids)} requests to detokenizer")
-
-            # CRITICAL FIX: Don't skip detokenizer for multimodal models
-            # The original code skipped detokenizer for VL models, causing content=None
-            # We need detokenizer to convert tokens to text for proper responses
-            # if self.model_config.is_multimodal_gen:
-            #     return
 
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(

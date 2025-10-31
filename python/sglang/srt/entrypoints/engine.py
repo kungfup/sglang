@@ -608,10 +608,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # 🔧 Semi-PD+PP: 多模态detokenizer模式设置
     if server_args.enable_semi_pd:
-        # 对于多模态模型，启用增量detokenizer模式
+        # 默认让多模态走全量detokenizer，保持输出语义稳定
         if not os.environ.get("SGLANG_MM_DETOKENIZER_MODE"):
-            os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "incremental"
-            logger.info(f"🔧 [SEMI-PD] Set SGLANG_MM_DETOKENIZER_MODE=incremental for multimodal models")
+            os.environ["SGLANG_MM_DETOKENIZER_MODE"] = "full"
+            logger.info("🔧 [SEMI-PD] Default SGLANG_MM_DETOKENIZER_MODE=full for multimodal models")
 
     # Set prometheus env vars
     if server_args.enable_metrics:
