@@ -22,7 +22,6 @@ import torch
 
 from sglang.srt.managers.vit_shm_utils import (
     cleanup_embedding_shm,
-    cleanup_shared_memory,
     read_embedding_from_shm,
 )
 
@@ -271,35 +270,44 @@ class VITSchedulerClient:
         return tensor
 
     def _cleanup_shm(self, shm_name: str, reason: str = "unspecified"):
-        """清理共享内存，并输出来源日志"""
+        """释放共享内存引用（不直接 unlink，改由引用计数管理）"""
         if not shm_name:
             return
-        try:
-            if shm_name in self.shm_objects:
-                shm = self.shm_objects.pop(shm_name)
+
+        from sglang.srt.managers.vit_shm_manager import get_global_shm_manager
+        shm_manager = get_global_shm_manager()
+
+        # 关闭本地 handle（如果有），避免 fd 泄漏
+        if shm_name in self.shm_objects:
+            shm = self.shm_objects.pop(shm_name)
+            try:
                 shm.close()
-                shm.unlink()
+            except FileNotFoundError:
                 logger.debug(
-                    "[VIT Client] 🧹 cleaned SHM %s (cached handle, reason=%s)",
+                    "[VIT Client] 🧹 SHM %s already closed when cleaning (reason=%s)",
                     shm_name,
                     reason,
                 )
-            else:
-                cleanup_shared_memory(shm_name)
-                logger.debug(
-                    "[VIT Client] 🧹 cleaned SHM %s (no cached handle, reason=%s)",
+            except Exception as exc:
+                logger.warning(
+                    "[VIT Client] ⚠️ Failed to close SHM %s (reason=%s): %s",
                     shm_name,
                     reason,
+                    exc,
                 )
-        except FileNotFoundError:
-            logger.debug(
-                "[VIT Client] 🧹 SHM %s already gone when cleaning (reason=%s)",
-                shm_name,
-                reason,
-            )
+
+        # 引用计数减 1；只有归零时才真正 unlink
+        try:
+            if shm_manager.release(shm_name):
+                if shm_manager.cleanup_if_zero(shm_name):
+                    logger.debug(
+                        "[VIT Client] 🧹 cleaned SHM %s via ref-count (reason=%s)",
+                        shm_name,
+                        reason,
+                    )
         except Exception as exc:
             logger.warning(
-                "[VIT Client] ⚠️ Failed to cleanup SHM %s (reason=%s): %s",
+                "[VIT Client] ⚠️ Failed to release SHM %s (reason=%s): %s",
                 shm_name,
                 reason,
                 exc,

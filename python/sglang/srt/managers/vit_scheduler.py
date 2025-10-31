@@ -526,77 +526,45 @@ class VITModelRunner:
         pixel_values_list: Sequence[torch.Tensor],
         image_grid_thw_list: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """批量计算 VIT embeddings
-
-        🔧 P0 修复: 直接复用 SGLang 原生 Qwen2_5_VisionTransformer.forward()
-
-        关键发现:
-        1. SGLang 的 Qwen2_5_VisionTransformer 已经实现了完整的窗口化注意力
-        2. get_window_index() 会自动处理多张图的窗口索引
-        3. forward() 内部已经正确处理 window_index 和 reverse_indices
-        4. 我们之前的 torch.cat() 破坏了窗口语义，导致 OOM
-
-        修复方案 (P0 止血版):
-        - 按图循环调用 self.vit_model.forward()
-        - 让原生代码自己处理窗口化注意力
-        - 避免手动拼接破坏窗口语义
-
-        Args:
-            pixel_values_list: List of pixel_values tensors, each shape [num_images, C, H, W]
-            image_grid_thw_list: List of image_grid_thw tensors, each shape [num_grids, 3]
-
-        Returns:
-            List of embedding tensors, each shape [num_tokens, embedding_dim]
-        """
         if self.vit_model is None:
             raise RuntimeError("VIT model not loaded")
 
-        batch_size = len(pixel_values_list)
-        if batch_size == 0:
+        if not pixel_values_list:
             return []
 
-        # ✅ P0 修复: 按图循环，直接复用 SGLang 原生 forward()
-        # 这样可以保证窗口化注意力正确工作，避免 OOM
-        logger.debug(f"[VIT Runner] Starting batch compute (per-image): batch_size={batch_size}")
+        if len(pixel_values_list) == 1:
+            return [self.compute(pixel_values_list[0], image_grid_thw_list[0])]
 
-        embeddings = []
-        total_time = 0.0
+        pixel_values_tensors = [
+            tensor.to(self.device, non_blocking=True) for tensor in pixel_values_list
+        ]
+        grid_tensors = [
+            grid.to(self.device, non_blocking=True) for grid in image_grid_thw_list
+        ]
 
-        for i, (pixel_values, image_grid_thw) in enumerate(zip(pixel_values_list, image_grid_thw_list)):
-            start_time = time.time()
+        pixel_values = torch.cat(pixel_values_tensors, dim=0)
+        image_grid_thw = torch.cat(grid_tensors, dim=0)
 
-            # 🔧 关键修复 1: 先迁移到 GPU (non_blocking 提高性能)
-            # 避免模型内部隐式搬运，保证性能和正确性
-            pixel_values = pixel_values.to(self.device, non_blocking=True)
-            image_grid_thw = image_grid_thw.to(self.device, non_blocking=True)
+        batched_embeddings = self.vit_model(pixel_values, grid_thw=image_grid_thw)
 
-            # 直接调用 SGLang 原生 forward()
-            # 内部会自动处理:
-            # 1. get_window_index(grid_thw) - 计算窗口索引
-            # 2. 窗口化注意力 - 避免 O(N²) 显存爆炸
-            # 3. reverse_indices - 恢复原始顺序
-            embedding = self.vit_model(pixel_values, grid_thw=image_grid_thw)
+        embeddings: List[torch.Tensor] = []
+        offset = 0
+        for grid in grid_tensors:
+            window_index, _ = self.vit_model.get_window_index(grid)
+            length = window_index.numel()
+            embeddings.append(
+                batched_embeddings[offset : offset + length].detach().cpu()
+            )
+            offset += length
 
-            compute_time = time.time() - start_time
-            total_time += compute_time
-
-            logger.debug(
-                f"[VIT Runner] Image {i+1}/{batch_size} completed: "
-                f"time={compute_time*1000:.1f}ms, embedding={embedding.shape}"
+        if offset != batched_embeddings.size(0):
+            raise RuntimeError(
+                "ViT batch output size mismatch: "
+                f"split={offset} actual={batched_embeddings.size(0)}"
             )
 
-            # 🔧 关键修复 2: 迁移到 CPU 再返回
-            # 避免 GPU tensor 写 SHM 出错，减少 GPU 显存占用
-            embeddings.append(embedding.detach().cpu())
-
-        avg_time = total_time / batch_size
-        logger.info(
-            f"[VIT Runner] Batch compute completed: "
-            f"batch_size={batch_size}, total_time={total_time*1000:.1f}ms, "
-            f"avg_time={avg_time*1000:.1f}ms per image"
-        )
-
         return embeddings
+
 
     @torch.inference_mode()
     def compute(
@@ -637,6 +605,22 @@ class VITScheduler:
     ):
         self.model_config = model_config
         self.device = device
+        try:
+            import torch
+
+            parsed_device = torch.device(device)
+            if parsed_device.type == "cuda":
+                if parsed_device.index is not None:
+                    self.base_cuda_index = parsed_device.index
+                else:
+                    self.base_cuda_index = torch.cuda.current_device()
+            else:
+                self.base_cuda_index = 0
+        except Exception:
+            self.base_cuda_index = 0
+
+        # ✅ 延迟到知道 tp_size 和 vit_dp 后再检查 GPU 数量
+        # 这个检查会在 __init__ 的后面部分执行
         self.zmq_port = zmq_port
         self.batch_size = max(1, batch_size)
 
@@ -710,6 +694,22 @@ class VITScheduler:
         if self.worker_gpu_overflow_limit < 1:
             self.worker_gpu_overflow_limit = 1
         self.worker_gpu_overflow_count: Dict[int, int] = defaultdict(int)
+
+        # ✅ 检查 GPU 数量是否足够
+        if self.use_worker_pool:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    num_gpus = torch.cuda.device_count()
+                    required_gpus = self.base_cuda_index + self.vit_dp * self.tp_size
+                    if required_gpus > num_gpus:
+                        logger.warning(
+                            f"[VIT Scheduler] Insufficient GPUs: required {required_gpus} "
+                            f"(base={self.base_cuda_index} + dp={self.vit_dp} * tp={self.tp_size}), "
+                            f"but only {num_gpus} available. This may cause CUDA errors."
+                        )
+            except Exception as e:
+                logger.warning(f"[VIT Scheduler] Failed to check GPU count: {e}")
 
         if self.tp_size > 1:
             self._init_distributed()
@@ -1049,6 +1049,11 @@ class VITScheduler:
         processes: List[Tuple[mp.Process, mp.connection.Connection]] = []
         rpc_port = self.worker_rpc_port_start + worker_id
         env_overrides = {"SGLANG_VIT_WORKER_ID": str(worker_id)}
+        # ✅ 修复: DP 场景下，每个 Worker 使用不同的 GPU 组
+        # Worker 0: GPU [base, base+1, ..., base+tp_size-1]
+        # Worker 1: GPU [base+tp_size, base+tp_size+1, ..., base+2*tp_size-1]
+        worker_base_device = self.base_cuda_index + worker_id * self.tp_size
+        env_overrides["SGLANG_VIT_TP_BASE_DEVICE"] = str(worker_base_device)
         try:
             success = True
             for tp_rank in range(self.tp_size):

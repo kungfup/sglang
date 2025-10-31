@@ -277,6 +277,16 @@ def _get_precomputed_embedding(
         result = torch.concat(precomputed_features)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
+
+        if result.numel() == 0:
+            logger.error(
+                "[MM Utils] ❌ Received empty precomputed embedding (shape=%s). "
+                "Clearing cached features and falling back to synchronous ViT.", result.shape
+            )
+            for item in items:
+                item.precomputed_features = None
+            return None
+
         logger.info(f"[MM Utils] ✅ Using precomputed embedding: shape={result.shape}, dtype={result.dtype}, device={result.device}")
         logger.info(f"[MM Utils] 📊 Precomputed embedding stats: min={result.min().item():.4f}, max={result.max().item():.4f}, mean={result.mean().item():.4f}, std={result.std().item():.4f}")
         return result

@@ -65,6 +65,14 @@ class VITWorkerService(rpyc.Service):
         self.total_cache_hits = 0
         self.total_cache_misses = 0
 
+        if torch.cuda.is_available() and self.device.startswith("cuda"):
+            try:
+                torch.cuda.set_device(torch.device(self.device))
+            except Exception as exc:
+                logger.warning(
+                    f"[Worker {self.worker_id}] Failed to set CUDA device {self.device}: {exc}"
+                )
+
         # 🔧 Phase 2.B: 健康检查相关
         self.last_ping_time = time.time()
         self.is_healthy = True
@@ -230,6 +238,18 @@ class VITWorkerService(rpyc.Service):
                 f"rank={actual_tp_rank}, size={actual_tp_size}"
             )
 
+            # ✅ NCCL Warmup broadcast (避免首次 broadcast 出错)
+            logger.info(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                f"Performing NCCL warmup broadcast..."
+            )
+            warmup_tensor = torch.zeros([1], dtype=torch.int32, device=self.device)
+            dist.broadcast(warmup_tensor, src=0)
+            logger.info(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                f"NCCL warmup broadcast successful"
+            )
+
         except Exception as e:
             logger.error(
                 f"[Worker {self.worker_id}] Failed to initialize NCCL: {e}",
@@ -271,65 +291,60 @@ class VITWorkerService(rpyc.Service):
         image_grid_thw_dtypes: List[str],
         content_hashes: List[int],
     ) -> List[Dict]:
-        """执行 forward 推理
-        
-        Args:
-            request_ids: 请求 ID 列表
-            pixel_values_shm_keys: pixel_values SHM 名称列表
-            image_grid_thw_shm_keys: image_grid_thw SHM 名称列表
-            content_hashes: 内容哈希列表
-        
-        Returns:
-            List[Dict]: 每个请求的结果
-                {
-                    "request_id": str,
-                    "cache_id": int,
-                    "from_cache": bool,
-                    "compute_time": float,
-                    "error": bool,
-                    "error_message": str,
-                }
+        """执行 forward 推理（仅 Rank 0 暴露给 RPC）
+
+        Rank 0:
+            1. 读取输入 / 检查缓存
+            2. 如果需要计算，通过 NCCL broadcast 通知其他 rank
+            3. 负责写回缓存 / 返回结果
+
+        Rank > 0:
+            - 通过 _run_tp_worker() 等待 broadcast，无需调用该 RPC。
         """
+        if self.tp_rank != 0:
+            logger.warning(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                "exposed_forward called on non-zero rank; ignoring"
+            )
+            return []
+
         start_time = time.time()
-        results = []
+        results: List[Dict] = []
 
         try:
-            # 🔧 Phase 2.C: 只有 rank0 执行 exposed_forward (因为只有 rank0 启动了 RPC server)
-            # rank0 负责: 读 SHM、检查缓存、广播任务、写缓存、返回结果
-            # rank>0 在 _run_tp_worker() 中等待 broadcast
-
-            # TP Rank 0: 读取 SHM 并检查缓存
-            pixel_values_list, image_grid_thw_list, cache_results = (
-                self._read_inputs_and_check_cache(
-                    pixel_values_shm_keys,
-                    pixel_values_shapes,
-                    pixel_values_dtypes,
-                    image_grid_thw_shm_keys,
-                    image_grid_thw_shapes,
-                    image_grid_thw_dtypes,
-                    content_hashes,
-                )
+            (
+                pixel_values_list,
+                image_grid_thw_list,
+                cache_results,
+            ) = self._read_inputs_and_check_cache(
+                pixel_values_shm_keys,
+                pixel_values_shapes,
+                pixel_values_dtypes,
+                image_grid_thw_shm_keys,
+                image_grid_thw_shapes,
+                image_grid_thw_dtypes,
+                content_hashes,
             )
 
-            # 🔧 分离缓存命中和未命中
-            cache_hits = []
-            cache_misses = []
+            cache_hits: List[Tuple[int, Dict]] = []
+            cache_misses: List[
+                Tuple[int, torch.Tensor, torch.Tensor, int, Optional[int]]
+            ] = []
+
             for i, cache_result in enumerate(cache_results):
                 if cache_result and cache_result["from_cache"]:
                     cache_hits.append((i, cache_result))
                 else:
-                    # 🔧 携带 cache_id 到 cache_misses，避免重复分配
                     cache_misses.append(
                         (
                             i,
                             pixel_values_list[i],
                             image_grid_thw_list[i],
                             content_hashes[i],
-                            cache_result["cache_id"] if cache_result else None,  # 🔧 携带 cache_id
+                            cache_result["cache_id"] if cache_result else None,
                         )
                     )
 
-            # 处理缓存命中
             for idx, cache_result in cache_hits:
                 results.append(
                     {
@@ -339,7 +354,6 @@ class VITWorkerService(rpyc.Service):
                         "compute_time": 0.0,
                         "error": False,
                         "error_message": "",
-                        # 🔑 方案 1: 返回输入 SHM 名称，用于 PP0 release
                         "input_shm_names": [
                             pixel_values_shm_keys[idx],
                             image_grid_thw_shm_keys[idx],
@@ -348,56 +362,64 @@ class VITWorkerService(rpyc.Service):
                 )
                 self.total_cache_hits += 1
 
-            # 🔧 Phase 2.C: 如果全部命中缓存，通知其他 rank 跳过计算
-            if not cache_misses and self.tp_size > 1:
-                from sglang.srt.distributed.communication_op import broadcast_tensor_dict
-                broadcast_tensor_dict(tensor_dict={"cache_hit": True}, src=0)
-                logger.debug(
-                    f"[Worker {self.worker_id}] Rank 0: all cache hits, "
-                    f"notified other ranks to skip"
-                )
+            if not cache_misses:
+                if self.tp_size > 1:
+                    try:
+                        self._broadcast_inputs([], [], shutdown=False, cache_hit=True)
+                    except Exception as e:
+                        logger.error(
+                            f"[Worker {self.worker_id}] Rank 0: failed to broadcast cache-hit signal: {e}",
+                            exc_info=True,
+                        )
+                self.total_requests += len(request_ids)
+                self.total_compute_time += time.time() - start_time
+                results.sort(key=lambda x: request_ids.index(x["request_id"]))
+                return results
 
-            # 处理缓存未命中 (需要计算)
-            if cache_misses:
-                miss_results = self._compute_embeddings(
-                    cache_misses,
-                    request_ids,
-                    pixel_values_shm_keys=pixel_values_shm_keys,  # 🔑 传递 SHM 名称
-                    image_grid_thw_shm_keys=image_grid_thw_shm_keys,
-                )
-                results.extend(miss_results)
-                self.total_cache_misses += len(cache_misses)
+            miss_results = self._compute_embeddings(
+                cache_misses,
+                request_ids,
+                pixel_values_shm_keys=pixel_values_shm_keys,
+                image_grid_thw_shm_keys=image_grid_thw_shm_keys,
+            )
+            results.extend(miss_results)
+            self.total_cache_misses += len(cache_misses)
 
-            # 更新统计
             self.total_requests += len(request_ids)
             self.total_compute_time += time.time() - start_time
-
-            # 按原始顺序排序结果
             results.sort(key=lambda x: request_ids.index(x["request_id"]))
-
             return results
 
         except Exception as e:
             logger.error(
-                f"[Worker {self.worker_id}] Forward failed: {e}", exc_info=True
+                f"[Worker {self.worker_id}] Rank 0: Forward failed: {e}",
+                exc_info=True,
             )
-            # 返回错误结果
-            return [
-                {
-                    "request_id": req_id,
-                    "cache_id": None,
-                    "from_cache": False,
-                    "compute_time": 0.0,
-                    "error": True,
-                    "error_message": str(e),
-                    # 🔑 方案 1: 即使失败也要返回 input_shm_names
-                    "input_shm_names": [
-                        pixel_values_shm_keys[i],
-                        image_grid_thw_shm_keys[i],
-                    ],
-                }
-                for i, req_id in enumerate(request_ids)
-            ]
+            if self.tp_size > 1:
+                try:
+                    self._broadcast_inputs([], [], shutdown=True, cache_hit=False)
+                except Exception as broadcast_err:
+                    logger.error(
+                        f"[Worker {self.worker_id}] Rank 0: Failed to send shutdown signal: {broadcast_err}"
+                    )
+
+            error_results = []
+            for i, req_id in enumerate(request_ids):
+                error_results.append(
+                    {
+                        "request_id": req_id,
+                        "cache_id": None,
+                        "from_cache": False,
+                        "compute_time": 0.0,
+                        "error": True,
+                        "error_message": str(e),
+                        "input_shm_names": [
+                            pixel_values_shm_keys[i],
+                            image_grid_thw_shm_keys[i],
+                        ],
+                    }
+                )
+            return error_results
 
     def exposed_ping(self) -> Dict:
         """健康检查 (心跳)
@@ -541,81 +563,156 @@ class VITWorkerService(rpyc.Service):
         self,
         pixel_values_list: List[torch.Tensor],
         image_grid_thw_list: List[torch.Tensor],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """TP Broadcast 输入 (NCCL)
+        shutdown: bool = False,
+        cache_hit: bool = False,
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        bool,
+        bool,
+    ]:
+        """通过 NCCL broadcast 输入张量给其他 TP ranks。
 
-        Rank 0: 已读取数据，broadcast 给其他 ranks
-        Other ranks: 接收 broadcast 的数据
+        Args:
+            pixel_values_list: Rank 0 的输入张量列表
+            image_grid_thw_list: Rank 0 的 grid 列表
+            shutdown: 是否发送退出信号
+            cache_hit: 是否发送缓存命中信号
 
-        参考 LightLLM 的实现，使用 dist.broadcast 进行张量广播
+        Returns:
+            Tuple[pixel_values_list, image_grid_thw_list, shutdown_flag, cache_hit_flag]
+            对于非 0 Rank，会返回通过 broadcast 接收到的新张量。
         """
         if self.tp_size <= 1:
-            return pixel_values_list, image_grid_thw_list
+            return pixel_values_list, image_grid_thw_list, shutdown, cache_hit
 
         try:
             batch_size = len(pixel_values_list)
-
-            # 🔧 Step 1: Broadcast batch metadata (shapes, dtypes)
             if self.tp_rank == 0:
-                # Rank 0: 准备元数据
-                # 🔧 修复: 保存 dtype 字符串，避免 .split(".") 解析失败
                 metadata = {
                     "batch_size": batch_size,
                     "pixel_values_shapes": [list(pv.shape) for pv in pixel_values_list],
-                    "pixel_values_dtypes": [str(pv.dtype).replace("torch.", "") for pv in pixel_values_list],
-                    "image_grid_thw_shapes": [list(grid.shape) for grid in image_grid_thw_list],
-                    "image_grid_thw_dtypes": [str(grid.dtype).replace("torch.", "") for grid in image_grid_thw_list],
+                    "pixel_values_dtypes": [
+                        str(pv.dtype).replace("torch.", "") for pv in pixel_values_list
+                    ],
+                    "image_grid_thw_shapes": [
+                        list(grid.shape) for grid in image_grid_thw_list
+                    ],
+                    "image_grid_thw_dtypes": [
+                        str(grid.dtype).replace("torch.", "") for grid in image_grid_thw_list
+                    ],
+                    "shutdown": bool(shutdown),
+                    "cache_hit": bool(cache_hit),
                 }
                 metadata_list = [metadata]
             else:
-                # Other ranks: 准备接收
                 metadata_list = [None]
 
-            # Broadcast metadata (使用 object list)
             dist.broadcast_object_list(metadata_list, src=0)
             metadata = metadata_list[0]
 
-            # 🔧 Step 2: Other ranks 根据 metadata 创建空 tensor
+            shutdown_flag = bool(metadata.get("shutdown", False))
+            cache_hit_flag = bool(metadata.get("cache_hit", False))
+            batch_size = int(metadata.get("batch_size", 0))
+
             if self.tp_rank != 0:
                 pixel_values_list = []
                 image_grid_thw_list = []
-
-                for i in range(metadata["batch_size"]):
-                    # 创建空 pixel_values tensor
+                for i in range(batch_size):
                     pv_shape = tuple(metadata["pixel_values_shapes"][i])
-                    pv_dtype_str = metadata["pixel_values_dtypes"][i]
-                    pv_dtype = getattr(torch, pv_dtype_str)
+                    pv_dtype = getattr(torch, metadata["pixel_values_dtypes"][i])
                     pixel_values = torch.empty(pv_shape, dtype=pv_dtype, device=self.device)
                     pixel_values_list.append(pixel_values)
 
-                    # 创建空 image_grid_thw tensor
                     grid_shape = tuple(metadata["image_grid_thw_shapes"][i])
-                    grid_dtype_str = metadata["image_grid_thw_dtypes"][i]
-                    grid_dtype = getattr(torch, grid_dtype_str)
-                    image_grid_thw = torch.empty(grid_shape, dtype=grid_dtype, device=self.device)
+                    grid_dtype = getattr(torch, metadata["image_grid_thw_dtypes"][i])
+                    image_grid_thw = torch.empty(
+                        grid_shape, dtype=grid_dtype, device=self.device
+                    )
                     image_grid_thw_list.append(image_grid_thw)
 
-            # 🔧 Step 3: Broadcast 每个 tensor
             for i in range(batch_size):
-                # Broadcast pixel_values
                 dist.broadcast(pixel_values_list[i], src=0)
-
-                # Broadcast image_grid_thw
                 dist.broadcast(image_grid_thw_list[i], src=0)
 
-            logger.info(
-                f"[Worker {self.worker_id}] TP Broadcast completed: "
-                f"rank={self.tp_rank}, batch_size={batch_size}"
-            )
-
-            return pixel_values_list, image_grid_thw_list
-
+            return pixel_values_list, image_grid_thw_list, shutdown_flag, cache_hit_flag
         except Exception as e:
             logger.error(
-                f"[Worker {self.worker_id}] TP Broadcast failed: {e}",
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: TP broadcast failed: {e}",
                 exc_info=True,
             )
             raise
+
+    def _run_tp_worker(self):
+        """Rank > 0 worker loop: 等待 Rank 0 的 NCCL broadcast 并参与计算。"""
+        logger.info(
+            f"[Worker {self.worker_id}] Rank {self.tp_rank}: TP worker loop started (device={self.device})"
+        )
+        try:
+            while True:
+                try:
+                    (
+                        pixel_values_list,
+                        image_grid_thw_list,
+                        shutdown_flag,
+                        cache_hit_flag,
+                    ) = self._broadcast_inputs([], [], shutdown=False, cache_hit=False)
+                except Exception as e:
+                    logger.error(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                        f"NCCL broadcast failed: {e}",
+                        exc_info=True,
+                    )
+                    time.sleep(0.001)
+                    continue
+
+                if shutdown_flag:
+                    logger.info(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: received shutdown signal, exiting"
+                    )
+                    break
+
+                if cache_hit_flag:
+                    logger.debug(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: received cache-hit signal, skipping compute"
+                    )
+                    continue
+
+                if not pixel_values_list:
+                    logger.debug(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: received empty payload, continue"
+                    )
+                    continue
+
+                batch_size = len(pixel_values_list)
+                logger.info(
+                    f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                    f"received batch_size={batch_size} from NCCL broadcast"
+                )
+                try:
+                    start = time.time()
+                    _ = self.model_runner.compute_batch(
+                        pixel_values_list, image_grid_thw_list
+                    )
+                    logger.info(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                        f"computation finished in {(time.time() - start) * 1000:.1f} ms"
+                    )
+                except Exception as compute_err:
+                    logger.error(
+                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                        f"error during compute: {compute_err}",
+                        exc_info=True,
+                    )
+        except KeyboardInterrupt:
+            logger.info(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: received interrupt, exiting loop"
+            )
+        except Exception as e:
+            logger.error(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: error in worker loop: {e}",
+                exc_info=True,
+            )
 
     def _compute_embeddings(
         self,
@@ -626,14 +723,13 @@ class VITWorkerService(rpyc.Service):
     ) -> List[Dict]:
         """计算 embeddings (所有 TP rank 都参与)
 
-        🔧 Phase 2.C: rank0 通过 broadcast_tensor_dict 通知其他 rank 参与计算
+        🔧 Phase 2.C: rank0 通过 NCCL broadcast (_broadcast_inputs) 通知其他 rank 参与计算
         🔧 修复: 所有 rank 都执行 forward，只有 rank0 写缓存和返回结果
         🔧 修复: 复用 _check_cache 返回的 cache_id，避免重复分配
         🔧 显存池: 估算显存需求，不满足则拒绝请求 (backpressure)
         🔑 方案 1: 接收 SHM 名称列表，用于返回 input_shm_names
         """
         from sglang.srt.managers.vit_shm_utils import write_embedding_to_shm_raw
-        from sglang.srt.distributed.communication_op import broadcast_tensor_dict
 
         results = []
 
@@ -749,20 +845,34 @@ class VITWorkerService(rpyc.Service):
                 f"gpu_before={gpu_memory_before:.2f} MB"
             )
 
-        # 🔧 Phase 2.C: rank0 通过 broadcast_tensor_dict 通知其他 rank
         if self.tp_size > 1:
-            if self.tp_rank == 0:
-                # rank0: 广播任务数据
-                task_data = {
-                    "cache_hit": False,  # 表示需要计算
-                    "pixel_values_list": pixel_values_list,
-                    "image_grid_thw_list": image_grid_thw_list,
-                }
-                broadcast_tensor_dict(tensor_dict=task_data, src=0)
-                logger.info(
-                    f"[Worker {self.worker_id}] Rank 0: broadcasted task batch_size={len(pixel_values_list)}"
+            pixel_values_list, image_grid_thw_list, shutdown_flag, cache_hit_flag = (
+                self._broadcast_inputs(
+                    pixel_values_list,
+                    image_grid_thw_list,
+                    shutdown=False,
+                    cache_hit=False,
                 )
-            # rank>0 会在 _run_tp_worker() 中接收并执行
+            )
+            if shutdown_flag:
+                logger.info(
+                    f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                    "received shutdown signal during compute"
+                )
+                return results
+            if cache_hit_flag:
+                logger.debug(
+                    f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
+                    "received cache-hit signal, skipping compute"
+                )
+                return results
+
+        # ✅ 在 forward 前清理 CUDA 缓存，减少内存碎片化
+        if self.tp_rank == 0:
+            torch.cuda.empty_cache()
+            logger.debug(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: CUDA cache cleared before forward"
+            )
 
         # 🔧 所有 rank 都执行 forward (TP 模式下需要同步)
         start_time = time.time()
@@ -773,6 +883,13 @@ class VITWorkerService(rpyc.Service):
         logger.info(
             f"[Worker {self.worker_id}] Rank {self.tp_rank}: forward finished in {compute_time*1000:.1f} ms"
         )
+
+        # ✅ 在 forward 后清理 CUDA 缓存，释放未使用的内存
+        if self.tp_rank == 0:
+            torch.cuda.empty_cache()
+            logger.debug(
+                f"[Worker {self.worker_id}] Rank {self.tp_rank}: CUDA cache cleared after forward"
+            )
 
         # 🔧 只有 rank0 写缓存和返回结果
         if self.tp_rank != 0:
@@ -946,80 +1063,9 @@ class VITWorkerService(rpyc.Service):
             ),
         }
 
-    def _run_tp_worker(self):
-        """🔧 Phase 2.C: TP worker 循环 (rank>0)
-
-        TP rank > 0 不监听 RPC，而是等待 TP rank 0 的 broadcast。
-        收到 broadcast 后，参与计算（RowParallelLinear 需要 all-reduce）。
-
-        参考: sglang/python/sglang/srt/managers/vit_scheduler.py.imporant:2856
-        """
-        logger.info(
-            f"[Worker {self.worker_id}] Rank {self.tp_rank}: TP worker loop started (device={self.device})"
-        )
-
-        from sglang.srt.distributed.communication_op import broadcast_tensor_dict
-
-        try:
-            while True:
-                # 1. 等待 TP rank 0 的 broadcast（接收请求数据）
-                # broadcast_tensor_dict 会阻塞直到收到数据
-                request_data = broadcast_tensor_dict(tensor_dict=None, src=0)
-
-                if request_data is None:
-                    # 没有请求，继续等待
-                    time.sleep(0.001)
-                    continue
-
-                # 检查是否是退出信号
-                if request_data.get("exit", False):
-                    logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank}: received exit signal")
-                    break
-
-                # 检查是否是 cache hit 信号 (跳过计算)
-                if request_data.get("cache_hit", False):
-                    logger.info(
-                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: cache hit broadcast, skipping compute"
-                    )
-                    continue
-
-                # 2. 获取批量数据
-                pixel_values_list = request_data.get("pixel_values_list")
-                image_grid_thw_list = request_data.get("image_grid_thw_list")
-
-                if pixel_values_list is None or image_grid_thw_list is None:
-                    logger.warning(f"[Worker {self.worker_id}] Rank {self.tp_rank}: invalid request data")
-                    continue
-
-                batch_size = len(pixel_values_list)
-                logger.info(
-                    f"[Worker {self.worker_id}] Rank {self.tp_rank}: received task broadcast batch_size={batch_size}"
-                )
-
-                # 3. 执行计算（参与 all-reduce）
-                try:
-                    start = time.time()
-                    _ = self.model_runner.compute_batch(
-                        pixel_values_list, image_grid_thw_list
-                    )
-                    logger.info(
-                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: computation completed "
-                        f"batch_size={batch_size} time={(time.time() - start)*1000:.1f} ms"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[Worker {self.worker_id}] Rank {self.tp_rank}: "
-                        f"error in compute: {e}",
-                        exc_info=True,
-                    )
-
-        except KeyboardInterrupt:
-            logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank}: received interrupt")
-        except Exception as e:
-            logger.error(
-                f"[Worker {self.worker_id}] Rank {self.tp_rank}: error in worker loop: {e}",
-                exc_info=True,
-            )
+    # ✅ 删除 _run_tp_worker() 方法（-72 行）
+    # Rank>0 不再需要独立的工作循环
+    # 它们会在 exposed_forward() 中自动参与计算
 
     def cleanup(self):
         """清理资源
@@ -1029,14 +1075,17 @@ class VITWorkerService(rpyc.Service):
         try:
             logger.info(f"[Worker {self.worker_id}] Rank {self.tp_rank} cleaning up...")
 
-            # 🔧 Phase 2.C: rank0 发送退出信号给其他 ranks
             if self.tp_rank == 0 and self.tp_size > 1:
                 try:
-                    from sglang.srt.distributed.communication_op import broadcast_tensor_dict
-                    broadcast_tensor_dict(tensor_dict={"exit": True}, src=0)
-                    logger.info(f"[Worker {self.worker_id}] Rank 0: sent exit signal to other ranks")
+                    self._broadcast_inputs([], [], shutdown=True, cache_hit=False)
+                    logger.info(
+                        f"[Worker {self.worker_id}] Rank 0: sent shutdown signal to other ranks"
+                    )
                 except Exception as e:
-                    logger.error(f"[Worker {self.worker_id}] Failed to send exit signal: {e}")
+                    logger.error(
+                        f"[Worker {self.worker_id}] Rank 0: failed to send shutdown signal: {e}",
+                        exc_info=True,
+                    )
 
             # 关闭 CacheServer 连接
             if hasattr(self, "cache_client") and self.cache_client is not None:
@@ -1092,7 +1141,9 @@ def start_vit_worker_process(
         cache_rpc_port: CacheServer RPC 端口
     """
     # 设置 GPU 设备
-    device = f"cuda:{tp_rank}"
+    base_device_index = int(os.environ.get("SGLANG_VIT_TP_BASE_DEVICE", "0"))
+    device_index = base_device_index + tp_rank
+    device = f"cuda:{device_index}"
 
     # 创建 Worker 服务
     service = VITWorkerService(
@@ -1105,11 +1156,12 @@ def start_vit_worker_process(
         cache_rpc_port=cache_rpc_port,
     )
 
-    # 🔧 只有 rank0 启动 RPC server
+    from sglang.srt.utils.graceful_utils import graceful_registry
+    graceful_registry(f"VITWorker_{worker_id}_Rank_{tp_rank}")
+
     if tp_rank == 0:
         from rpyc.utils.server import ThreadedServer
 
-        # 启动 RPyC 服务器
         server = ThreadedServer(
             service,
             port=rpc_port,
@@ -1121,33 +1173,59 @@ def start_vit_worker_process(
         )
 
         logger.info(
-            f"[Worker {worker_id}] Rank 0 starting RPC server on port {rpc_port}, "
+            f"[Worker {worker_id}] Rank {tp_rank}: starting RPC server on port {rpc_port}, "
             f"tp_size={tp_size}, device={device}"
         )
 
         try:
             server.start()
         except KeyboardInterrupt:
-            logger.info(f"[Worker {worker_id}] Rank 0 shutting down...")
+            logger.info(f"[Worker {worker_id}] Rank {tp_rank}: shutting down...")
         except Exception as e:
-            logger.error(f"[Worker {worker_id}] Rank 0 failed to start: {e}", exc_info=True)
+            logger.error(
+                f"[Worker {worker_id}] Rank {tp_rank}: failed to start: {e}",
+                exc_info=True,
+            )
             raise
         finally:
+            if dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                    logger.info(
+                        f"[Worker {worker_id}] Rank {tp_rank}: destroyed process group"
+                    )
+                except Exception as cleanup_err:
+                    logger.error(
+                        f"[Worker {worker_id}] Rank {tp_rank}: "
+                        f"failed to destroy process group: {cleanup_err}"
+                    )
             service.cleanup()
     else:
-        # 🔧 Phase 2.C: TP 真正并行 - rank>0 进入工作循环
         logger.info(
-            f"[Worker {worker_id}] Rank {tp_rank} entering worker loop (TP mode), "
-            f"tp_size={tp_size}, device={device}"
+            f"[Worker {worker_id}] Rank {tp_rank}: entering TP worker loop (device={device})"
         )
-
         try:
-            # 进入 TP worker 循环，等待 rank0 的 broadcast
             service._run_tp_worker()
         except KeyboardInterrupt:
-            logger.info(f"[Worker {worker_id}] Rank {tp_rank} shutting down...")
+            logger.info(
+                f"[Worker {worker_id}] Rank {tp_rank}: received interrupt, shutting down..."
+            )
         except Exception as e:
-            logger.error(f"[Worker {worker_id}] Rank {tp_rank} failed: {e}", exc_info=True)
+            logger.error(
+                f"[Worker {worker_id}] Rank {tp_rank}: worker loop failed: {e}",
+                exc_info=True,
+            )
             raise
         finally:
+            if dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                    logger.info(
+                        f"[Worker {worker_id}] Rank {tp_rank}: destroyed process group"
+                    )
+                except Exception as cleanup_err:
+                    logger.error(
+                        f"[Worker {worker_id}] Rank {tp_rank}: "
+                        f"failed to destroy process group: {cleanup_err}"
+                    )
             service.cleanup()
